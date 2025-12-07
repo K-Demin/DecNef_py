@@ -81,33 +81,48 @@ class MotionRegressor:
         self._regress = RtpRegress(
             mot_reg="mot6",
             volreg=volreg,
-            wait_num=0,  # regress from the first usable volume
+            TR=1.4,
+            wait_num=0,
             save_proc=False,
             online_saving=False,
+            reg_retro_proc=False,
         )
         self._ready = False
 
     def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> np.ndarray:
-        """Run motion regression using the cumulative RTPSpy pipeline."""
+        """
+        Run motion regression using RTPSpy.
 
+        - Uses RTPSpy's internal state across volumes.
+        - Works in-place on mc_img.dataobj.
+        - Returns the regressed volume as a float32 array.
+        """
+
+        # Make sure the regressor has enough data/history
         if not self._ready:
             try:
                 self._ready = bool(self._regress.ready_proc())
-            except Exception as exc:  # pragma: no cover - safety guard
+            except Exception as exc:
                 log.error(f"[REG] Failed to prepare regressor: {exc}")
+                # fall back to unregressed data
                 return np.asanyarray(mc_img.dataobj)
 
+        # If still not ready, just pass original data through
         if not self._ready:
             return np.asanyarray(mc_img.dataobj)
 
         try:
+            # RTPSpy modifies mc_img in-place
             self._regress.do_proc(mc_img, vol_idx=volume_idx - 1)
-            if self._regress.proc_data is None:
-                return np.asanyarray(mc_img.dataobj)
-            return np.asarray(self._regress.proc_data, dtype=np.float32)
-        except Exception as exc:  # pragma: no cover - runtime safeguard
+
+            # Grab the (now regressed) data from the image
+            return np.asarray(mc_img.dataobj, dtype=np.float32)
+
+        except Exception as exc:
             log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
+            # fall back to unregressed
             return np.asanyarray(mc_img.dataobj)
+
 
 
 # ---------- Simple config for this RT session ----------
@@ -179,7 +194,7 @@ class RTSessionConfig:
         """
         Global real-time reference EPI (set by offline preprocessor).
         """
-        return self.day_root / "func" / "rt_ref_epi.nii"
+        return self.day_root / "func" / "trans" / "rt_ref_epi.nii"
 
     @property
     def rt_ref_mask(self) -> Path:
@@ -187,7 +202,7 @@ class RTSessionConfig:
         Optional mask for the RT reference (not strictly needed here,
         but kept for completeness / future use).
         """
-        return self.day_root / "func" / "rt_ref_epi_mask.nii"
+        return self.day_root / "func" / "trans" / "rt_ref_epi_mask.nii"
 
 
 # ---------- Filename parsing ----------
@@ -407,11 +422,10 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     reg_t0 = time.time()
     mc_for_warp = mc_nii
     cleaned = handler.motion_regressor.apply(mc_img, volume_idx)
-    if not np.may_share_memory(cleaned, mc_data):
-        reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
-        mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "motion", start_t=reg_t0)
+    reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
+    nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+    mc_for_warp = reg_nii
+    log_step("REG", volume_idx, "motion", start_t=reg_t0)
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()

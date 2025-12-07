@@ -46,8 +46,8 @@ class FMRIRealtimePreprocessor:
 
         # --- NEW: global EPI reference for RT (per day) ---
         # This will be set from the FIRST run we preprocess.
-        self.rt_ref_epi = self.func_dir / "rt_ref_epi.nii"
-        self.rt_ref_mask = self.func_dir / "rt_ref_epi_mask.nii"
+        self.rt_ref_epi = self.func_dir / "trans" / "rt_ref_epi.nii"
+        self.rt_ref_mask = self.func_dir / "trans" / "rt_ref_epi_mask.nii"
 
     # ---------- Top-level entry points ----------
 
