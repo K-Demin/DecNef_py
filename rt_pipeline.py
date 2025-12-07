@@ -13,6 +13,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
+from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -71,6 +72,42 @@ def append_fd(fd_path: Path, volume_idx: int, fd_value: float):
         if not exists:
             w.writerow(["volume_idx", "fd"])
         w.writerow([volume_idx, fd_value])
+
+
+class MotionRegressor:
+    """Wrapper around RTPSpy's regression module for online motion denoising."""
+
+    def __init__(self, volreg: RtpVolreg):
+        self._regress = RtpRegress(
+            mot_reg="mot6",
+            volreg=volreg,
+            wait_num=0,  # regress from the first usable volume
+            save_proc=False,
+            online_saving=False,
+        )
+        self._ready = False
+
+    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> np.ndarray:
+        """Run motion regression using the cumulative RTPSpy pipeline."""
+
+        if not self._ready:
+            try:
+                self._ready = bool(self._regress.ready_proc())
+            except Exception as exc:  # pragma: no cover - safety guard
+                log.error(f"[REG] Failed to prepare regressor: {exc}")
+                return np.asanyarray(mc_img.dataobj)
+
+        if not self._ready:
+            return np.asanyarray(mc_img.dataobj)
+
+        try:
+            self._regress.do_proc(mc_img, vol_idx=volume_idx - 1)
+            if self._regress.proc_data is None:
+                return np.asanyarray(mc_img.dataobj)
+            return np.asarray(self._regress.proc_data, dtype=np.float32)
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
+            return np.asanyarray(mc_img.dataobj)
 
 
 # ---------- Simple config for this RT session ----------
@@ -212,6 +249,7 @@ class DICOMHandler(FileSystemEventHandler):
         self.prev_motion = None              # previous 6-vector
         self.brain_radius_mm = 50.0          # standard radius for FD
         self.pre_trial_scans = 0             # if you ever want NaNs for early scans
+        self.motion_regressor = MotionRegressor(self.volreg)
 
         # --- Decoder / scorer ---
         decoder_path = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
@@ -365,8 +403,15 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         start_t=t0,
     )
 
-
-
+    # ---------- 2c) Motion regression (RTPS_py) ----------
+    reg_t0 = time.time()
+    mc_for_warp = mc_nii
+    cleaned = handler.motion_regressor.apply(mc_img, volume_idx)
+    if not np.may_share_memory(cleaned, mc_data):
+        reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        mc_for_warp = reg_nii
+        log_step("REG", volume_idx, "motion", start_t=reg_t0)
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()
@@ -388,17 +433,17 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     cmd = [
         "bash", "-lc",
         f"""
-        export ANTS_USE_GPU=1
-        export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-        export OMP_NUM_THREADS=$(nproc)
-        antsApplyTransforms \
-          -d 3 \
-          -i {mc_nii} \
-          -r {decoder_template} \
-          -o {mni_nii} \
-          -t {warp_t1_mni} \
-          -t {epi2t1} \
-          -n Linear --float 1
+          export ANTS_USE_GPU=1
+          export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
+          export OMP_NUM_THREADS=$(nproc)
+          antsApplyTransforms \
+            -d 3 \
+            -i {mc_for_warp} \
+            -r {decoder_template} \
+            -o {mni_nii} \
+            -t {warp_t1_mni} \
+            -t {epi2t1} \
+            -n Linear --float 1
         """
     ]
     run(cmd)
