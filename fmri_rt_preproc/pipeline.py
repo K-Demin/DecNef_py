@@ -36,7 +36,7 @@ class FMRIRealtimePreprocessor:
                  fastsurfer_env: str = "fastsurfer",
                  ants_env: str = "ants_env"):
         self.cfg = cfg
-        self.anat_dir = cfg.root / "anat"
+        self.anat_dir = cfg.subject_root / "anat"
         self.fmap_dir = cfg.root / "fmap"
         self.func_dir = cfg.root / "func"
         self.decoder_template = (cfg.root / cfg.decoder_template).resolve()

@@ -13,6 +13,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
+from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -73,20 +74,59 @@ def append_fd(fd_path: Path, volume_idx: int, fd_value: float):
         w.writerow([volume_idx, fd_value])
 
 
+class MotionRegressor:
+    """Wrapper around RTPSpy's regression module for online motion denoising."""
+
+    def __init__(self, volreg: RtpVolreg):
+        self._regress = RtpRegress(
+            mot_reg="mot6",
+            volreg=volreg,
+            wait_num=0,  # regress from the first usable volume
+            save_proc=False,
+            online_saving=False,
+        )
+        self._ready = False
+
+    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> np.ndarray:
+        """Run motion regression using the cumulative RTPSpy pipeline."""
+
+        if not self._ready:
+            try:
+                self._ready = bool(self._regress.ready_proc())
+            except Exception as exc:  # pragma: no cover - safety guard
+                log.error(f"[REG] Failed to prepare regressor: {exc}")
+                return np.asanyarray(mc_img.dataobj)
+
+        if not self._ready:
+            return np.asanyarray(mc_img.dataobj)
+
+        try:
+            self._regress.do_proc(mc_img, vol_idx=volume_idx - 1)
+            if self._regress.proc_data is None:
+                return np.asanyarray(mc_img.dataobj)
+            return np.asarray(self._regress.proc_data, dtype=np.float32)
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
+            return np.asanyarray(mc_img.dataobj)
+
+
 # ---------- Simple config for this RT session ----------
 
 @dataclass
 class RTSessionConfig:
     subject: str
     day: str
-    run: str   # we will set this == block in main()
-    block: str
+    run: str
     incoming_root: Path
     base_data: Path
 
     @property
+    def subject_root(self) -> Path:
+        return self.base_data / f"sub-{self.subject}"
+
+    @property
     def day_root(self) -> Path:
-        return self.base_data / f"sub-{self.subject}" / self.day
+        return self.subject_root / self.day
 
     @property
     def trans_dir(self) -> Path:
@@ -98,11 +138,10 @@ class RTSessionConfig:
         """
         Where we put per-volume NIfTIs, logs, etc.
 
-        You said run == block and run folders are named as:
-          func/XXX
-        So for block 4 -> .../func/4
+        Runs are stored under func/XXX, where XXX corresponds to the middle
+        element of the DICOM name (historically called "block").
         """
-        d = self.day_root / "func" / self.block
+        d = self.day_root / "func" / self.run
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -156,7 +195,7 @@ class RTSessionConfig:
 def parse_dicom_name(name: str):
     """
     Parse a Siemens-like DICOM filename: 001_000004_000003.dcm
-    Returns (series_id, block, scan).
+    Returns (series_id, run_id, scan).
 
     001_000004_000003
      ^    ^       ^
@@ -171,11 +210,11 @@ def parse_dicom_name(name: str):
     series_str, block_str, scan_str = parts
     try:
         series_id = int(series_str)
-        block = int(block_str)
+        run_id = int(block_str)
         scan = int(scan_str)
     except ValueError:
         return None
-    return series_id, block, scan
+    return series_id, run_id, scan
 
 
 # ---------- Watchdog event handler ----------
@@ -184,7 +223,7 @@ class DICOMHandler(FileSystemEventHandler):
     def __init__(self, cfg: RTSessionConfig):
         super().__init__()
         self.cfg = cfg
-        self.current_block = int(cfg.block)
+        self.current_run = int(cfg.run)
         self.next_volume_idx = 1
 
         # --- RTPSpy Volreg ---
@@ -210,6 +249,7 @@ class DICOMHandler(FileSystemEventHandler):
         self.prev_motion = None              # previous 6-vector
         self.brain_radius_mm = 50.0          # standard radius for FD
         self.pre_trial_scans = 0             # if you ever want NaNs for early scans
+        self.motion_regressor = MotionRegressor(self.volreg)
 
         # --- Decoder / scorer ---
         decoder_path = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
@@ -235,15 +275,15 @@ class DICOMHandler(FileSystemEventHandler):
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
             return
 
-        series_id, block, scan = parsed
-        if block != self.current_block:
-            log.debug(f"[WATCHDOG] Ignoring block {block}, expecting {self.current_block}")
+        series_id, run_id, scan = parsed
+        if run_id != self.current_run:
+            log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
 
         volume_idx = self.next_volume_idx
         self.next_volume_idx += 1
 
-        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (block={block}, scan={scan})")
+        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={run_id}, scan={scan})")
         process_volume(self.cfg, self, path, volume_idx)
 
 
@@ -363,15 +403,22 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         start_t=t0,
     )
 
-
-
+    # ---------- 2c) Motion regression (RTPS_py) ----------
+    reg_t0 = time.time()
+    mc_for_warp = mc_nii
+    cleaned = handler.motion_regressor.apply(mc_img, volume_idx)
+    if not np.may_share_memory(cleaned, mc_data):
+        reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        mc_for_warp = reg_nii
+        log_step("REG", volume_idx, "motion", start_t=reg_t0)
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()
     mni_dir = cfg.rt_mni_dir
     mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
 
-    warp_t1_mni = cfg.day_root / "anat" / "warp_T1_to_MNI_synth.nii"
+    warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
     epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
     decoder_template = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
@@ -386,17 +433,17 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     cmd = [
         "bash", "-lc",
         f"""
-        export ANTS_USE_GPU=1
-        export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-        export OMP_NUM_THREADS=$(nproc)
-        antsApplyTransforms \
-          -d 3 \
-          -i {mc_nii} \
-          -r {decoder_template} \
-          -o {mni_nii} \
-          -t {warp_t1_mni} \
-          -t {epi2t1} \
-          -n Linear --float 1
+          export ANTS_USE_GPU=1
+          export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
+          export OMP_NUM_THREADS=$(nproc)
+          antsApplyTransforms \
+            -d 3 \
+            -i {mc_for_warp} \
+            -r {decoder_template} \
+            -o {mni_nii} \
+            -t {warp_t1_mni} \
+            -t {epi2t1} \
+            -n Linear --float 1
         """
     ]
     run(cmd)
@@ -463,8 +510,7 @@ def main():
     parser = argparse.ArgumentParser(description="Real-time fMRI watcher pipeline")
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
     parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
-    parser.add_argument("--run", required=True, help="Run index (for bookkeeping), e.g. 1")
-    parser.add_argument("--block", required=True, help="Block number, e.g. 4 (matches 000004 in DICOM name)")
+    parser.add_argument("--run", required=True, help="Run number, e.g. 4 (matches 000004 in DICOM name)")
     parser.add_argument(
         "--incoming-root",
         required=False,
@@ -479,12 +525,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Here we ENFORCE run == block for this RT pipeline
     cfg = RTSessionConfig(
         subject=args.sub,
         day=args.day,
-        run=args.block,   # run = block
-        block=args.block,
+        run=args.run,
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
     )
@@ -496,7 +540,7 @@ def main():
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
-    # Process existing DICOMs first (offline-style), but only for this block
+    # Process existing DICOMs first (offline-style), but only for this run
     existing = sorted(cfg.incoming_dir.glob("*.dcm"))
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
