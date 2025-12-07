@@ -86,7 +86,7 @@ class FMRIRealtimePreprocessor:
             print("✓ FastSurfer: already exists — skipping")
         else:
             print("→ Running FastSurfer")
-            self._run_fastsurfer(t1_n4, fastsurfer_dir)
+            self._run_fastsurfer(t1, fastsurfer_dir)
 
         # ---------- 3. BRAIN MASKS ----------
         t1_combined = self.anat_dir / "T1_combined_mask.nii"
