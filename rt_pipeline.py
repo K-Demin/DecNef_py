@@ -79,8 +79,7 @@ def append_fd(fd_path: Path, volume_idx: int, fd_value: float):
 class RTSessionConfig:
     subject: str
     day: str
-    run: str   # we will set this == block in main()
-    block: str
+    run: str
     incoming_root: Path
     base_data: Path
 
@@ -102,11 +101,10 @@ class RTSessionConfig:
         """
         Where we put per-volume NIfTIs, logs, etc.
 
-        You said run == block and run folders are named as:
-          func/XXX
-        So for block 4 -> .../func/4
+        Runs are stored under func/XXX, where XXX corresponds to the middle
+        element of the DICOM name (historically called "block").
         """
-        d = self.day_root / "func" / self.block
+        d = self.day_root / "func" / self.run
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -160,7 +158,7 @@ class RTSessionConfig:
 def parse_dicom_name(name: str):
     """
     Parse a Siemens-like DICOM filename: 001_000004_000003.dcm
-    Returns (series_id, block, scan).
+    Returns (series_id, run_id, scan).
 
     001_000004_000003
      ^    ^       ^
@@ -175,11 +173,11 @@ def parse_dicom_name(name: str):
     series_str, block_str, scan_str = parts
     try:
         series_id = int(series_str)
-        block = int(block_str)
+        run_id = int(block_str)
         scan = int(scan_str)
     except ValueError:
         return None
-    return series_id, block, scan
+    return series_id, run_id, scan
 
 
 # ---------- Watchdog event handler ----------
@@ -188,7 +186,7 @@ class DICOMHandler(FileSystemEventHandler):
     def __init__(self, cfg: RTSessionConfig):
         super().__init__()
         self.cfg = cfg
-        self.current_block = int(cfg.block)
+        self.current_run = int(cfg.run)
         self.next_volume_idx = 1
 
         # --- RTPSpy Volreg ---
@@ -239,15 +237,15 @@ class DICOMHandler(FileSystemEventHandler):
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
             return
 
-        series_id, block, scan = parsed
-        if block != self.current_block:
-            log.debug(f"[WATCHDOG] Ignoring block {block}, expecting {self.current_block}")
+        series_id, run_id, scan = parsed
+        if run_id != self.current_run:
+            log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
 
         volume_idx = self.next_volume_idx
         self.next_volume_idx += 1
 
-        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (block={block}, scan={scan})")
+        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={run_id}, scan={scan})")
         process_volume(self.cfg, self, path, volume_idx)
 
 
@@ -467,8 +465,7 @@ def main():
     parser = argparse.ArgumentParser(description="Real-time fMRI watcher pipeline")
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
     parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
-    parser.add_argument("--run", required=True, help="Run index (for bookkeeping), e.g. 1")
-    parser.add_argument("--block", required=True, help="Block number, e.g. 4 (matches 000004 in DICOM name)")
+    parser.add_argument("--run", required=True, help="Run number, e.g. 4 (matches 000004 in DICOM name)")
     parser.add_argument(
         "--incoming-root",
         required=False,
@@ -483,12 +480,10 @@ def main():
     )
     args = parser.parse_args()
 
-    # Here we ENFORCE run == block for this RT pipeline
     cfg = RTSessionConfig(
         subject=args.sub,
         day=args.day,
-        run=args.block,   # run = block
-        block=args.block,
+        run=args.run,
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
     )
@@ -500,7 +495,7 @@ def main():
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
-    # Process existing DICOMs first (offline-style), but only for this block
+    # Process existing DICOMs first (offline-style), but only for this run
     existing = sorted(cfg.incoming_dir.glob("*.dcm"))
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
