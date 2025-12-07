@@ -165,8 +165,8 @@ def main():
 
     args = parser.parse_args()
 
-    # infer layout: /root/sub-<subj>/<day>/anat
-    subj_root = args.root / f"sub-{args.subj}" / args.day
+    # infer layout: /root/sub-<subj>/anat
+    subj_root = args.root / f"sub-{args.subj}"
     anat_dir = subj_root / "anat"
     fs_subjects_dir = anat_dir / "fastsurfer"
     sid = f"{args.subj}_day-{args.day}"

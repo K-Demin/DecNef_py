@@ -13,6 +13,7 @@ class SubjectDayConfig:
     subject_id: str
     day_id: str
     root: Path
+    subject_root: Path
     ap_file: Path
     pa_file: Path
     t1_file: Path
@@ -25,6 +26,7 @@ class SubjectDayConfig:
     def from_json(cls, path: str | Path) -> "SubjectDayConfig":
         cfg = json.loads(Path(path).read_text())
         root = Path(cfg["root"])
+        subject_root = Path(cfg.get("subject_root", root.parent))
         runs = [
             RunConfig(id=r["id"], epi_file=root / r["epi_file"])
             for r in cfg["runs"]
@@ -33,9 +35,10 @@ class SubjectDayConfig:
             subject_id=cfg["subject_id"],
             day_id=cfg["day_id"],
             root=root,
+            subject_root=subject_root,
             ap_file=root / "fmap" / "AP.nii",
             pa_file=root / "fmap" / "PA.nii",
-            t1_file=root / "anat" / "T1.nii",
+            t1_file=subject_root / "anat" / "T1.nii",
             mni_template=Path(cfg["templates"]["mni_t1"]),
             runs=runs,
         )
@@ -51,8 +54,9 @@ class SubjectDayConfig:
         """
         Build config from a standard layout:
 
-        root/
+        subject_root/
           anat/T1.nii.gz
+        root/
           fmap/AP.nii.gz, PA.nii.gz
           func/run-XX/epi_basename
         """
@@ -87,9 +91,10 @@ class SubjectDayConfig:
             subject_id=subject_id,
             day_id=day_id,
             root=root,
+            subject_root=root.parent,
             ap_file=root / "fmap" / "AP.nii.gz",
             pa_file=root / "fmap" / "PA.nii.gz",
-            t1_file=root / "anat" / "T1.nii.gz",
+            t1_file=root.parent / "anat" / "T1.nii.gz",
             mni_template=mni_template,
             runs=runs,
         )
@@ -107,8 +112,9 @@ class SubjectDayConfig:
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
 
         Layout:
-            root/
+            subject_root/
               anat/T1.nii
+            root/
               fmap/AP.nii, PA.nii
               func/<run_id>/epi_4d.nii.gz
         """
@@ -133,9 +139,10 @@ class SubjectDayConfig:
             subject_id=subject_id,
             day_id=day_id,
             root=root,
+            subject_root=root.parent,
             ap_file=root / "fmap" / "AP.nii",
             pa_file=root / "fmap" / "PA.nii",
-            t1_file=root / "anat" / "T1.nii",
+            t1_file=root.parent / "anat" / "T1.nii",
             mni_template=mni_template,
             runs=runs,
         )
@@ -152,6 +159,7 @@ class SubjectDayConfig:
             "subject_id": self.subject_id,
             "day_id": self.day_id,
             "root": str(root),
+            "subject_root": str(self.subject_root),
             "templates": {
                 "mni_t1": str(self.mni_template),
             },
@@ -164,4 +172,4 @@ class SubjectDayConfig:
             ],
         }
         path = Path(path)
-        path.write_text(json.dumps(cfg, indent=2))
+        path.write_text(json.dumps(cfg, indent=2) + "\n")

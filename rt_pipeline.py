@@ -85,8 +85,12 @@ class RTSessionConfig:
     base_data: Path
 
     @property
+    def subject_root(self) -> Path:
+        return self.base_data / f"sub-{self.subject}"
+
+    @property
     def day_root(self) -> Path:
-        return self.base_data / f"sub-{self.subject}" / self.day
+        return self.subject_root / self.day
 
     @property
     def trans_dir(self) -> Path:
@@ -371,7 +375,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     mni_dir = cfg.rt_mni_dir
     mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
 
-    warp_t1_mni = cfg.day_root / "anat" / "warp_T1_to_MNI_synth.nii"
+    warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
     epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
     decoder_template = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
