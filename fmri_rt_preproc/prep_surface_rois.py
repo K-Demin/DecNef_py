@@ -95,7 +95,7 @@ def make_dkt_rois(sid: str, fs_subjects_dir: Path) -> None:
         log.info("Created %s", roi_lpfc_mgz)
 
     # --- Sensorimotor (M1 + S1) ---
-    roi_sens_mgz = mri_dir / "ROI_sensorimotor.mgz"
+    roi_sens_mgz = mri_dir / "ROI_Sensorimotor.mgz"
     if not roi_sens_mgz.exists():
         run([
             "mri_binarize",
