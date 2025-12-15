@@ -43,15 +43,15 @@ def log_step(step: str, vol: int, extra: str = "", start_t=None):
         log.info(f"[{step:<5}] vol {v}  {extra}")
 
 
-def append_score(csv_path: Path, volume_idx: int, raw_score: float, z_score: float):
+def append_score(csv_path: Path, volume_idx: int, raw_score: float):
     timestamp = time.time()
     exists = csv_path.exists()
 
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not exists:
-            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_z"])
-        writer.writerow([volume_idx, timestamp, raw_score, z_score])
+            writer.writerow(["volume_idx", "timestamp", "score_raw"])
+        writer.writerow([volume_idx, timestamp, raw_score])
 
 def append_motion(motion_path: Path, motion_vec: np.ndarray):
     """
@@ -79,23 +79,29 @@ class MotionRegressor:
 
     def __init__(self, volreg: RtpVolreg):
         self._regress = RtpRegress(
-            mot_reg="mot6",
+            mot_reg="mot12",
             volreg=volreg,
             TR=1.4,
             wait_num=0,
+            # max_poly_order=2,
             save_proc=False,
             online_saving=False,
             reg_retro_proc=False,
         )
         self._ready = False
 
-    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> np.ndarray:
+    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> tuple[np.ndarray, bool]:
         """
         Run motion regression using RTPSpy.
 
-        - Uses RTPSpy's internal state across volumes.
-        - Works in-place on mc_img.dataobj.
-        - Returns the regressed volume as a float32 array.
+        Returns
+        -------
+        cleaned_vol : np.ndarray
+            The (possibly regressed) volume data.
+        regressed   : bool
+            True if RtpRegress is actually active for this volume
+            (i.e., _vol_num > wait_num); False if this is still
+            effectively unregressed.
         """
 
         # Make sure the regressor has enough data/history
@@ -105,23 +111,33 @@ class MotionRegressor:
             except Exception as exc:
                 log.error(f"[REG] Failed to prepare regressor: {exc}")
                 # fall back to unregressed data
-                return np.asanyarray(mc_img.dataobj)
+                return np.asanyarray(mc_img.dataobj), False
 
         # If still not ready, just pass original data through
         if not self._ready:
-            return np.asanyarray(mc_img.dataobj)
+            return np.asanyarray(mc_img.dataobj), False
 
         try:
+            # Keep track of the internal volume counter
+            prev_vol = getattr(self._regress, "_vol_num", 0)
+
             # RTPSpy modifies mc_img in-place
             self._regress.do_proc(mc_img, vol_idx=volume_idx - 1)
 
-            # Grab the (now regressed) data from the image
-            return np.asarray(mc_img.dataobj, dtype=np.float32)
+            # After do_proc, RtpRegress increments _vol_num and
+            # only starts regression when _vol_num > wait_num
+            cur_vol = getattr(self._regress, "_vol_num", prev_vol + 1)
+            regressed = cur_vol > self._regress.wait_num
+
+            # Grab the (maybe regressed) data from the image
+            cleaned = np.asarray(mc_img.dataobj, dtype=np.float32)
+            return cleaned, regressed
 
         except Exception as exc:
             log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
             # fall back to unregressed
-            return np.asanyarray(mc_img.dataobj)
+            return np.asanyarray(mc_img.dataobj), False
+
 
 
 
@@ -421,7 +437,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     # ---------- 2c) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
     mc_for_warp = mc_nii
-    cleaned = handler.motion_regressor.apply(mc_img, volume_idx)
+    cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx)
     reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
     nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
     mc_for_warp = reg_nii
@@ -466,22 +482,27 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     # ---------- 4) Decoder scoring ----------
     t0 = time.time()
     try:
-        # Load the warped volume (decoder space) once
+        # Load the warped volume (decoder/ROI space)
         mni_img = nib.load(str(mni_nii))
         mni_data = np.asanyarray(mni_img.dataobj)
 
-        # First N volumes → baseline accumulation
-        if handler.scorer.baseline_count < handler.scorer.n_baseline:
+        # Only accumulate baseline from *denoised* volumes
+        if reg_ready and handler.scorer.baseline_count < handler.scorer.n_baseline:
             handler.scorer.accumulate_baseline(mni_data)
             if handler.scorer.baseline_count == handler.scorer.n_baseline:
                 handler.scorer.finalize_baseline()
 
-        raw_score, z_score = handler.scorer.score_from_array(mni_data, use_z=True)
-        append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score, z_score)
-        log_step("SCORE", volume_idx, f"raw={raw_score:.4f} z={z_score:.4f}", start_t=t0)
+        # Always compute raw; z will be NaN until baseline_ready
+        raw_score = handler.scorer.score_from_array(mni_data)
+        append_score(cfg.rt_work_dir / "scores_12.csv", volume_idx, raw_score)
+
+        extra = f"raw={raw_score:.4f}"
+
+        log_step("SCORE", volume_idx, extra, start_t=t0)
 
     except Exception as e:
         log.error(f"[SCORE] Failed scoring vol {volume_idx:05d}: {e}")
+
 
 
 
@@ -564,6 +585,8 @@ def main():
     print("[RT] Switching to online mode.")
     observer.start()
 
+    # observer.stop()
+    # observer.join()
     try:
         while True:
             time.sleep(0.2)

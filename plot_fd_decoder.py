@@ -18,7 +18,7 @@ def zscore(x):
 def load_scores(run_dir: Path):
     """
     Expect: scores.csv with header:
-    volume_idx, timestamp, score_raw, score_z
+    volume_idx, timestamp, score_raw
     (as written by your RT pipeline)
     """
     scores_path = run_dir / "scores.csv"
@@ -27,7 +27,9 @@ def load_scores(run_dir: Path):
 
     data = np.genfromtxt(scores_path, delimiter=",", names=True)
     vol_idx = data["volume_idx"].astype(int)
-    z_dec = data["score_z"].astype(float)
+    z_dec = data["score_raw"].astype(float)
+    vol_idx = vol_idx[10:]
+    z_dec = z_dec[10:]
     return vol_idx, z_dec
 
 
@@ -99,7 +101,7 @@ def align_by_volume_idx(vol_fd, fd, vol_dec, z_dec):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot z-scored FD and z-scored decoder (score_z) together."
+        description="Plot z-scored FD and denoised decoder together."
     )
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00085")
     parser.add_argument("--day", required=True, help="Day/session, e.g. 4")

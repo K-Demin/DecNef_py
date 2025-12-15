@@ -131,7 +131,7 @@ class FMRIRealtimePreprocessor:
         """
         sid = f"{self.cfg.subject_id}_day-{self.cfg.day_id}"
         fs_mri_dir = fastsurfer_dir / sid / "mri"
-        aparc_aseg = fs_mri_dir / "aseg.auto_noCCseg.mgz"
+        aparc_aseg = fs_mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
 
         brainmask_noCSF = self.anat_dir / "brainmask_noCSF.nii"
         filled = self.anat_dir / "brainmask_noCSF_filled.nii"

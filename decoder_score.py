@@ -188,33 +188,24 @@ class DecoderScorer:
 
     # ---------- Scoring ----------
 
-    def score_from_array(self, vol_arr: np.ndarray, use_z: bool = True):
+    def score_from_array(self, vol_arr: np.ndarray):
         """
         vol_arr: 3D volume in the same space as the decoder/ROI.
         Returns (raw_score, z_score).
 
         - raw_score: dot(vox, w) + bias  (no baseline normalization)
-        - z_score:   dot( (vox - mean)/std, w ) + bias
-                     (only if baseline_ready and use_z=True; else NaN)
         """
         vox = np.asanyarray(vol_arr, dtype=np.float32)[self.mask].ravel()
 
         # Raw dot-product decoder value (no baseline normalization)
         raw_score = float(np.dot(vox, self.w) + self.bias)
 
-        # ATR-style normalized decoder value
-        if use_z and self.baseline_ready:
-            z = (vox - self.baseline_mean) / self.baseline_std
-            z_score = float(np.dot(z, self.w) + self.bias)
-        else:
-            z_score = float("nan")
+        return raw_score
 
-        return raw_score, z_score
-
-    def score_volume(self, vol_path: str | Path, use_z: bool = True):
+    def score_volume(self, vol_path: str | Path):
         """
         Convenience: load 3D NIfTI from disk and score it.
         """
         img = nib.load(str(vol_path))
         data = np.asanyarray(img.dataobj)
-        return self.score_from_array(data, use_z=use_z)
+        return self.score_from_array(data)
