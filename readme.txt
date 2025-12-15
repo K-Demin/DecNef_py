@@ -41,6 +41,7 @@ Typical usage:
     conda activate rt_pipe
     python run_preproc.py --sub 00085 --day 4
     python rt_pipeline.py --sub 00085 --day 2 --run 11 --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya  --base-data /SSD2/DecNef_py/data
+    python -m fmri_rt_preproc.prep_surface_rois --root /SSD2/DecNef_py/data --subj 00085 --day 2_copy
 
 For full fastsurfer preproc + ROI masks (you can run it before run_preproc):
     python -m fmri_rt_preproc.prep_surface_rois \
