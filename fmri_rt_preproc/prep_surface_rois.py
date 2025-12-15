@@ -41,7 +41,7 @@ def run_fastsurfer_full(
     ensure_dir(fs_subjects_dir)
 
     subj_dir = fs_subjects_dir / sid
-    aseg = subj_dir / "mri" / "aseg.mgz"
+    aseg = subj_dir / "mri" / "aparc.DKTatlas+aseg.deep.mgz"
 
     if aseg.exists():
         log.info("FastSurfer already completed for %s – skipping.", sid)
