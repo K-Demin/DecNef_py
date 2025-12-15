@@ -194,6 +194,12 @@ class RTSessionConfig:
         return d
 
     @property
+    def rt_reg_dir(self) -> Path:
+        d = self.rt_work_dir / "reg"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @property
     def rt_mni_dir(self) -> Path:
         d = self.rt_work_dir / "mni"
         d.mkdir(parents=True, exist_ok=True)
@@ -438,7 +444,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     reg_t0 = time.time()
     mc_for_warp = mc_nii
     cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx)
-    reg_nii = mc_dir / f"vol_{volume_idx:05d}_mc_reg.nii"
+    reg_dir = cfg.rt_reg_dir
+    reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
     nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
     mc_for_warp = reg_nii
     log_step("REG", volume_idx, "motion", start_t=reg_t0)
