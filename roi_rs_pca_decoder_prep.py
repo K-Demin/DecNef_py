@@ -119,22 +119,28 @@ def _is_rest_name(name: str) -> bool:
     return any(k in low for k in keywords)
 
 
-def _rs_priority_for_pca(path: Path) -> Tuple[int, int]:
+def _rs_priority_for_pca(path: Path) -> Tuple[int, int, int]:
     low = path.name.lower()
+    parent_low = path.parent.name.lower()
     denoise_keys = ["denoise", "resid", "clean", "regress", "regressed", "nuis", "filtered", "noise"]
     mc_keys = ["mc", "motioncorr", "distcorr", "preproc"]
-    has_denoise = any(k in low for k in denoise_keys)
-    has_mc = any(k in low for k in mc_keys)
-    return (0 if has_denoise else 1, 0 if has_mc else 1)
+    has_denoise = any(k in low for k in denoise_keys) or parent_low == "reg"
+    has_mc = any(k in low for k in mc_keys) or parent_low == "mc"
+    # Prefer reg/denoised first, then mc, then everything else
+    dir_score = 0 if parent_low == "reg" else (1 if parent_low == "mc" else 2)
+    return (dir_score, 0 if has_denoise else 1, 0 if has_mc else 1)
 
 
-def _rs_priority_for_tsnr(path: Path) -> Tuple[int, int]:
+def _rs_priority_for_tsnr(path: Path) -> Tuple[int, int, int]:
     low = path.name.lower()
+    parent_low = path.parent.name.lower()
     pre_keys = ["mc", "distcorr", "stc", "preproc", "raw"]
     denoise_keys = ["denoise", "resid", "clean", "regress", "regressed", "nuis", "filtered", "noise"]
-    has_pre = any(k in low for k in pre_keys)
-    has_denoise = any(k in low for k in denoise_keys)
-    return (0 if has_pre else 1, 1 if has_denoise else 0)
+    has_pre = any(k in low for k in pre_keys) or parent_low == "mc"
+    has_denoise = any(k in low for k in denoise_keys) or parent_low == "reg"
+    # Prefer mc/preproc for tSNR, avoid denoised when possible
+    dir_score = 0 if parent_low == "mc" else (1 if parent_low == "reg" else 2)
+    return (dir_score, 0 if has_pre else 1, 1 if has_denoise else 0)
 
 
 def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
@@ -145,8 +151,11 @@ def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
 
 def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
     candidates: List[Tuple[Path, nib.Nifti1Header]] = []
+    priority_dirs = {"reg", "mc"}
     for path in _list_imaging_files(data_dir):
-        if not _is_rest_name(path.name):
+        parent_low = path.parent.name.lower()
+        is_reg_or_mc = parent_low in priority_dirs or any(part.lower() in priority_dirs for part in path.parts[-3:])
+        if not (_is_rest_name(path.name) or is_reg_or_mc):
             continue
         try:
             hdr = nib.load(str(path)).header
