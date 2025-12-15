@@ -43,6 +43,7 @@ class FMRIRealtimePreprocessor:
         self.fastsurfer_env = fastsurfer_env
         self.ants_env = ants_env
         self.trans_dir = self.func_dir / "trans"
+        self.fastsurfer_sid = self.cfg.subject_id
 
         # --- NEW: global EPI reference for RT (per day) ---
         # This will be set from the FIRST run we preprocess.
@@ -79,8 +80,9 @@ class FMRIRealtimePreprocessor:
         fastsurfer_dir = self.anat_dir / "fastsurfer"
         ensure_dir(fastsurfer_dir)
 
-        sid = f"{self.cfg.subject_id}_day-{self.cfg.day_id}"
-        aparc_aseg = fastsurfer_dir / sid / "mri" / "aseg.auto_noCCseg.mgz"
+        aparc_aseg = (
+            fastsurfer_dir / self.fastsurfer_sid / "mri" / "aseg.auto_noCCseg.mgz"
+        )
 
         if aparc_aseg.exists():
             print("✓ FastSurfer: already exists — skipping")
@@ -109,13 +111,12 @@ class FMRIRealtimePreprocessor:
 
     def _run_fastsurfer(self, t1_n4: Path, fs_base_dir: Path):
         """
-        Run FastSurfer in a separate conda env, once per subject/day.
+        Run FastSurfer in a separate conda env, once per subject (shared across days).
         """
-        sid = f"{self.cfg.subject_id}_day-{self.cfg.day_id}"
         cmd_str = (
             f"run_fastsurfer.sh "
             f"--t1 {t1_n4} "
-            f"--sid {sid} "
+            f"--sid {self.fastsurfer_sid} "
             f"--sd {fs_base_dir} "
             "--threads max --seg_only --3T --device cuda"
         )
@@ -129,8 +130,7 @@ class FMRIRealtimePreprocessor:
         - Resamples brainmask_noCSF_filled to T1 brain mask space
         - Multiplies to get T1_combined_mask.nii
         """
-        sid = f"{self.cfg.subject_id}_day-{self.cfg.day_id}"
-        fs_mri_dir = fastsurfer_dir / sid / "mri"
+        fs_mri_dir = fastsurfer_dir / self.fastsurfer_sid / "mri"
         aparc_aseg = fs_mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
 
         brainmask_noCSF = self.anat_dir / "brainmask_noCSF.nii"

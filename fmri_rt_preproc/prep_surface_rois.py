@@ -169,12 +169,12 @@ def main():
     subj_root = args.root / f"sub-{args.subj}"
     anat_dir = subj_root / "anat"
     fs_subjects_dir = anat_dir / "fastsurfer"
-    sid = f"{args.subj}_day-{args.day}"
+    sid = args.subj
 
     log.info("Subject root: %s", subj_root)
     log.info("Anat dir    : %s", anat_dir)
     log.info("FastSurfer sd: %s", fs_subjects_dir)
-    log.info("FS subject ID: %s", sid)
+    log.info("FS subject ID (subject-level): %s", sid)
 
     t1_path = find_t1(anat_dir)
 
