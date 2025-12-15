@@ -1,4 +1,12 @@
 # fmri_rt_preproc/prep_surface_rois.py
+#
+#
+#python -m fmri_rt_preproc.prep_surface_rois \
+# --root /SSD2/DecNef_py/data \
+# --subj 00085 \
+# --day 2_copy
+#
+
 
 from __future__ import annotations
 import argparse
@@ -95,7 +103,7 @@ def make_dkt_rois(sid: str, fs_subjects_dir: Path) -> None:
         log.info("Created %s", roi_lpfc_mgz)
 
     # --- Sensorimotor (M1 + S1) ---
-    roi_sens_mgz = mri_dir / "ROI_sensorimotor.mgz"
+    roi_sens_mgz = mri_dir / "ROI_Sensorimotor.mgz"
     if not roi_sens_mgz.exists():
         run([
             "mri_binarize",

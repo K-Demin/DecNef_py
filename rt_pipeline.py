@@ -79,7 +79,7 @@ class MotionRegressor:
 
     def __init__(self, volreg: RtpVolreg):
         self._regress = RtpRegress(
-            mot_reg="mot12",
+            mot_reg="mot6",
             volreg=volreg,
             TR=1.4,
             wait_num=0,
@@ -501,7 +501,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(mni_data)
-        append_score(cfg.rt_work_dir / "scores_12.csv", volume_idx, raw_score)
+        append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
 
         extra = f"raw={raw_score:.4f}"
 
