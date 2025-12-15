@@ -4,10 +4,10 @@ roi_rs_pca_decoder_prep.py
 HOW TO USE
 ----------
 1) Keep the USER SETTINGS block below as-is unless you want to tweak ROI/KVOX/etc.
-2) Run the script by specifying subject and run/day IDs (data are under ./data):
-       python roi_rs_pca_decoder_prep.py -subj 00085 -run 3
-3) Inputs are discovered under ./data/sub-<subj>/<run>/ and outputs are written
-   to ./data/sub-<subj>/PCA/<run>/<ROI>/.
+2) Run the script by specifying subject, day, and run IDs (data are under ./data):
+       python roi_rs_pca_decoder_prep.py -subj 00085 -day 3 -run 1
+3) Inputs are discovered under ./data/sub-<subj>/<day>/func/<run>/ and outputs
+   are written to ./data/sub-<subj>/<day>/PCA/<run>/<ROI>/.
 
 This script auto-discovers resting-state (RS) fMRI inputs, ROI masks in EPI space,
 optional FD vectors, and optional brain/GM masks. It computes voxelwise tSNR,
@@ -108,8 +108,9 @@ def score_components(volume_3d: np.ndarray, voxel_indices: np.ndarray, weights: 
     return weights @ x
 
 
-def _list_nifti_files(data_dir: Path) -> List[Path]:
-    return [p for p in data_dir.rglob("*.nii*") if p.is_file()]
+def _list_imaging_files(data_dir: Path) -> List[Path]:
+    exts = (".nii", ".nii.gz", ".mgz")
+    return [p for p in data_dir.rglob("*") if p.is_file() and any(p.name.lower().endswith(ext) for ext in exts)]
 
 
 def _is_rest_name(name: str) -> bool:
@@ -144,7 +145,7 @@ def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
 
 def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
     candidates: List[Tuple[Path, nib.Nifti1Header]] = []
-    for path in _list_nifti_files(data_dir):
+    for path in _list_imaging_files(data_dir):
         if not _is_rest_name(path.name):
             continue
         try:
@@ -182,19 +183,23 @@ def _discover_mask(paths: Iterable[Path], keywords: Sequence[str]) -> Optional[P
     return best
 
 
-def _discover_roi_masks(data_dir: Path, roi_names: Sequence[str]) -> dict:
-    all_nii = _list_nifti_files(data_dir)
+def _discover_roi_masks(search_dirs: Sequence[Path], roi_names: Sequence[str]) -> dict:
     roi_masks = {}
+    all_paths: List[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            all_paths.extend(_list_imaging_files(d))
+
     for roi in roi_names:
         roi_low = roi.lower()
         matches = []
-        for p in all_nii:
+        for p in all_paths:
             name_low = p.name.lower()
             if roi_low in name_low and any(key in name_low for key in ["roi", "mask"]):
                 matches.append(p)
         if not matches:
             # allow looser match
-            for p in all_nii:
+            for p in all_paths:
                 if roi_low in p.name.lower():
                     matches.append(p)
         if matches:
@@ -203,9 +208,12 @@ def _discover_roi_masks(data_dir: Path, roi_names: Sequence[str]) -> dict:
     return roi_masks
 
 
-def _discover_optional_mask(data_dir: Path, name_keywords: Sequence[str]) -> Optional[Path]:
-    all_nii = _list_nifti_files(data_dir)
-    return _discover_mask(all_nii, name_keywords)
+def _discover_optional_mask(search_dirs: Sequence[Path], name_keywords: Sequence[str]) -> Optional[Path]:
+    all_paths: List[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            all_paths.extend(_list_imaging_files(d))
+    return _discover_mask(all_paths, name_keywords)
 
 
 def _discover_fd_vector(data_dir: Path, t_expected: int) -> Optional[np.ndarray]:
@@ -360,9 +368,15 @@ def _corr_pc1_fd(pc1: np.ndarray, fd: np.ndarray) -> Optional[float]:
     return float(np.corrcoef(pc1, fd)[0, 1])
 
 
-def process_dataset(data_dir: Path, roi_names: Sequence[str], out_root: Optional[Path] = None) -> None:
-    print(f"\nProcessing dataset: {data_dir}")
-    pca_rs_path, tsnr_rs_path = _discover_rs_inputs(data_dir)
+def process_dataset(
+    run_dir: Path,
+    roi_names: Sequence[str],
+    roi_search_dirs: Optional[Sequence[Path]] = None,
+    mask_search_dirs: Optional[Sequence[Path]] = None,
+    out_root: Optional[Path] = None,
+) -> None:
+    print(f"\nProcessing dataset: {run_dir}")
+    pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir)
     tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
     if len(tsnr_data.shape) != 4:
         raise ValueError(f"tSNR input is not 4D: {tsnr_rs_path}")
@@ -382,17 +396,20 @@ def process_dataset(data_dir: Path, roi_names: Sequence[str], out_root: Optional
     if not _affine_close(pca_affine, tsnr_affine):
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
 
-    fd_vec = _discover_fd_vector(data_dir, t_all)
+    fd_vec = _discover_fd_vector(run_dir, t_all)
 
-    brain_mask_path = _discover_optional_mask(data_dir, ["brainmask", "mask_brain", "brain_mask"])
-    gm_mask_path = _discover_optional_mask(data_dir, ["gm_mask", "gmmask", "ribbon", "gm"])
+    roi_dirs = list(roi_search_dirs or [run_dir])
+    mask_dirs = list(mask_search_dirs or roi_dirs)
 
-    roi_masks = _discover_roi_masks(data_dir, roi_names)
+    brain_mask_path = _discover_optional_mask(mask_dirs, ["brainmask", "mask_brain", "brain_mask"])
+    gm_mask_path = _discover_optional_mask(mask_dirs, ["gm_mask", "gmmask", "ribbon", "gm"])
+
+    roi_masks = _discover_roi_masks(roi_dirs, roi_names)
     if not roi_masks:
         print("No ROI masks found; skipping dataset.")
         return
 
-    out_root = out_root or data_dir / "PCA"
+    out_root = out_root or run_dir / "PCA"
     out_root.mkdir(parents=True, exist_ok=True)
     _save_nifti_like(tsnr_img, tsnr_map, out_root / "tsnr_full.nii.gz")
 
@@ -591,41 +608,52 @@ def process_dataset(data_dir: Path, roi_names: Sequence[str], out_root: Optional
     print(f"QC summary saved to {qc_path}")
 
 
-def _build_run_dir(base_data: Path, subj: str, run: str) -> Path:
+def _build_run_dir(base_data: Path, subj: str, day: str, run: str) -> Path:
     subj_dir = base_data / f"sub-{subj}"
-    # Allow run id with or without prefix (e.g., "3" or "run-03")
-    candidate_runs = [subj_dir / run]
+    day_dir = subj_dir / day
+    func_dir = day_dir / "func"
+    # Allow run id with or without prefix (e.g., "1" or "run-01")
+    candidate_runs = [func_dir / run]
     if not run.startswith("run-"):
-        candidate_runs.append(subj_dir / f"run-{run}")
+        candidate_runs.append(func_dir / f"run-{run}")
     for c in candidate_runs:
         if c.exists():
             return c
-    # Fallback to first candidate even if missing so error surfaces downstream
     return candidate_runs[0]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare ROI PCA decoder inputs")
     parser.add_argument("-subj", required=True, help="Subject ID (e.g., 00085)")
-    parser.add_argument("-run", required=True, help="Run/day ID (e.g., 3 or run-03)")
+    parser.add_argument("-day", required=True, help="Day/session ID (e.g., 3)")
+    parser.add_argument("-run", required=True, help="Run ID within the day (e.g., 1 or run-01)")
     parser.add_argument(
         "--base-data",
         default=Path(__file__).resolve().parent / "data",
         type=Path,
-        help="Root data directory containing sub-*/<run>/ (default: ./data)",
+        help="Root data directory containing sub-*/day/func/run folders (default: ./data)",
     )
     args = parser.parse_args()
 
-    run_dir = _build_run_dir(Path(args.base_data), args.subj, args.run)
-    subj_dir = run_dir.parent
+    run_dir = _build_run_dir(Path(args.base_data), args.subj, args.day, args.run)
+    day_dir = run_dir.parent.parent  # .../day/func/run -> day
+    subj_dir = day_dir.parent
 
     if not run_dir.exists():
         print(f"Run directory not found: {run_dir}")
         return
 
     try:
-        out_root = subj_dir / "PCA" / run_dir.name
-        process_dataset(run_dir, ROI_NAMES, out_root=out_root)
+        anat_fs_dir = subj_dir / "anat" / "fastsurfer" / subj_dir.name / "mri"
+        roi_search_dirs = [run_dir, day_dir, subj_dir, anat_fs_dir]
+        out_root = day_dir / "PCA" / run_dir.name
+        process_dataset(
+            run_dir,
+            ROI_NAMES,
+            roi_search_dirs=roi_search_dirs,
+            mask_search_dirs=roi_search_dirs,
+            out_root=out_root,
+        )
     except Exception as e:
         print(f"Error processing {run_dir}: {e}")
 
