@@ -129,6 +129,72 @@ def _stage_convert_to_target(
     return dest_path
 
 
+def _stage_epi_block(
+    incoming_dir: Path,
+    block_id: int,
+    run_dir: Path,
+    keep_start: int = 11,
+    keep_end: int = 30,
+) -> list[Path]:
+    """
+    Stage a subset of EPI DICOMs for a given block/run and convert to NIfTI.
+
+    By default, drops the first 10 volumes (scans 1-10) and keeps scans 11-30
+    so the resulting NIfTI set has 20 volumes.
+    """
+
+    ensure_dir(run_dir)
+
+    existing = sorted(run_dir.glob("*.nii*"))
+    if existing:
+        log.info("Found existing EPI NIfTIs in %s; skipping staging", run_dir)
+        return existing
+
+    if block_id is None:
+        raise ValueError(
+            "--epi-block is required to stage incoming EPI DICOMs when --incoming-root is used."
+        )
+
+    selected_dicoms: list[Path] = []
+    for f in sorted(incoming_dir.iterdir()):
+        if not f.is_file() or f.suffix.lower() != ".dcm":
+            continue
+        parsed = _parse_dicom_name(f.name)
+        if parsed is None:
+            continue
+        _, run_id, scan = parsed
+        if run_id == block_id and keep_start <= scan <= keep_end:
+            selected_dicoms.append(f)
+
+    expected = keep_end - keep_start + 1
+    if len(selected_dicoms) != expected:
+        raise FileNotFoundError(
+            f"Expected {expected} DICOMs for block/run {block_id} in scans {keep_start}-{keep_end}, "
+            f"but found {len(selected_dicoms)} in {incoming_dir}."
+        )
+
+    log.info(
+        "Staging %d EPI DICOM(s) for block %s into %s (keeping scans %d-%d)",
+        len(selected_dicoms),
+        block_id,
+        run_dir,
+        keep_start,
+        keep_end,
+    )
+    for src in selected_dicoms:
+        dst = run_dir / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+
+    converted = _convert_dicoms_if_needed(run_dir, "epi")
+    if not converted:
+        raise FileNotFoundError(
+            f"Failed to convert staged EPI DICOMs for block/run {block_id} in {run_dir}"
+        )
+
+    return converted
+
+
 def _find_structural(anat_dir: Path) -> Path:
     """Locate the first structural (T1) scan, converting DICOMs if necessary."""
 
@@ -199,6 +265,11 @@ def main():
         help="Block/run id for the PA fieldmap DICOMs inside incoming-root (required when using --incoming-root).",
     )
     parser.add_argument(
+        "--epi-block",
+        type=int,
+        help="Block/run id for the EPI DICOMs inside incoming-root (used to stage scans 11-30 into func/trans).",
+    )
+    parser.add_argument(
         "--no-save-config",
         action="store_true",
         help="Do not write config.json (use only in-memory config).",
@@ -217,10 +288,15 @@ def main():
 
         anat_dir = day_root.parent / "anat"
         fmap_dir = day_root / "fmap"
+        ensure_dir(anat_dir)
+        ensure_dir(fmap_dir)
+        ensure_dir(run_dir)
 
         structural_present = any(anat_dir.glob("T1*.nii*")) or any(
             f.is_file() and f.suffix.lower() == ".dcm" for f in anat_dir.iterdir()
         )
+
+        epi_present = any(run_dir.glob("*.nii*"))
 
         if None in (args.ap_block, args.pa_block):
             raise ValueError(
@@ -243,6 +319,11 @@ def main():
 
         _stage_convert_to_target(incoming_dir, args.ap_block, fmap_dir / "AP.nii.gz")
         _stage_convert_to_target(incoming_dir, args.pa_block, fmap_dir / "PA.nii.gz")
+
+        if epi_present:
+            log.info("Found existing EPI NIfTI(s) in %s; skipping --epi-block staging", run_dir)
+        else:
+            _stage_epi_block(incoming_dir, args.epi_block, run_dir)
 
     # ------------------------------------------------------------------
     # 1) Collect ALL EPI files in this run and merge into a single 4D file
