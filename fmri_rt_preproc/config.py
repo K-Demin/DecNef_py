@@ -108,6 +108,8 @@ class SubjectDayConfig:
         run_id: str,
         epi_file: Path,
         t1_file: Path | None = None,
+        ap_file: Path | None = None,
+        pa_file: Path | None = None,
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -136,14 +138,29 @@ class SubjectDayConfig:
 
         runs = [RunConfig(id=run_id, epi_file=epi_file)]
 
+        def pick_existing(primary: Path, fallback_suffix: str) -> Path:
+            if primary.exists():
+                return primary
+            fallback = primary.with_suffix(primary.suffix + fallback_suffix)
+            return fallback if fallback.exists() else primary
+
+        ap_path = ap_file or root / "fmap" / "AP.nii"
+        ap_path = pick_existing(ap_path, ".gz")
+
+        pa_path = pa_file or root / "fmap" / "PA.nii"
+        pa_path = pick_existing(pa_path, ".gz")
+
+        t1_path = t1_file or root.parent / "anat" / "T1.nii"
+        t1_path = pick_existing(t1_path, ".gz")
+
         return cls(
             subject_id=subject_id,
             day_id=day_id,
             root=root,
             subject_root=root.parent,
-            ap_file=root / "fmap" / "AP.nii",
-            pa_file=root / "fmap" / "PA.nii",
-            t1_file=t1_file or root.parent / "anat" / "T1.nii",
+            ap_file=ap_path,
+            pa_file=pa_path,
+            t1_file=t1_path,
             mni_template=mni_template,
             runs=runs,
         )
