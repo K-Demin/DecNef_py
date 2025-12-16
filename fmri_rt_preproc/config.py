@@ -107,6 +107,7 @@ class SubjectDayConfig:
         root: Path,
         run_id: str,
         epi_file: Path,
+        t1_file: Path | None = None,
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -142,7 +143,7 @@ class SubjectDayConfig:
             subject_root=root.parent,
             ap_file=root / "fmap" / "AP.nii",
             pa_file=root / "fmap" / "PA.nii",
-            t1_file=root.parent / "anat" / "T1.nii",
+            t1_file=t1_file or root.parent / "anat" / "T1.nii",
             mni_template=mni_template,
             runs=runs,
         )

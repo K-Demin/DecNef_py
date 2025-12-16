@@ -6,12 +6,66 @@ import time
 
 from fmri_rt_preproc.config import SubjectDayConfig
 from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
-from fmri_rt_preproc.utils import run  # <- to call fslmerge
+from fmri_rt_preproc.utils import ensure_dir, run  # <- to call fslmerge
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc")
 
 BASE_DATA = Path(__file__).resolve().parent / "data"
+
+
+def _convert_dicoms_if_needed(dicom_dir: Path, out_prefix: str) -> list[Path]:
+    """Convert DICOMs in ``dicom_dir`` to NIfTI using dcm2niix if present."""
+
+    # Accept both lower- and upper-case extensions so the caller doesn't have to
+    # normalize filenames.
+    dicoms = sorted(
+        f
+        for f in dicom_dir.iterdir()
+        if f.is_file() and f.suffix.lower() == ".dcm"
+    )
+    if not dicoms:
+        return []
+
+    log.info("No NIfTI files found – converting %d DICOMs in %s", len(dicoms), dicom_dir)
+
+    ensure_dir(dicom_dir)
+    run([
+        "dcm2niix",
+        "-z",
+        "y",
+        "-b",
+        "n",
+        "-f",
+        out_prefix,
+        "-o",
+        str(dicom_dir),
+        str(dicom_dir),
+    ])
+
+    converted = sorted(dicom_dir.glob(f"{out_prefix}*.nii*"))
+    log.info("Converted %d NIfTI file(s) from DICOMs", len(converted))
+    return converted
+
+
+def _find_structural(anat_dir: Path) -> Path:
+    """Locate the first structural (T1) scan, converting DICOMs if necessary."""
+
+    ensure_dir(anat_dir)
+
+    candidates = sorted(anat_dir.glob("T1*.nii*"))
+    if not candidates:
+        converted = _convert_dicoms_if_needed(anat_dir, "T1")
+        candidates = sorted(converted)
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No structural scan found in {anat_dir}. "
+            "Expected T1*.nii* or DICOM files."
+        )
+
+    log.info("Using structural scan: %s", candidates[0])
+    return candidates[0]
 
 
 def main():
@@ -41,8 +95,12 @@ def main():
     # ------------------------------------------------------------------
     epi_files = sorted(run_dir.glob(args.epi_pattern))
     if not epi_files:
+        epi_files = _convert_dicoms_if_needed(run_dir, "epi")
+
+    if not epi_files:
         raise FileNotFoundError(
-            f"No EPI files found in {run_dir} matching pattern '{args.epi_pattern}'"
+            f"No EPI files found in {run_dir} matching pattern '{args.epi_pattern}' "
+            "or convertible DICOMs."
         )
 
     log.info(f"Found {len(epi_files)} EPI files in {run_dir}")
@@ -60,12 +118,15 @@ def main():
     # 2) Build a config for this single run
     # ------------------------------------------------------------------
     # NOTE: we don't have args.run anymore; just give a fixed run_id
+    t1_path = _find_structural(day_root.parent / "anat")
+
     cfg = SubjectDayConfig.for_single_run(
         subject_id=args.sub,
         day_id=args.day,
         root=day_root,
         run_id="trans",      # arbitrary ID for this synthetic run
         epi_file=merged_epi,
+        t1_file=t1_path,
     )
 
     # Optionally save config.json so you can re-use it later
