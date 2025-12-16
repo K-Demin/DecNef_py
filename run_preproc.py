@@ -98,6 +98,15 @@ def _stage_convert_to_target(
         log.info("Found existing file %s; skipping conversion", dest_path)
         return dest_path
 
+    # Stage DICOMs in an isolated folder so conversions do not mix across runs.
+    dest_prefix = dest_path.stem
+    staging_dir = dest_path.parent / f".{dest_prefix}_dicoms"
+    ensure_dir(staging_dir)
+
+    # Clear any stale staged files from prior attempts.
+    for stale in staging_dir.iterdir():
+        stale.unlink()
+
     dicoms = _dicoms_for_block(incoming_dir, block_id)
     if not dicoms:
         raise FileNotFoundError(
@@ -105,15 +114,14 @@ def _stage_convert_to_target(
         )
 
     log.info(
-        "Staging %d DICOM(s) for block %s into %s", len(dicoms), block_id, dest_path.parent
+        "Staging %d DICOM(s) for block %s into %s", len(dicoms), block_id, staging_dir
     )
     for src in dicoms:
-        dst = dest_path.parent / src.name
+        dst = staging_dir / src.name
         if not dst.exists():
             shutil.copy2(src, dst)
 
-    dest_prefix = dest_path.name.split(".")[0]
-    converted = _convert_dicoms_if_needed(dest_path.parent, dest_prefix)
+    converted = _convert_dicoms_if_needed(staging_dir, dest_prefix)
     if not converted:
         raise FileNotFoundError(
             f"Failed to convert staged DICOMs for block/run {block_id} in {dest_path.parent}"
@@ -125,6 +133,11 @@ def _stage_convert_to_target(
         if dest_path.exists():
             dest_path.unlink()
         chosen.rename(dest_path)
+
+    # Clean up staged DICOMs to avoid re-conversion side effects later.
+    for staged in staging_dir.iterdir():
+        staged.unlink()
+    staging_dir.rmdir()
 
     return dest_path
 
