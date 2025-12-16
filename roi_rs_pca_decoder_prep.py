@@ -2,6 +2,8 @@
 roi_rs_pca_decoder_prep.py
 
 HOW TO USE
+
+# python roi_rs_pca_decoder_prep.py -subj 00085 -day 2 -run 7
 ----------
 1) Keep the USER SETTINGS block below as-is unless you want to tweak ROI/KVOX/etc.
 2) Run the script by specifying subject, day, and run IDs (data are under ./data):
@@ -25,10 +27,17 @@ from __future__ import annotations
 ROI_NAMES = ["EVC", "LPFC", "Sensorimotor"]
 KVOX = 2000
 N_COMPONENTS = 10
-FD_THRESH = 0.3
+FD_THRESH = 0.2
 MIN_NEIGHBORS = 0  # 0 disables neighbor filtering
 USE_ZSCORE = True
 SEED = 0
+
+
+AUTO_FSLMERGE_4D = True
+FSLMERGE_OUTDIR_NAME = "analysis"  # where to write the merged 4D under run_dir
+PREFER_MERGED_BASENAME = "rs_4d"   # filename stem: rs_4d_mc.nii.gz / rs_4d_reg.nii.gz
+USE_MOTION_QC = True              # load motion_rt.1D and compute PC1 motion corr
+
 # ----------------------
 
 import csv
@@ -41,7 +50,10 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import nibabel as nib
 import numpy as np
-
+import re
+import subprocess
+from pathlib import Path
+import matplotlib.pyplot as plt
 
 @dataclass
 class DiscoveredInputs:
@@ -150,8 +162,10 @@ def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
 
 
 def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
+    # ---- 1) Original logic: find 4D candidates anywhere under run_dir ----
     candidates: List[Tuple[Path, nib.Nifti1Header]] = []
     priority_dirs = {"reg", "mc"}
+
     for path in _list_imaging_files(data_dir):
         parent_low = path.parent.name.lower()
         is_reg_or_mc = parent_low in priority_dirs or any(part.lower() in priority_dirs for part in path.parts[-3:])
@@ -165,14 +179,57 @@ def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
             continue
         candidates.append((path, hdr))
 
-    if not candidates:
-        raise FileNotFoundError(f"No resting-state NIfTI found under {data_dir}")
+    if candidates:
+        pca_sorted = sorted(candidates, key=lambda x: _rs_priority_for_pca(x[0]))
+        tsnr_sorted = sorted(candidates, key=lambda x: _rs_priority_for_tsnr(x[0]))
+        pca_rs = pca_sorted[0][0]
+        tsnr_rs = tsnr_sorted[0][0] if tsnr_sorted else pca_rs
+        return pca_rs, tsnr_rs
 
-    pca_sorted = sorted(candidates, key=lambda x: _rs_priority_for_pca(x[0]))
-    tsnr_sorted = sorted(candidates, key=lambda x: _rs_priority_for_tsnr(x[0]))
-    pca_rs = pca_sorted[0][0]
-    tsnr_rs = tsnr_sorted[0][0] if tsnr_sorted else pca_rs
+    # ---- 2) Fallback: build 4D from 3D-per-TR in mc/ or reg/ ----
+    if not AUTO_FSLMERGE_4D:
+        raise FileNotFoundError(f"No resting-state 4D NIfTI found under {data_dir} (and AUTO_FSLMERGE_4D is False)")
+
+    mc_dir = data_dir / "mc"
+    reg_dir = data_dir / "reg"
+
+    # Prefer reg (denoised) for PCA, but tSNR wants mc if available.
+    reg_vols = _find_3d_series(reg_dir) if reg_dir.exists() else []
+    mc_vols = _find_3d_series(mc_dir) if mc_dir.exists() else []
+
+    if not reg_vols and not mc_vols:
+        raise FileNotFoundError(f"No resting-state NIfTI found under {data_dir} (no 4D files; no 3D series in mc/ or reg/)")
+
+    out_dir = data_dir / FSLMERGE_OUTDIR_NAME
+    merged_reg = out_dir / f"{PREFER_MERGED_BASENAME}_reg.nii.gz"
+    merged_mc  = out_dir / f"{PREFER_MERGED_BASENAME}_mc.nii.gz"
+
+    # Merge what exists
+    if reg_vols and (not merged_reg.exists()):
+        print(f"Building 4D from reg/ ({len(reg_vols)} vols) -> {merged_reg}")
+        ok = _run_fslmerge(reg_vols, merged_reg)
+        if not ok:
+            raise RuntimeError("Failed to fslmerge reg/ 3D volumes into 4D.")
+    if mc_vols and (not merged_mc.exists()):
+        print(f"Building 4D from mc/ ({len(mc_vols)} vols) -> {merged_mc}")
+        ok = _run_fslmerge(mc_vols, merged_mc)
+        if not ok:
+            raise RuntimeError("Failed to fslmerge mc/ 3D volumes into 4D.")
+
+    # Decide PCA vs tSNR inputs
+    # PCA: prefer reg merged if exists; otherwise mc merged
+    pca_rs = merged_reg if merged_reg.exists() else merged_mc
+    # tSNR: prefer mc merged if exists; otherwise reg merged
+    tsnr_rs = merged_mc if merged_mc.exists() else merged_reg
+
+    # sanity check they are 4D
+    for p in [pca_rs, tsnr_rs]:
+        hdr = nib.load(str(p)).header
+        if len(hdr.get_data_shape()) != 4:
+            raise RuntimeError(f"Merged file is not 4D: {p} shape={hdr.get_data_shape()}")
+
     return pca_rs, tsnr_rs
+
 
 
 def _discover_mask(paths: Iterable[Path], keywords: Sequence[str]) -> Optional[Path]:
@@ -226,26 +283,66 @@ def _discover_optional_mask(search_dirs: Sequence[Path], name_keywords: Sequence
 
 
 def _discover_fd_vector(data_dir: Path, t_expected: int) -> Optional[np.ndarray]:
-    text_exts = [".txt", ".tsv", ".csv"]
-    fd_files = []
-    for ext in text_exts:
-        fd_files.extend(data_dir.rglob(f"*fd*{ext}"))
-        fd_files.extend(data_dir.rglob(f"*framewise*{ext}"))
+    fdt = data_dir / "fd_rt.csv"
+    if not fdt.exists():
+        print("No fd_rt.csv found in run folder; FD censoring disabled.")
+        return None
 
-    for f in fd_files:
-        try:
-            fd = np.loadtxt(f, dtype=np.float32, delimiter=None)
-        except Exception:
-            continue
-        fd = np.atleast_1d(fd)
-        if fd.ndim > 1:
-            fd = fd.reshape(-1)
-        if fd.size == t_expected:
-            print(f"Found FD file: {f} (length {fd.size})")
-            return fd
-        else:
-            print(f"Warning: FD length mismatch for {f} (found {fd.size}, expected {t_expected}); ignoring.")
-    return None
+    try:
+        # Try DictReader first (header-aware)
+        with open(fdt, "r", newline="") as f:
+            sample = f.read(2048)
+            f.seek(0)
+            has_header = any(h in sample.lower() for h in ["fd", "framewise"]) and ("," in sample or "\t" in sample)
+
+            if has_header:
+                reader = csv.DictReader(f)
+                vals = []
+                for row in reader:
+                    if "fd" in row and row["fd"] != "":
+                        vals.append(float(row["fd"]))
+                    else:
+                        # fallback: second column if fd missing
+                        items = list(row.values())
+                        if len(items) >= 2 and items[1] != "":
+                            vals.append(float(items[1]))
+                fd = np.array(vals, dtype=np.float32)
+            else:
+                # No reliable header: read as plain CSV and take 2nd column
+                f.seek(0)
+                raw = []
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    # skip non-numeric header-ish lines
+                    try:
+                        raw.append(float(parts[1]))
+                    except ValueError:
+                        continue
+                fd = np.array(raw, dtype=np.float32)
+
+        fd = np.atleast_1d(fd).reshape(-1)
+
+        # Handle common FD length conventions
+        if fd.size == t_expected - 1:
+            print(f"FD length is T-1 ({fd.size}); prepending 0 to match T={t_expected}.")
+            fd = np.concatenate([[0.0], fd]).astype(np.float32)
+
+        if fd.size != t_expected:
+            print(f"Warning: FD length mismatch in fd_rt.csv (found {fd.size}, expected {t_expected}); ignoring FD.")
+            return None
+
+        print(f"Found FD in: {fdt} (length {fd.size})")
+        return fd
+
+    except Exception as e:
+        print(f"Warning: failed to read FD from {fdt}: {e}")
+        return None
+
 
 
 def _affine_close(a1: np.ndarray, a2: np.ndarray, tol: float = 1e-3) -> bool:
@@ -317,13 +414,22 @@ def _prepare_roi(
     brain_mask: Optional[np.ndarray],
     gm_mask: Optional[np.ndarray],
     output_dir: Path,
+    run_dir: Path,  # <-- add this new argument
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    roi_data, roi_affine, _ = _load_nifti(roi_mask_path)
-    if roi_data.shape != tsnr_map.shape:
-        raise ValueError(f"ROI {roi} mask shape {roi_data.shape} does not match RS shape {tsnr_map.shape}")
-    if not _affine_close(roi_affine, reference_img.affine):
+
+    roi_mask, roi_affine = _load_mask_in_epi_space(
+        roi=roi,
+        roi_mask_path=roi_mask_path,
+        tsnr_map_3d=tsnr_map,
+        tsnr_img_3d=reference_img,
+        run_dir=run_dir,
+        roi_out_dir=output_dir,
+    )
+    if roi_mask is None:
+        raise ValueError(f"ROI {roi} could not be loaded/warped into EPI space: {roi_mask_path}")
+
+    if roi_affine is not None and not _affine_close(roi_affine, reference_img.affine):
         print(f"  Warning: ROI {roi} affine differs from RS affine; proceeding with caution.")
-    roi_mask = roi_data > 0
 
     _save_nifti_like(reference_img, roi_mask.astype(np.float32), output_dir / "roi_original_mask.nii.gz")
 
@@ -406,6 +512,7 @@ def process_dataset(
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
 
     fd_vec = _discover_fd_vector(run_dir, t_all)
+    motion_mat = _load_motion_1d(run_dir, t_all) if USE_MOTION_QC else None
 
     roi_dirs = list(roi_search_dirs or [run_dir])
     mask_dirs = list(mask_search_dirs or roi_dirs)
@@ -461,6 +568,7 @@ def process_dataset(
             brain_mask,
             gm_mask,
             roi_dir,
+            run_dir,
         )
 
         vox_orig = int(np.sum(roi_original_mask))
@@ -537,6 +645,8 @@ def process_dataset(
             continue
 
         pc_corr = _corr_pc1_fd(timecourses[:, 0], fd_used) if fd_used is not None else None
+        motion_qc = _pc1_motion_qc(timecourses[:, 0], motion_mat[keep, :] if (
+                    motion_mat is not None and fd_used is not None) else motion_mat) if USE_MOTION_QC else None
 
         # Save outputs
         np.save(roi_dir / "pca_explained.npy", explained)
@@ -568,6 +678,8 @@ def process_dataset(
             "voxel_count": vox_selected,
             "t_original": t_all,
             "t_used": t_used,
+            "motion_file": str(run_dir / "motion_rt.1D") if (run_dir / "motion_rt.1D").exists() else None,
+            "pc1_motion_corr": motion_qc,
             "decoder_ready": "scores = weights @ voxel_values (optionally z-scored)",
         }
         with open(roi_dir / "decoder_metadata.json", "w") as f:
@@ -631,6 +743,274 @@ def _build_run_dir(base_data: Path, subj: str, day: str, run: str) -> Path:
     return candidate_runs[0]
 
 
+def _load_motion_1d(run_dir: Path, t_expected: int) -> Optional[np.ndarray]:
+    f = run_dir / "motion_rt.1D"
+    if not f.exists():
+        return None
+    try:
+        arr = np.loadtxt(f, dtype=np.float32)
+        arr = np.atleast_2d(arr)
+        if arr.shape[0] != t_expected and arr.shape[1] == t_expected:
+            arr = arr.T
+        if arr.shape[0] == t_expected:
+            return arr
+        # allow T-1 by prepending zeros
+        if arr.shape[0] == t_expected - 1:
+            z = np.zeros((1, arr.shape[1]), dtype=np.float32)
+            return np.vstack([z, arr])
+        print(f"Warning: motion_rt.1D length mismatch (got {arr.shape}, expected T={t_expected}); ignoring.")
+        return None
+    except Exception as e:
+        print(f"Warning: failed to read motion_rt.1D: {e}")
+        return None
+
+def _pc1_motion_qc(pc1: np.ndarray, motion: np.ndarray) -> Optional[dict]:
+    if motion is None or pc1 is None:
+        return None
+    if motion.shape[0] != pc1.size or pc1.size < 2:
+        return None
+    out = {}
+    for j in range(motion.shape[1]):
+        x = motion[:, j]
+        if np.std(x) == 0 or np.std(pc1) == 0:
+            out[f"mot{j+1:02d}"] = None
+        else:
+            out[f"mot{j+1:02d}"] = float(np.corrcoef(pc1, x)[0, 1])
+    # convenience: max abs corr across cols
+    vals = [abs(v) for v in out.values() if v is not None]
+    out["max_abs_corr"] = float(max(vals)) if vals else None
+    return out
+
+
+def _find_epi2t1_composite(run_dir: Path) -> Optional[Path]:
+    """
+    Expected layout (your pipeline):
+      <day>/func/trans/epi2t1_Composite.h5
+    run_dir = <day>/func/<run>
+    """
+    try:
+        day_dir = run_dir.parent.parent  # <day>
+        trans_dir = day_dir / "func" / "trans"
+        comp = trans_dir / "epi2t1_Composite.h5"
+        return comp if comp.exists() else None
+    except Exception:
+        return None
+
+
+def _maybe_convert_to_nifti(mask_path: Path, out_dir: Path) -> Path:
+    """
+    antsApplyTransforms is happiest with NIfTI. FastSurfer ROIs are often .mgz.
+    Convert .mgz/.mgh -> .nii.gz using mri_convert if available; otherwise try to use as-is.
+    """
+    low = mask_path.name.lower()
+    if low.endswith((".nii", ".nii.gz")):
+        return mask_path
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_nii = out_dir / (mask_path.stem.replace(".mgz", "").replace(".mgh", "") + ".nii.gz")
+
+    if out_nii.exists():
+        return out_nii
+
+    # Try FreeSurfer mri_convert
+    try:
+        subprocess.run(
+            ["mri_convert", str(mask_path), str(out_nii)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return out_nii
+    except Exception as e:
+        print(f"Warning: failed to mri_convert {mask_path} -> {out_nii}: {e}")
+        # Fall back to original path (might still work)
+        return mask_path
+
+
+def warp_t1_mask_to_epi(
+    roi_t1_path: Path,
+    run_dir: Path,          # MUST be .../day/func/<run>
+    epi_ref_3d: Path,
+    out_roi_epi: Path,
+) -> Path:
+    import subprocess
+
+    out_roi_epi.parent.mkdir(parents=True, exist_ok=True)
+    if out_roi_epi.exists():
+        return out_roi_epi
+
+    # run_dir = .../sub-XXXX/<day>/func/<run>
+    day_dir = run_dir.parent.parent # .../sub-XXXX/<day>
+    trans_dir = day_dir / "func" / "trans"          # .../sub-XXXX/<day>/func/trans
+    inv_comp = trans_dir / "epi2t1_InverseComposite.h5"
+    if not inv_comp.exists():
+        raise FileNotFoundError(f"Missing T1→EPI transform: {inv_comp}")
+
+    # Convert mgz -> nii.gz if needed
+    roi_in = roi_t1_path
+    if roi_t1_path.suffix.lower() == ".mgz":
+        roi_in = out_roi_epi.parent / (roi_t1_path.stem + ".nii.gz")
+        if not roi_in.exists():
+            subprocess.run(["mri_convert", str(roi_t1_path), str(roi_in)], check=True)
+
+    cmd = [
+        "bash", "-lc",
+        f"""
+        antsApplyTransforms -d 3 \
+          -i {roi_in} \
+          -r {epi_ref_3d} \
+          -o {out_roi_epi} \
+          -t {inv_comp} \
+          -n NearestNeighbor --float 1
+        """
+    ]
+    subprocess.run(cmd, check=True)
+    return out_roi_epi
+
+
+
+def _load_mask_in_epi_space(
+    roi: str,
+    roi_mask_path: Path,
+    tsnr_map_3d: np.ndarray,
+    tsnr_img_3d: nib.Nifti1Image,
+    run_dir: Path,
+    roi_out_dir: Path,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Returns (mask_bool_3d, affine) in EPI space.
+    If roi_mask_path is not in EPI space, tries to warp it using inverse epi2t1_Composite.h5.
+    """
+    # First try direct load
+    data, aff, _ = _load_nifti(roi_mask_path)
+    if data.shape == tsnr_map_3d.shape:
+        return (data > 0), aff
+
+    # Try warp T1->EPI using inverse of epi2t1 composite
+    comp = _find_epi2t1_composite(run_dir)
+    if comp is None:
+        print(f"  ROI {roi}: mask is not in EPI space and epi2t1_Composite.h5 not found; cannot warp.")
+        return None, None
+
+    # Use the already-saved tSNR 3D as reference grid for warping
+    # (we ensure it exists below in process_dataset)
+    epi_ref = run_dir.parent.parent / "func" / "trans" / "rt_ref_epi.nii"
+    if not epi_ref.exists():
+        epi_ref = run_dir.parent.parent / "func" / "trans" / "epi_unwarped_mean.nii"
+
+    warped_path = roi_out_dir / "roi_in_epi.nii.gz"
+    warped = warp_t1_mask_to_epi(
+        roi_t1_path=roi_mask_path,
+        run_dir=run_dir,
+        epi_ref_3d=epi_ref,
+        out_roi_epi=warped_path,
+    )
+    if warped is None:
+        return None, None
+
+    # Load warped ROI and validate
+    wdata, waff, _ = _load_nifti(warped)
+    if wdata.shape != tsnr_map_3d.shape:
+        print(f"  ROI {roi}: warped mask shape {wdata.shape} still != EPI shape {tsnr_map_3d.shape}; skipping.")
+        return None, None
+
+    return (wdata > 0), waff
+
+def make_qc_plots(out_root: Path):
+    """
+    Saves QC plots for each ROI into:
+      out_root/<ROI>/qc_*.png
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # force non-interactive backend (prevents "flash then disappear")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import nibabel as nib
+
+    for roi_dir in sorted([p for p in out_root.iterdir() if p.is_dir()]):
+        roi = roi_dir.name
+        # required files
+        p_expl = roi_dir / "pca_explained.npy"
+        p_tc   = roi_dir / "pca_timecourses.npy"
+        p_tsnr = roi_dir / "roi_tsnr_in_roi.nii.gz"
+        p_roi  = roi_dir / "roi_in_epi.nii.gz"
+        p_sel  = roi_dir / "roi_selected_mask.nii.gz"
+
+        if not (p_expl.exists() and p_tc.exists() and p_tsnr.exists() and p_roi.exists() and p_sel.exists()):
+            continue
+
+        # ---------- PCA scree ----------
+        expl = np.load(p_expl)
+        plt.figure()
+        plt.plot(np.arange(1, len(expl) + 1), expl, "o-")
+        plt.xlabel("PC index")
+        plt.ylabel("Explained variance ratio")
+        plt.title(f"{roi}: PCA scree")
+        plt.yscale("log")
+        plt.tight_layout()
+        plt.savefig(roi_dir / "qc_pca_scree.png", dpi=200)
+        plt.close()
+
+        # ---------- PCA timecourses ----------
+        tc = np.load(p_tc)  # (T, nPC)
+        plt.figure(figsize=(10, 6))
+        for i in range(min(5, tc.shape[1])):
+            plt.plot(tc[:, i] + i * 5, label=f"PC{i + 1}")
+        plt.xlabel("Time (TRs)")
+        plt.title(f"{roi}: Top PCA timecourses (offset)")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(roi_dir / "qc_pca_timecourses.png", dpi=200)
+        plt.close()
+
+        # ---------- tSNR distributions ----------
+        tsnr = nib.load(str(p_tsnr)).get_fdata()
+        roi_mask = nib.load(str(p_roi)).get_fdata() > 0
+        sel_mask = nib.load(str(p_sel)).get_fdata() > 0
+
+        tsnr_vals = tsnr[roi_mask]
+        sel_vals  = tsnr[sel_mask]
+
+        plt.figure()
+        plt.hist(tsnr_vals, bins=100, log=True)
+        plt.xlabel("tSNR")
+        plt.ylabel("Voxel count (log)")
+        plt.title(f"{roi}: tSNR distribution (ROI)")
+        plt.tight_layout()
+        plt.savefig(roi_dir / "qc_tsnr_hist.png", dpi=200)
+        plt.close()
+
+        # ---------- tSNR decay curve ----------
+        tsnr_sorted = np.sort(tsnr_vals)[::-1]
+        cum = np.arange(1, len(tsnr_sorted) + 1)
+        plt.figure()
+        plt.plot(cum, tsnr_sorted)
+        plt.axvline(min(KVOX, len(tsnr_sorted)), color="gray", ls="--", label=f"KVOX={KVOX}")
+        plt.xlabel("Voxel rank (sorted by tSNR)")
+        plt.ylabel("tSNR")
+        plt.title(f"{roi}: tSNR decay curve")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(roi_dir / "qc_tsnr_decay.png", dpi=200)
+        plt.close()
+
+        # ---------- ROI vs selected comparison ----------
+        plt.figure()
+        plt.hist(tsnr_vals, bins=100, alpha=0.5, label="All ROI", log=True)
+        plt.hist(sel_vals, bins=100, alpha=0.5, label="Selected voxels", log=True)
+        plt.xlabel("tSNR")
+        plt.ylabel("Voxel count (log)")
+        plt.legend()
+        plt.title(f"{roi}: tSNR ROI vs selected")
+        plt.tight_layout()
+        plt.savefig(roi_dir / "qc_tsnr_roi_vs_selected.png", dpi=200)
+        plt.close()
+
+    print(f"[QC] Saved plots under: {out_root}")
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Prepare ROI PCA decoder inputs")
     parser.add_argument("-subj", required=True, help="Subject ID (e.g., 00085)")
@@ -653,18 +1033,62 @@ def main():
         return
 
     try:
-        anat_fs_dir = subj_dir / "anat" / "fastsurfer" / subj_dir.name / "mri"
-        roi_search_dirs = [run_dir, day_dir, subj_dir, anat_fs_dir]
+        anat_dir = subj_dir / "anat"  # sub-00085/anat
+        roi_search_dirs = [anat_dir]  # ONLY subject anatomy
         out_root = day_dir / "PCA" / run_dir.name
         process_dataset(
             run_dir,
             ROI_NAMES,
             roi_search_dirs=roi_search_dirs,
-            mask_search_dirs=roi_search_dirs,
+            mask_search_dirs=[run_dir, day_dir],  # masks (if any) can still be searched near run
             out_root=out_root,
         )
+        make_qc_plots(out_root)
     except Exception as e:
         print(f"Error processing {run_dir}: {e}")
+        raise
+
+
+def _natural_sort_key(p: Path):
+    # Sort vol_00001_mc.nii, vol_00002_mc.nii, ... safely
+    nums = re.findall(r"\d+", p.name)
+    return (int(nums[-1]) if nums else 10**12, p.name)
+
+def _find_3d_series(dirpath: Path) -> List[Path]:
+    exts = (".nii", ".nii.gz", ".mgz")
+    vols = [p for p in dirpath.glob("*") if p.is_file() and p.name.lower().endswith(exts)]
+    vols = sorted(vols, key=_natural_sort_key)
+    # Keep only 3D volumes (fast header check)
+    out = []
+    for p in vols:
+        try:
+            shp = nib.load(str(p)).header.get_data_shape()
+        except Exception:
+            continue
+        if len(shp) == 3:
+            out.append(p)
+    return out
+
+def _run_fslmerge(vols: List[Path], out_4d: Path) -> bool:
+    """
+    Returns True if merged successfully.
+    Requires FSL in PATH (fslmerge).
+    """
+    if not vols:
+        return False
+    out_4d.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["fslmerge", "-t", str(out_4d)] + [str(v) for v in vols]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return True
+    except FileNotFoundError:
+        print("Warning: fslmerge not found in PATH. Install FSL or disable AUTO_FSLMERGE_4D.")
+        return False
+    except subprocess.CalledProcessError as e:
+        print("Warning: fslmerge failed.")
+        print("STDERR:", e.stderr.strip())
+        return False
+
 
 
 if __name__ == "__main__":

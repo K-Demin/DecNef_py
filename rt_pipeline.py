@@ -592,14 +592,14 @@ def main():
     print("[RT] Switching to online mode.")
     observer.start()
 
-    # observer.stop()
-    # observer.join()
-    try:
-        while True:
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        observer.stop()
+    observer.stop()
     observer.join()
+    # try:
+    #     while True:
+    #         time.sleep(0.2)
+    # except KeyboardInterrupt:
+    #     observer.stop()
+    # observer.join()
 
 
 if __name__ == "__main__":
