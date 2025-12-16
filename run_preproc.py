@@ -215,16 +215,32 @@ def main():
         if not incoming_dir.exists():
             raise FileNotFoundError(f"Incoming directory does not exist: {incoming_dir}")
 
-        if None in (args.struct_block, args.ap_block, args.pa_block):
-            raise ValueError(
-                "When providing --incoming-root you must also set --struct-block, "
-                "--ap-block, and --pa-block so the correct DICOM runs can be staged."
-            )
-
         anat_dir = day_root.parent / "anat"
         fmap_dir = day_root / "fmap"
 
-        _stage_convert_to_target(incoming_dir, args.struct_block, anat_dir / "T1.nii.gz")
+        structural_present = any(anat_dir.glob("T1*.nii*")) or any(
+            f.is_file() and f.suffix.lower() == ".dcm" for f in anat_dir.iterdir()
+        )
+
+        if None in (args.ap_block, args.pa_block):
+            raise ValueError(
+                "When providing --incoming-root you must also set --ap-block and --pa-block "
+                "so the correct DICOM runs can be staged."
+            )
+
+        if args.struct_block is None and not structural_present:
+            raise ValueError(
+                "When providing --incoming-root you must set --struct-block unless the anat "
+                "folder already contains a structural scan."
+            )
+
+        if args.struct_block is not None:
+            _stage_convert_to_target(incoming_dir, args.struct_block, anat_dir / "T1.nii.gz")
+        elif structural_present:
+            log.info(
+                "Found existing structural in %s; skipping --struct-block staging", anat_dir
+            )
+
         _stage_convert_to_target(incoming_dir, args.ap_block, fmap_dir / "AP.nii.gz")
         _stage_convert_to_target(incoming_dir, args.pa_block, fmap_dir / "PA.nii.gz")
 
