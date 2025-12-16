@@ -87,21 +87,16 @@ def _dicoms_for_block(incoming_dir: Path, block_id: int) -> list[Path]:
     return dicoms
 
 
-def _stage_and_convert(
-    incoming_dir: Path, block_id: int, dest_dir: Path, prefix: str
-) -> list[Path]:
-    """
-    Copy DICOMs for ``block_id`` into ``dest_dir`` and convert to NIfTI.
+def _stage_convert_to_target(
+    incoming_dir: Path, block_id: int, dest_path: Path
+) -> Path:
+    """Stage a specific block's DICOMs and convert them to a fixed NIfTI name."""
 
-    Returns the converted NIfTI paths.
-    """
+    ensure_dir(dest_path.parent)
 
-    ensure_dir(dest_dir)
-
-    existing = sorted(dest_dir.glob(f"{prefix}*.nii*"))
-    if existing:
-        log.info("Found existing %s NIfTI(s) in %s; skipping conversion", prefix, dest_dir)
-        return existing
+    if dest_path.exists():
+        log.info("Found existing file %s; skipping conversion", dest_path)
+        return dest_path
 
     dicoms = _dicoms_for_block(incoming_dir, block_id)
     if not dicoms:
@@ -109,20 +104,29 @@ def _stage_and_convert(
             f"No DICOMs found in {incoming_dir} for block/run {block_id}."
         )
 
-    log.info("Staging %d DICOM(s) for block %s into %s", len(dicoms), block_id, dest_dir)
-    staged: list[Path] = []
+    log.info(
+        "Staging %d DICOM(s) for block %s into %s", len(dicoms), block_id, dest_path.parent
+    )
     for src in dicoms:
-        dst = dest_dir / src.name
+        dst = dest_path.parent / src.name
         if not dst.exists():
             shutil.copy2(src, dst)
-        staged.append(dst)
 
-    converted = _convert_dicoms_if_needed(dest_dir, prefix)
+    dest_prefix = dest_path.name.split(".")[0]
+    converted = _convert_dicoms_if_needed(dest_path.parent, dest_prefix)
     if not converted:
         raise FileNotFoundError(
-            f"Failed to convert staged DICOMs for block/run {block_id} in {dest_dir}"
+            f"Failed to convert staged DICOMs for block/run {block_id} in {dest_path.parent}"
         )
-    return converted
+
+    # Normalize the converted file to the expected name (e.g., AP.nii.gz)
+    chosen = converted[0]
+    if chosen != dest_path:
+        if dest_path.exists():
+            dest_path.unlink()
+        chosen.rename(dest_path)
+
+    return dest_path
 
 
 def _find_structural(anat_dir: Path) -> Path:
@@ -182,17 +186,17 @@ def main():
     parser.add_argument(
         "--struct-block",
         type=int,
-        help="Block/run id for the structural (UNI/T1) DICOMs inside incoming-root.",
+        help="Block/run id for the structural (UNI/T1) DICOMs inside incoming-root (required when using --incoming-root).",
     )
     parser.add_argument(
         "--ap-block",
         type=int,
-        help="Block/run id for the AP fieldmap DICOMs inside incoming-root.",
+        help="Block/run id for the AP fieldmap DICOMs inside incoming-root (required when using --incoming-root).",
     )
     parser.add_argument(
         "--pa-block",
         type=int,
-        help="Block/run id for the PA fieldmap DICOMs inside incoming-root.",
+        help="Block/run id for the PA fieldmap DICOMs inside incoming-root (required when using --incoming-root).",
     )
     parser.add_argument(
         "--no-save-config",
@@ -211,15 +215,18 @@ def main():
         if not incoming_dir.exists():
             raise FileNotFoundError(f"Incoming directory does not exist: {incoming_dir}")
 
-        if args.struct_block is not None:
-            anat_dir = day_root.parent / "anat"
-            _stage_and_convert(incoming_dir, args.struct_block, anat_dir, "T1")
+        if None in (args.struct_block, args.ap_block, args.pa_block):
+            raise ValueError(
+                "When providing --incoming-root you must also set --struct-block, "
+                "--ap-block, and --pa-block so the correct DICOM runs can be staged."
+            )
 
+        anat_dir = day_root.parent / "anat"
         fmap_dir = day_root / "fmap"
-        if args.ap_block is not None:
-            _stage_and_convert(incoming_dir, args.ap_block, fmap_dir, "AP")
-        if args.pa_block is not None:
-            _stage_and_convert(incoming_dir, args.pa_block, fmap_dir, "PA")
+
+        _stage_convert_to_target(incoming_dir, args.struct_block, anat_dir / "T1.nii.gz")
+        _stage_convert_to_target(incoming_dir, args.ap_block, fmap_dir / "AP.nii.gz")
+        _stage_convert_to_target(incoming_dir, args.pa_block, fmap_dir / "PA.nii.gz")
 
     # ------------------------------------------------------------------
     # 1) Collect ALL EPI files in this run and merge into a single 4D file
