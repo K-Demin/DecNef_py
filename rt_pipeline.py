@@ -5,6 +5,7 @@ import logging
 import argparse
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional
 
 import nibabel as nib
 import numpy as np
@@ -43,7 +44,7 @@ def log_step(step: str, vol: int, extra: str = "", start_t=None):
         log.info(f"[{step:<5}] vol {v}  {extra}")
 
 
-def append_score(csv_path: Path, volume_idx: int, raw_score: float):
+def append_score(csv_path: Path, volume_idx: int, raw_score: float) -> float:
     timestamp = time.time()
     exists = csv_path.exists()
 
@@ -52,6 +53,7 @@ def append_score(csv_path: Path, volume_idx: int, raw_score: float):
         if not exists:
             writer.writerow(["volume_idx", "timestamp", "score_raw"])
         writer.writerow([volume_idx, timestamp, raw_score])
+    return timestamp
 
 def append_motion(motion_path: Path, motion_vec: np.ndarray):
     """
@@ -150,6 +152,7 @@ class RTSessionConfig:
     run: str
     incoming_root: Path
     base_data: Path
+    decoder_template: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -257,11 +260,12 @@ def parse_dicom_name(name: str):
 # ---------- Watchdog event handler ----------
 
 class DICOMHandler(FileSystemEventHandler):
-    def __init__(self, cfg: RTSessionConfig):
+    def __init__(self, cfg: RTSessionConfig, score_queue: Optional[object] = None):
         super().__init__()
         self.cfg = cfg
         self.current_run = int(cfg.run)
         self.next_volume_idx = 1
+        self.score_queue = score_queue
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -289,7 +293,11 @@ class DICOMHandler(FileSystemEventHandler):
         self.motion_regressor = MotionRegressor(self.volreg)
 
         # --- Decoder / scorer ---
-        decoder_path = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
+        decoder_path = cfg.decoder_template or (
+            Path(cfg.base_data).parent
+            / "decoders"
+            / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
+        )
         roi_txt = cfg.trans_dir / "ROI_DECODER.txt"
 
         self.scorer = DecoderScorer(
@@ -457,7 +465,11 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
     warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
     epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-    decoder_template = Path(cfg.base_data).parent / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
+    decoder_template = cfg.decoder_template or (
+        Path(cfg.base_data).parent
+        / "decoders"
+        / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
+    )
 
     if not decoder_template.exists():
         log.error(f"Decoder template not found at {decoder_template}")
@@ -501,7 +513,18 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(mni_data)
-        append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
+        timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
+        if handler.score_queue is not None:
+            try:
+                handler.score_queue.put_nowait(
+                    {
+                        "volume_idx": volume_idx,
+                        "timestamp": timestamp,
+                        "score_raw": raw_score,
+                    }
+                )
+            except Exception as exc:
+                log.error(f"[SCORE] Failed to enqueue score for vol {volume_idx:05d}: {exc}")
 
         extra = f"raw={raw_score:.4f}"
 
@@ -548,6 +571,29 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
 
 # ---------- Main ----------
 
+def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
+    event_handler = DICOMHandler(cfg, score_queue=score_queue)
+    observer = Observer()
+    observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
+
+    # Process existing DICOMs first (offline-style), but only for this run
+    existing = sorted(cfg.incoming_dir.glob("*.dcm"))
+    if existing:
+        print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
+        for f in existing:
+            event_handler.process_file(Path(f))
+
+    print("[RT] Switching to online mode.")
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Real-time fMRI watcher pipeline")
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
@@ -565,6 +611,11 @@ def main():
         default="/SSD2/DecNef_py/data",
         help="Base preproc data folder (same as offline pipeline).",
     )
+    parser.add_argument(
+        "--decoder-template",
+        required=False,
+        help="Optional decoder template path to override the default.",
+    )
     args = parser.parse_args()
 
     cfg = RTSessionConfig(
@@ -573,33 +624,13 @@ def main():
         run=args.run,
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
+        decoder_template=Path(args.decoder_template) if args.decoder_template else None,
     )
 
     if not cfg.incoming_dir.exists():
         raise FileNotFoundError(f"Incoming directory does not exist: {cfg.incoming_dir}")
 
-    event_handler = DICOMHandler(cfg)
-    observer = Observer()
-    observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
-
-    # Process existing DICOMs first (offline-style), but only for this run
-    existing = sorted(cfg.incoming_dir.glob("*.dcm"))
-    if existing:
-        print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
-        for f in existing:
-            event_handler.process_file(Path(f))
-
-    print("[RT] Switching to online mode.")
-    observer.start()
-
-    observer.stop()
-    observer.join()
-    # try:
-    #     while True:
-    #         time.sleep(0.2)
-    # except KeyboardInterrupt:
-    #     observer.stop()
-    # observer.join()
+    run_rt_pipeline(cfg)
 
 
 if __name__ == "__main__":
