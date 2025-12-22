@@ -41,6 +41,7 @@ class RegressorSettings:
     enable_motion_regression: bool = True
     mot_reg: str = "mot6"
     max_poly_order: float = np.inf
+    TR: float = 0.9
     use_gs: bool = True
     use_wm: bool = True
     use_vent: bool = True
@@ -51,10 +52,12 @@ REGRESSOR_SETTINGS = RegressorSettings(
     # - enable_motion_regression: True/False to toggle RtpRegress entirely.
     # - mot_reg: one of {"None", "mot6", "mot12", "dmot6"} (RTPSpy-supported).
     # - max_poly_order: int >= 0 or np.inf (higher allows more polynomial terms).
+    # - TR: float > 0 (seconds, used for polynomial regressor timing).
     # - use_gs/use_wm/use_vent: True/False to include each mask regressor when file exists.
     enable_motion_regression=True,
     mot_reg="mot6",
     max_poly_order=np.inf,
+    TR=0.9,
     use_gs=True,
     use_wm=True,
     use_vent=True,
@@ -113,11 +116,12 @@ class MotionRegressor:
             vent_mask: Optional[Path] = None,
             mot_reg: str = "mot6",
             max_poly_order: float = np.inf,
+            TR: float = 0.9,
     ):
         kwargs = dict(
             mot_reg=mot_reg,
             volreg=volreg,
-            TR=0.9,
+            TR=TR,
             wait_num=0,
             max_poly_order=max_poly_order,
             save_proc=False,
@@ -375,6 +379,7 @@ class DICOMHandler(FileSystemEventHandler):
                 vent_mask=vent,
                 mot_reg=REGRESSOR_SETTINGS.mot_reg,
                 max_poly_order=REGRESSOR_SETTINGS.max_poly_order,
+                TR=REGRESSOR_SETTINGS.TR,
             )
         else:
             log.info("[REG] Motion regression disabled by config.")
