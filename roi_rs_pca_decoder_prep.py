@@ -25,12 +25,22 @@ from __future__ import annotations
 # USER SETTINGS
 # ----------------------
 ROI_NAMES = ["EVC", "LPFC", "Sensorimotor"]
-KVOX = 2000
+KVOX = 3000
 N_COMPONENTS = 10
 FD_THRESH = 0.2
 MIN_NEIGHBORS = 0  # 0 disables neighbor filtering
 USE_ZSCORE = True
 SEED = 0
+
+# Choose which data to use for PCA (NOT for tSNR):
+#   "auto" : current behavior (prefer reg/, else mc/, else anything)
+#   "mc"   : force motion-corrected only (avoid regressed/denoised)
+#   "reg"  : force regressed/denoised only (prefer reg/)
+PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg"
+FORCE_REBUILD_4D = False  # True => always rebuild rs_4d_{mc,reg}.nii.gz from 3D series
+SEPARATE_OUTPUTS_BY_MODE = True  # True => write outputs under .../PCA/<run>/pca_<mode>/
+
+N_SKIP_START = 25
 
 
 AUTO_FSLMERGE_4D = True
@@ -161,26 +171,103 @@ def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
     return data, img.affine, img.header
 
 
-def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
-    # ---- 1) Original logic: find 4D candidates anywhere under run_dir ----
-    candidates: List[Tuple[Path, nib.Nifti1Header]] = []
-    priority_dirs = {"reg", "mc"}
+def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Path]:
+    """
+    Deterministic:
+      - PCA input: depends on pca_mode (mc/reg/auto)
+      - tSNR input: always from mc if possible
+      - builds analysis/rs_4d_mc.nii.gz from mc/ and analysis/rs_4d_reg.nii.gz from reg/
+        (from 3D series if needed)
+    """
+    pca_mode = (pca_mode or "auto").lower()
+    if pca_mode not in ("auto", "mc", "reg"):
+        pca_mode = "auto"
 
-    for path in _list_imaging_files(data_dir):
-        parent_low = path.parent.name.lower()
-        is_reg_or_mc = parent_low in priority_dirs or any(part.lower() in priority_dirs for part in path.parts[-3:])
-        if not (_is_rest_name(path.name) or is_reg_or_mc):
-            continue
-        try:
-            hdr = nib.load(str(path)).header
-        except Exception:
-            continue
-        if len(hdr.get_data_shape()) != 4:
-            continue
-        candidates.append((path, hdr))
+    mc_dir = run_dir / "mc"
+    reg_dir = run_dir / "reg"
+    out_dir = run_dir / FSLMERGE_OUTDIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    merged_mc = out_dir / f"{PREFER_MERGED_BASENAME}_mc.nii.gz"
+    merged_reg = out_dir / f"{PREFER_MERGED_BASENAME}_reg.nii.gz"
+
+    def ensure_4d_from_dir(src_dir: Path, out_4d: Path, tag: str) -> Optional[Path]:
+        """
+        If out_4d exists (and not FORCE_REBUILD_4D), use it.
+        Else try:
+          1) find an existing 4D inside src_dir
+          2) build from 3D series in src_dir via fslmerge
+        """
+        if out_4d.exists() and not FORCE_REBUILD_4D:
+            return out_4d
+
+        # 1) try an existing 4D inside the folder (mc/ or reg/)
+        if src_dir.exists():
+            for p in sorted(_list_imaging_files(src_dir)):
+                try:
+                    shp = nib.load(str(p)).header.get_data_shape()
+                except Exception:
+                    continue
+                if len(shp) == 4:
+                    # if we found a 4D already, optionally copy/standardize by just using it directly
+                    return p
+
+        # 2) build from 3D series
+        if not AUTO_FSLMERGE_4D:
+            return None
+
+        vols = _find_3d_series(src_dir) if src_dir.exists() else []
+        if not vols:
+            return None
+
+        print(f"Building 4D from {tag}/ ({len(vols)} vols) -> {out_4d}")
+        ok = _run_fslmerge(vols, out_4d)
+        if not ok:
+            raise RuntimeError(f"Failed to fslmerge {tag}/ 3D volumes into 4D.")
+        return out_4d
+
+    # --- ensure mc 4D (for tSNR and sometimes PCA) ---
+    mc_4d = ensure_4d_from_dir(mc_dir, merged_mc, "mc")
+
+    # --- ensure reg 4D (for PCA in reg/auto) ---
+    reg_4d = ensure_4d_from_dir(reg_dir, merged_reg, "reg")
+
+    # --- choose PCA input deterministically ---
+    if pca_mode == "mc":
+        if mc_4d is None:
+            raise FileNotFoundError("PCA_INPUT_MODE=mc but no mc 4D (or 3D series) found.")
+        pca_rs = mc_4d
+    elif pca_mode == "reg":
+        if reg_4d is None:
+            raise FileNotFoundError("PCA_INPUT_MODE=reg but no reg 4D (or 3D series) found.")
+        pca_rs = reg_4d
+    else:
+        # auto: prefer reg, else mc
+        if reg_4d is not None:
+            pca_rs = reg_4d
+        elif mc_4d is not None:
+            pca_rs = mc_4d
+        else:
+            raise FileNotFoundError("No mc or reg 4D found/built for auto mode.")
+
+    # --- choose tSNR input deterministically (prefer mc) ---
+    if mc_4d is not None:
+        tsnr_rs = mc_4d
+    else:
+        # fallback: if no mc exists, use PCA input (better than nothing)
+        tsnr_rs = pca_rs
+
+    # sanity check they are 4D
+    for p in [pca_rs, tsnr_rs]:
+        shp = nib.load(str(p)).header.get_data_shape()
+        if len(shp) != 4:
+            raise RuntimeError(f"Selected file is not 4D: {p} shape={shp}")
+
+    return pca_rs, tsnr_rs
+
 
     if candidates:
-        pca_sorted = sorted(candidates, key=lambda x: _rs_priority_for_pca(x[0]))
+        pca_sorted = sorted(candidates, key=lambda x: _rs_priority_for_pca(x[0], pca_mode))
         tsnr_sorted = sorted(candidates, key=lambda x: _rs_priority_for_tsnr(x[0]))
         pca_rs = pca_sorted[0][0]
         tsnr_rs = tsnr_sorted[0][0] if tsnr_sorted else pca_rs
@@ -216,10 +303,22 @@ def _discover_rs_inputs(data_dir: Path) -> Tuple[Path, Path]:
         if not ok:
             raise RuntimeError("Failed to fslmerge mc/ 3D volumes into 4D.")
 
-    # Decide PCA vs tSNR inputs
-    # PCA: prefer reg merged if exists; otherwise mc merged
-    pca_rs = merged_reg if merged_reg.exists() else merged_mc
-    # tSNR: prefer mc merged if exists; otherwise reg merged
+    if pca_mode == "mc":
+        mc = [c for c in candidates if c[0].parent.name.lower() == "mc"]
+        if not mc:
+            raise FileNotFoundError("PCA_INPUT_MODE=mc but no mc 4D found")
+        pca_rs = sorted(mc, key=lambda x: _rs_priority_for_pca(x[0]))[0][0]
+
+    elif pca_mode == "reg":
+        reg = [c for c in candidates if c[0].parent.name.lower() == "reg"]
+        if not reg:
+            raise FileNotFoundError("PCA_INPUT_MODE=reg but no reg 4D found")
+        pca_rs = sorted(reg, key=lambda x: _rs_priority_for_pca(x[0]))[0][0]
+
+    else:
+        pca_rs = sorted(candidates, key=lambda x: _rs_priority_for_pca(x[0]))[0][0]
+
+    # tSNR: keep current logic (prefer mc)
     tsnr_rs = merged_mc if merged_mc.exists() else merged_reg
 
     # sanity check they are 4D
@@ -491,11 +590,22 @@ def process_dataset(
     out_root: Optional[Path] = None,
 ) -> None:
     print(f"\nProcessing dataset: {run_dir}")
-    pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir)
+    pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir, PCA_INPUT_MODE)
     tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
-    if len(tsnr_data.shape) != 4:
-        raise ValueError(f"tSNR input is not 4D: {tsnr_rs_path}")
-    t_all = tsnr_data.shape[3]
+    print("[DEBUG PCA INPUT]")
+    print("  pca_rs_path =", pca_rs_path)
+    print("  tsnr_rs_path =", tsnr_rs_path)
+    print("  pca_rs inode =", pca_rs_path.stat().st_ino)
+    print("  tsnr inode  =", tsnr_rs_path.stat().st_ino)
+
+    t_all_full = tsnr_data.shape[3]  # <-- ORIGINAL length (660)
+
+    if N_SKIP_START > 0:
+        tsnr_data = tsnr_data[..., N_SKIP_START:]
+
+    t_all = tsnr_data.shape[3]  # <-- USED length (650)
+
+    tr_idx = np.arange(1 + N_SKIP_START, 1 + N_SKIP_START + t_all)
 
     tsnr_map = np.divide(
         np.mean(tsnr_data, axis=3),
@@ -511,8 +621,19 @@ def process_dataset(
     if not _affine_close(pca_affine, tsnr_affine):
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
 
-    fd_vec = _discover_fd_vector(run_dir, t_all)
-    motion_mat = _load_motion_1d(run_dir, t_all) if USE_MOTION_QC else None
+    if N_SKIP_START > 0:
+        if pca_data.shape[3] <= N_SKIP_START:
+            raise ValueError(f"Not enough TRs for PCA after skipping {N_SKIP_START}")
+        pca_data = pca_data[..., N_SKIP_START:]
+
+    fd_vec = _discover_fd_vector(run_dir, t_all_full)
+    if fd_vec is not None and N_SKIP_START > 0:
+        fd_vec = fd_vec[N_SKIP_START:]
+    # --- motion (load full length, then apply same trimming/masking as PCA) ---
+    motion_mat = _load_motion_1d(run_dir, t_all_full) if USE_MOTION_QC else None
+    if motion_mat is not None and N_SKIP_START > 0:
+        motion_mat = motion_mat[N_SKIP_START:, :]
+
 
     roi_dirs = list(roi_search_dirs or [run_dir])
     mask_dirs = list(mask_search_dirs or roi_dirs)
@@ -617,8 +738,10 @@ def process_dataset(
                 continue
             roi_ts = roi_ts[keep, :]
             fd_used = fd_vec[keep]
+            tr_used = tr_idx[keep]
         else:
             fd_used = None
+            tr_used = tr_idx[:roi_ts.shape[0]]
 
         t_used = roi_ts.shape[0]
 
@@ -644,9 +767,32 @@ def process_dataset(
             print(f"  Warning: PCA failed for ROI {roi}; skipping outputs.")
             continue
 
-        pc_corr = _corr_pc1_fd(timecourses[:, 0], fd_used) if fd_used is not None else None
-        motion_qc = _pc1_motion_qc(timecourses[:, 0], motion_mat[keep, :] if (
-                    motion_mat is not None and fd_used is not None) else motion_mat) if USE_MOTION_QC else None
+        def corr_safe(x, y):
+            if x is None or y is None:
+                return None
+            if len(x) != len(y):
+                return None
+            if np.std(x) == 0 or np.std(y) == 0:
+                return None
+            return float(np.corrcoef(x, y)[0, 1])
+
+        pc_corr = corr_safe(timecourses[:, 0], fd_used)
+
+        # --- motion alignment ---
+        if motion_mat is not None:
+            if fd_used is not None:
+                motion_used = motion_mat[keep, :]
+            else:
+                motion_used = motion_mat[:timecourses.shape[0], :]
+        else:
+            motion_used = None
+
+        print(f"[QC] ROI {roi}: "
+              f"PC1={timecourses.shape[0]} | "
+              f"FD={'None' if fd_used is None else fd_used.size} | "
+              f"MOT={'None' if motion_used is None else motion_used.shape[0]}")
+
+        motion_qc = _pc1_motion_qc(timecourses[:, 0], motion_used) if USE_MOTION_QC else None
 
         # Save outputs
         np.save(roi_dir / "pca_explained.npy", explained)
@@ -675,6 +821,7 @@ def process_dataset(
             "fd_thresh": FD_THRESH,
             "use_zscore": USE_ZSCORE,
             "min_neighbors": MIN_NEIGHBORS,
+            "pca_input_mode": PCA_INPUT_MODE,
             "voxel_count": vox_selected,
             "t_original": t_all,
             "t_used": t_used,
@@ -955,8 +1102,12 @@ def make_qc_plots(out_root: Path):
         # ---------- PCA timecourses ----------
         tc = np.load(p_tc)  # (T, nPC)
         plt.figure(figsize=(10, 6))
-        for i in range(min(5, tc.shape[1])):
-            plt.plot(tc[:, i] + i * 5, label=f"PC{i + 1}")
+        cum = np.cumsum(expl)
+        expl = np.load(p_expl)  # explained variance ratio
+        order = np.argsort(expl)[::-1]  # descending variance
+        n_keep = np.searchsorted(cum, 0.6) + 1  # e.g. 60% variance
+        for rank, i in enumerate(order[:n_keep]):
+            plt.plot(tc[:, i] + i * 5, label=f"PC{i+1} ({expl[i]*100:.1f}%)")
         plt.xlabel("Time (TRs)")
         plt.title(f"{roi}: Top PCA timecourses (offset)")
         plt.legend()
@@ -1017,12 +1168,22 @@ def main():
     parser.add_argument("-day", required=True, help="Day/session ID (e.g., 3)")
     parser.add_argument("-run", required=True, help="Run ID within the day (e.g., 1 or run-01)")
     parser.add_argument(
+        "--pca-input",
+        choices=["auto", "mc", "reg"],
+        default=None,
+        help="PCA input selection: auto (prefer reg), mc (force mc), reg (force reg). Overrides PCA_INPUT_MODE.",
+    )
+    parser.add_argument(
         "--base-data",
         default=Path(__file__).resolve().parent / "data",
         type=Path,
         help="Root data directory containing sub-*/day/func/run folders (default: ./data)",
     )
     args = parser.parse_args()
+
+    global PCA_INPUT_MODE
+    if args.pca_input is not None:
+        PCA_INPUT_MODE = args.pca_input
 
     run_dir = _build_run_dir(Path(args.base_data), args.subj, args.day, args.run)
     day_dir = run_dir.parent.parent  # .../day/func/run -> day
@@ -1035,7 +1196,10 @@ def main():
     try:
         anat_dir = subj_dir / "anat"  # sub-00085/anat
         roi_search_dirs = [anat_dir]  # ONLY subject anatomy
-        out_root = day_dir / "PCA" / run_dir.name
+        if SEPARATE_OUTPUTS_BY_MODE:
+            out_root = day_dir / "PCA" / run_dir.name / f"pca_{PCA_INPUT_MODE}"
+        else:
+            out_root = day_dir / "PCA" / run_dir.name
         process_dataset(
             run_dir,
             ROI_NAMES,
@@ -1088,6 +1252,44 @@ def _run_fslmerge(vols: List[Path], out_4d: Path) -> bool:
         print("Warning: fslmerge failed.")
         print("STDERR:", e.stderr.strip())
         return False
+
+def _rs_priority_for_pca(path: Path, pca_mode: str) -> Tuple[int, int, int]:
+    """
+    Lower tuple = higher priority.
+    pca_mode:
+      - "auto": prefer reg/denoised, then mc, then others (current behavior)
+      - "mc"  : prefer mc only, then others, reg last
+      - "reg" : prefer reg only, then others, mc last
+    """
+    low = path.name.lower()
+    parent_low = path.parent.name.lower()
+
+    denoise_keys = ["denoise", "resid", "clean", "regress", "regressed", "nuis", "filtered", "noise"]
+    mc_keys = ["mc", "motioncorr", "distcorr", "preproc"]
+
+    is_reg = parent_low == "reg"
+    is_mc = parent_low == "mc"
+
+    has_denoise = any(k in low for k in denoise_keys) or is_reg
+    has_mc = any(k in low for k in mc_keys) or is_mc
+
+    pca_mode = (pca_mode or "auto").lower()
+    if pca_mode not in ("auto", "mc", "reg"):
+        pca_mode = "auto"
+
+    if pca_mode == "auto":
+        dir_score = 0 if is_reg else (1 if is_mc else 2)
+        return (dir_score, 0 if has_denoise else 1, 0 if has_mc else 1)
+
+    if pca_mode == "mc":
+        # hard avoid reg: mc first, others second, reg last
+        dir_score = 0 if is_mc else (2 if is_reg else 1)
+        return (dir_score, 0 if has_mc else 1, 0 if has_denoise else 1)
+
+    # pca_mode == "reg"
+    # reg first, others second, mc last (optional; tweak if you want mc ahead of "others")
+    dir_score = 0 if is_reg else (2 if is_mc else 1)
+    return (dir_score, 0 if has_denoise else 1, 0 if has_mc else 1)
 
 
 

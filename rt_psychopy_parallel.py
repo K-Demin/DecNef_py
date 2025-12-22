@@ -4,8 +4,7 @@ from collections import deque
 from multiprocessing import Process, Queue
 from queue import Empty
 from pathlib import Path
-
-from rt_pipeline import RTSessionConfig, run_rt_pipeline
+import multiprocessing as mp
 
 
 def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
@@ -32,7 +31,13 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
         end=(origin_x, origin_y + plot_height),
         lineColor="white",
     )
-    score_line = visual.ShapeStim(win, vertices=[], closeShape=False, lineColor="cyan")
+    # start as a degenerate 2-point line (valid Nx2)
+    score_line = visual.ShapeStim(
+        win,
+        vertices=[(origin_x, origin_y), (origin_x, origin_y)],
+        closeShape=False,
+        lineColor="cyan",
+    )
     last_score_text = visual.TextStim(win, text="", pos=(0, -300), color="white")
 
     scores = deque(maxlen=max_points)
@@ -41,13 +46,18 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
     def update_plot() -> None:
         nonlocal needs_redraw
         if not scores:
-            score_line.vertices = []
+            score_line.vertices = [(origin_x, origin_y), (origin_x, origin_y)]
             last_score_text.text = "Waiting for scores…"
             needs_redraw = True
             return
 
-        min_score = min(scores)
-        max_score = max(scores)
+        # If only 1 point, duplicate it so vertices is still Nx2 with N>=2
+        data = list(scores)
+        if len(data) == 1:
+            data = [data[0], data[0]]
+
+        min_score = min(data)
+        max_score = max(data)
         if min_score == max_score:
             min_score -= 0.5
             max_score += 0.5
@@ -56,7 +66,7 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
         x_step = plot_width / max(1, max_points - 1)
 
         vertices = []
-        for idx, score in enumerate(scores):
+        for idx, score in enumerate(data):
             x = origin_x + idx * x_step
             y_norm = (score - min_score) / span
             y = origin_y + y_norm * plot_height
@@ -96,6 +106,7 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
 
 
 def main() -> None:
+    mp.set_start_method("spawn", force=True)  # <-- IMPORTANT: before CUDA touches anything
     parser = argparse.ArgumentParser(
         description=(
             "Run rt_pipeline in parallel with a PsychoPy visualization of the last 20 scores."
@@ -128,7 +139,7 @@ def main() -> None:
         help="Optional decoder template path to override the default.",
     )
     args = parser.parse_args()
-
+    from rt_pipeline import RTSessionConfig, run_rt_pipeline
     cfg = RTSessionConfig(
         subject=args.sub,
         day=args.day,
@@ -138,8 +149,9 @@ def main() -> None:
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
     )
 
-    score_queue: Queue = Queue(maxsize=100)
-    pipeline_process = Process(target=run_rt_pipeline, args=(cfg, score_queue))
+    ctx = mp.get_context("spawn")
+    score_queue = ctx.Queue(maxsize=100)
+    pipeline_process = ctx.Process(target=run_rt_pipeline, args=(cfg, score_queue))
     pipeline_process.start()
 
     try:

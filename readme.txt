@@ -55,6 +55,15 @@ For full fastsurfer preproc + ROI masks (you can run it before run_preproc):
       --subj 00085 \
       --day 2_copy
 
+Example of behavioral experiment:
+usage: rt_psychopy_parallel.py [-h] --sub SUB --day DAY --run RUN
+                               [--incoming-root INCOMING_ROOT]
+                               [--base-data BASE_DATA]
+                               [--max-points MAX_POINTS]
+                               [--decoder-template DECODER_TEMPLATE]
+rt_psychopy_parallel.py: error: the following arguments are required: --sub, --day, --run
+
+
 
 
 Data Organization

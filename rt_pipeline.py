@@ -79,17 +79,34 @@ def append_fd(fd_path: Path, volume_idx: int, fd_value: float):
 class MotionRegressor:
     """Wrapper around RTPSpy's regression module for online motion denoising."""
 
-    def __init__(self, volreg: RtpVolreg):
-        self._regress = RtpRegress(
+    def __init__(
+            self,
+            volreg: RtpVolreg,
+            gs_mask: Optional[Path] = None,
+            wm_mask: Optional[Path] = None,
+            vent_mask: Optional[Path] = None,
+    ):
+        kwargs = dict(
             mot_reg="mot6",
             volreg=volreg,
-            TR=1.4,
+            TR=0.9,
             wait_num=0,
             # max_poly_order=2,
             save_proc=False,
             online_saving=False,
             reg_retro_proc=False,
         )
+
+        # If masks exist, enable those regressors
+        # (If your RTPSpy build uses different kw names, you’ll see it immediately as a TypeError.)
+        if gs_mask is not None:
+            kwargs.update(dict(GS_reg=True, GS_mask=str(gs_mask)))
+        if wm_mask is not None:
+            kwargs.update(dict(WM_reg=True, WM_mask=str(wm_mask)))
+        if vent_mask is not None:
+            kwargs.update(dict(Vent_reg=True, Vent_mask=str(vent_mask)))
+
+        self._regress = RtpRegress(**kwargs)
         self._ready = False
 
     def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> tuple[np.ndarray, bool]:
@@ -168,6 +185,18 @@ class RTSessionConfig:
         return self.day_root / "func" / "trans"
 
     @property
+    def rt_gs_mask(self) -> Path:
+        return self.trans_dir / "rt_GS_mask.nii"
+
+    @property
+    def rt_wm_mask(self) -> Path:
+        return self.trans_dir / "rt_WM_mask.nii"
+
+    @property
+    def rt_vent_mask(self) -> Path:
+        return self.trans_dir / "rt_Vent_mask.nii"
+
+    @property
     def rt_work_dir(self) -> Path:
         """
         Where we put per-volume NIfTIs, logs, etc.
@@ -219,7 +248,7 @@ class RTSessionConfig:
         """
         Global real-time reference EPI (set by offline preprocessor).
         """
-        return self.day_root / "func" / "trans" / "rt_ref_epi.nii"
+        return self.day_root / "func" / "trans" / "epi_unwarped_mean.nii"
 
     @property
     def rt_ref_mask(self) -> Path:
@@ -227,7 +256,7 @@ class RTSessionConfig:
         Optional mask for the RT reference (not strictly needed here,
         but kept for completeness / future use).
         """
-        return self.day_root / "func" / "trans" / "rt_ref_epi_mask.nii"
+        return self.day_root / "func" / "trans" / "epi_mask_mean.nii"
 
 
 # ---------- Filename parsing ----------
@@ -290,7 +319,22 @@ class DICOMHandler(FileSystemEventHandler):
         self.prev_motion = None              # previous 6-vector
         self.brain_radius_mm = 50.0          # standard radius for FD
         self.pre_trial_scans = 0             # if you ever want NaNs for early scans
-        self.motion_regressor = MotionRegressor(self.volreg)
+        # --- Nuisance masks (made offline by pipeline.py) ---
+        gs = cfg.rt_gs_mask
+        wm = cfg.rt_wm_mask
+        vent = cfg.rt_vent_mask
+
+        missing = [p for p in (gs, wm, vent) if not p.exists()]
+        if missing:
+            log.warning(
+                "[REG] Nuisance masks missing; running motion-only regression.\n"
+                + "\n".join([f"  - {p}" for p in missing])
+            )
+            gs = wm = vent = None
+        else:
+            log.info(f"[REG] Using nuisance masks:\n  GS={gs}\n  WM={wm}\n  Vent={vent}")
+
+        self.motion_regressor = MotionRegressor(self.volreg, gs_mask=gs, wm_mask=wm, vent_mask=vent)
 
         # --- Decoder / scorer ---
         decoder_path = cfg.decoder_template or (

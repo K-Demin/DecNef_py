@@ -14,39 +14,40 @@ log = logging.getLogger("fmri_rt_preproc")
 
 BASE_DATA = Path(__file__).resolve().parent / "data"
 
+DICOM_LIKE_SUFFIXES = {".dcm", ".ima"}
+
+def _is_dicom_like(p: Path) -> bool:
+    """Return True for DICOM-ish files we want to pass to dcm2niix (.dcm, .IMA)."""
+    return p.is_file() and p.suffix.lower() in DICOM_LIKE_SUFFIXES
+
 
 def _convert_dicoms_if_needed(dicom_dir: Path, out_prefix: str) -> list[Path]:
-    """Convert DICOMs in ``dicom_dir`` to NIfTI using dcm2niix if present."""
+    """Convert DICOM-like files in ``dicom_dir`` to NIfTI using dcm2niix if present."""
 
-    # Accept both lower- and upper-case extensions so the caller doesn't have to
-    # normalize filenames.
-    dicoms = sorted(
-        f
-        for f in dicom_dir.iterdir()
-        if f.is_file() and f.suffix.lower() == ".dcm"
-    )
+    dicoms = sorted(f for f in dicom_dir.iterdir() if _is_dicom_like(f))
     if not dicoms:
         return []
 
-    log.info("No NIfTI files found – converting %d DICOMs in %s", len(dicoms), dicom_dir)
+    log.info(
+        "No NIfTI files found – converting %d DICOM-like files in %s",
+        len(dicoms),
+        dicom_dir,
+    )
 
     ensure_dir(dicom_dir)
     run([
         "dcm2niix",
-        "-z",
-        "y",
-        "-b",
-        "n",
-        "-f",
-        out_prefix,
-        "-o",
-        str(dicom_dir),
+        "-z", "y",
+        "-b", "n",
+        "-f", out_prefix,
+        "-o", str(dicom_dir),
         str(dicom_dir),
     ])
 
     converted = sorted(dicom_dir.glob(f"{out_prefix}*.nii*"))
-    log.info("Converted %d NIfTI file(s) from DICOMs", len(converted))
+    log.info("Converted %d NIfTI file(s) from DICOM-like inputs", len(converted))
     return converted
+
 
 
 def _parse_dicom_name(name: str):
@@ -69,14 +70,13 @@ def _parse_dicom_name(name: str):
 
 
 def _dicoms_for_block(incoming_dir: Path, block_id: int) -> list[Path]:
-    """Collect DICOMs in ``incoming_dir`` matching the given block/run id."""
-
+    """Collect DICOM-like files in ``incoming_dir`` matching the given block/run id."""
     if block_id is None:
         return []
 
     dicoms: list[Path] = []
     for f in sorted(incoming_dir.iterdir()):
-        if not f.is_file() or f.suffix.lower() != ".dcm":
+        if not _is_dicom_like(f):
             continue
         parsed = _parse_dicom_name(f.name)
         if parsed is None:
@@ -85,6 +85,7 @@ def _dicoms_for_block(incoming_dir: Path, block_id: int) -> list[Path]:
         if run_id == block_id:
             dicoms.append(f)
     return dicoms
+
 
 
 def _stage_convert_to_target(
@@ -170,7 +171,7 @@ def _stage_epi_block(
 
     selected_dicoms: list[Path] = []
     for f in sorted(incoming_dir.iterdir()):
-        if not f.is_file() or f.suffix.lower() != ".dcm":
+        if not _is_dicom_like(f):
             continue
         parsed = _parse_dicom_name(f.name)
         if parsed is None:
@@ -306,7 +307,7 @@ def main():
         ensure_dir(run_dir)
 
         structural_present = any(anat_dir.glob("T1*.nii*")) or any(
-            f.is_file() and f.suffix.lower() == ".dcm" for f in anat_dir.iterdir()
+            _is_dicom_like(f) for f in anat_dir.iterdir()
         )
 
         epi_present = any(run_dir.glob("*.nii*"))

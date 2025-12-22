@@ -81,7 +81,7 @@ class FMRIRealtimePreprocessor:
         ensure_dir(fastsurfer_dir)
 
         aparc_aseg = (
-            fastsurfer_dir / self.fastsurfer_sid / "mri" / "aseg.auto_noCCseg.mgz"
+            fastsurfer_dir / self.fastsurfer_sid / "mri" / "aparc.DKTatlas+aseg.deep.mgz"
         )
 
         if aparc_aseg.exists():
@@ -312,6 +312,9 @@ class FMRIRealtimePreprocessor:
 
         # 5) EPI->T1 registration using EPI mean + masks
         self._register_epi_to_t1(run_dir, epi_mean, epi_mask_mean)
+
+        # 5.5 create masks for regression
+        self._make_rtp_nuisance_masks()
 
         # 6) EPI mean -> MNI
         self._warp_epi_mean_to_mni(run_dir, epi_mean)
@@ -565,6 +568,134 @@ class FMRIRealtimePreprocessor:
         # Copy geometry from T1 (helps keep everything aligned)
         run(["fslcpgeom", str(t1_n4), str(warped)])
         run(["fslcpgeom", str(t1_n4), str(inv_warped)])
+
+    def _make_rtp_nuisance_masks(self):
+        """
+        Create GS / WM / Vent masks for RTPSpy RtpRegress.
+
+        Outputs (all in EPI/RT grid):
+          trans/rt_GS_mask.nii
+          trans/rt_WM_mask.nii
+          trans/rt_Vent_mask.nii
+
+        Assumes:
+          - FastSurfer outputs exist in anat/fastsurfer/<sid>/mri/
+          - epi2t1 transforms exist in func/trans/ (from _register_epi_to_t1)
+          - rt_ref_epi and rt_ref_mask exist (from _maybe_set_rt_reference)
+        """
+        ensure_dir(self.trans_dir)
+
+        # -------------------------
+        # 0) References (EPI grid)
+        # -------------------------
+        if not self.rt_ref_epi.exists():
+            raise FileNotFoundError(f"rt_ref_epi missing: {self.rt_ref_epi}")
+        if not self.rt_ref_mask.exists():
+            raise FileNotFoundError(f"rt_ref_mask missing: {self.rt_ref_mask}")
+
+        epi_ref = self.rt_ref_epi
+        epi_brainmask = self.rt_ref_mask  # already EPI-space brain mask
+
+        # GS mask: just use the EPI brain mask (best + simplest)
+        gs_epi = self.trans_dir / "rt_GS_mask.nii"
+        if not gs_epi.exists():
+            run(["fslmaths", str(epi_brainmask), "-thr", "0.5", "-bin", str(gs_epi)])
+        slice_slab = self.trans_dir / "rt_slice_slab.nii"
+        if not slice_slab.exists():
+            # collapse x/y -> leaves a z “which slices have brain” mask (broadcasts back fine)
+            run(["fslmaths", str(gs_epi), "-Tmax", str(slice_slab)])
+
+        gunzip_python(self.trans_dir / "rt_GS_mask.nii.gz")
+
+
+        # -----------------------------------------
+        # 1) Build WM/Vent in T1 space from FastSurfer
+        # -----------------------------------------
+        fs_mri_dir = self.anat_dir / "fastsurfer" / self.fastsurfer_sid / "mri"
+        #aseg_mgz = fs_mri_dir / "aseg.auto_noCCseg.mgz"
+        # If you prefer your DKT aparc+aseg:
+        aseg_mgz = fs_mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
+
+        if not aseg_mgz.exists():
+            raise FileNotFoundError(f"FastSurfer aseg not found: {aseg_mgz}")
+
+        wm_t1 = self.trans_dir / "WM_T1.nii"
+        vent_t1 = self.trans_dir / "Vent_T1.nii"
+
+        # Common FreeSurfer aseg labels:
+        # WM: 2 (LH WM), 41 (RH WM)
+        # Ventricles: 4,43 (lat), 5,44 (inf lat), 14 (3rd), 15 (4th)
+        WM_LABELS = ["2", "41"]
+        VENT_LABELS = ["4", "43", "5", "44", "14", "15"]
+
+        if not wm_t1.exists():
+            run([
+                "mri_binarize",
+                "--i", str(aseg_mgz),
+                "--match", *WM_LABELS,
+                "--o", str(wm_t1)
+            ])
+
+        if not vent_t1.exists():
+            run([
+                "mri_binarize",
+                "--i", str(aseg_mgz),
+                "--match", *VENT_LABELS,
+                "--o", str(vent_t1)
+            ])
+
+        # -----------------------------------------
+        # 2) Warp WM/Vent T1->EPI using *composite* (same style as other warps)
+        # -----------------------------------------
+        inv_comp = self.trans_dir / "epi2t1_InverseComposite.h5"
+        if not inv_comp.exists():
+            raise FileNotFoundError(f"Missing inverse composite: {inv_comp}")
+
+        wm_epi = self.trans_dir / "rt_WM_mask.nii"
+        vent_epi = self.trans_dir / "rt_Vent_mask.nii"
+
+        def _apply_t1_to_epi_nn(in_mask_t1: Path, out_mask_epi: Path):
+            if out_mask_epi.exists():
+                return
+
+            cmd = [
+                "bash", "-lc",
+                f"""
+                export ANTS_USE_GPU=1
+                export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
+                export OMP_NUM_THREADS=$(nproc)
+                antsApplyTransforms -d 3 \
+                  -i {in_mask_t1} \
+                  -r {epi_ref} \
+                  -o {out_mask_epi} \
+                  -n NearestNeighbor \
+                  -t {inv_comp} \
+                  --float 1
+                """
+            ]
+            run(cmd)
+
+            # Clean binary + intersect with EPI brain mask (safety)
+            run(["fslmaths", str(out_mask_epi), "-thr", "0.5", "-bin", str(out_mask_epi)])
+            run(["fslmaths", str(out_mask_epi), "-mul", str(gs_epi), str(out_mask_epi)])
+
+        _apply_t1_to_epi_nn(wm_t1, wm_epi)
+        _apply_t1_to_epi_nn(vent_t1, vent_epi)
+
+        run(["fslmaths", str(wm_epi), "-mul", str(slice_slab), str(wm_epi)])
+        run(["fslmaths", str(vent_epi), "-mul", str(slice_slab), str(vent_epi)])
+
+        # -----------------------------------------
+        # 3) Final sanity check: shapes must match EPI volume shape
+        # -----------------------------------------
+        ref_shape = nib.load(str(epi_ref)).shape[:3]
+        for p in (gs_epi, wm_epi, vent_epi):
+            shp = nib.load(str(p)).shape[:3]
+            if shp != ref_shape:
+                raise RuntimeError(f"Mask shape mismatch for {p.name}: {shp} vs ref {ref_shape}")
+
+        log.info(f"✓ RTP masks ready:\n  GS={gs_epi}\n  WM={wm_epi}\n  Vent={vent_epi}")
+        return gs_epi, wm_epi, vent_epi
 
     def _warp_epi_mean_to_mni(self, run_dir: Path, epi_mean: Path):
         mni = self.cfg.mni_template
