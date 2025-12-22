@@ -34,6 +34,35 @@ logging.getLogger("fmri_rt_preproc").setLevel(logging.WARNING)
 logging.getLogger("RtpVolreg").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
+# ---------- Regressor config (edit to control usage) ----------
+
+@dataclass
+class RegressorSettings:
+    enable_motion_regression: bool = True
+    mot_reg: str = "mot6"
+    max_poly_order: float = np.inf
+    TR: float = 0.9
+    use_gs: bool = True
+    use_wm: bool = True
+    use_vent: bool = True
+
+
+REGRESSOR_SETTINGS = RegressorSettings(
+    # How to use:
+    # - enable_motion_regression: True/False to toggle RtpRegress entirely.
+    # - mot_reg: one of {"None", "mot6", "mot12", "dmot6"} (RTPSpy-supported).
+    # - max_poly_order: int >= 0 or np.inf (higher allows more polynomial terms).
+    # - TR: float > 0 (seconds, used for polynomial regressor timing).
+    # - use_gs/use_wm/use_vent: True/False to include each mask regressor when file exists.
+    enable_motion_regression=True,
+    mot_reg="mot6",
+    max_poly_order=np.inf,
+    TR=0.9,
+    use_gs=True,
+    use_wm=True,
+    use_vent=True,
+)
+
 def log_step(step: str, vol: int, extra: str = "", start_t=None):
     """Compact colored/clean log."""
     v = f"{vol:05d}"
@@ -85,13 +114,16 @@ class MotionRegressor:
             gs_mask: Optional[Path] = None,
             wm_mask: Optional[Path] = None,
             vent_mask: Optional[Path] = None,
+            mot_reg: str = "mot6",
+            max_poly_order: float = np.inf,
+            TR: float = 0.9,
     ):
         kwargs = dict(
-            mot_reg="mot6",
+            mot_reg=mot_reg,
             volreg=volreg,
-            TR=0.9,
+            TR=TR,
             wait_num=0,
-            # max_poly_order=2,
+            max_poly_order=max_poly_order,
             save_proc=False,
             online_saving=False,
             reg_retro_proc=False,
@@ -320,21 +352,38 @@ class DICOMHandler(FileSystemEventHandler):
         self.brain_radius_mm = 50.0          # standard radius for FD
         self.pre_trial_scans = 0             # if you ever want NaNs for early scans
         # --- Nuisance masks (made offline by pipeline.py) ---
-        gs = cfg.rt_gs_mask
-        wm = cfg.rt_wm_mask
-        vent = cfg.rt_vent_mask
+        def resolve_mask(label: str, path: Path, enabled: bool) -> Optional[Path]:
+            if not enabled:
+                log.info(f"[REG] {label} regressor disabled by config.")
+                return None
+            if not path.exists():
+                log.warning(f"[REG] {label} mask missing at {path}; skipping {label} regressor.")
+                return None
+            return path
 
-        missing = [p for p in (gs, wm, vent) if not p.exists()]
-        if missing:
-            log.warning(
-                "[REG] Nuisance masks missing; running motion-only regression.\n"
-                + "\n".join([f"  - {p}" for p in missing])
-            )
-            gs = wm = vent = None
+        gs = resolve_mask("GS", cfg.rt_ref_mask, REGRESSOR_SETTINGS.use_gs)
+        wm = resolve_mask("WM", cfg.rt_wm_mask, REGRESSOR_SETTINGS.use_wm)
+        vent = resolve_mask("Vent", cfg.rt_vent_mask, REGRESSOR_SETTINGS.use_vent)
+
+        used = {k: v for k, v in {"GS": gs, "WM": wm, "Vent": vent}.items() if v is not None}
+        if used:
+            log.info("[REG] Using nuisance masks:\n" + "\n".join([f"  {k}={v}" for k, v in used.items()]))
         else:
-            log.info(f"[REG] Using nuisance masks:\n  GS={gs}\n  WM={wm}\n  Vent={vent}")
+            log.info("[REG] No nuisance masks enabled; running motion-only regression.")
 
-        self.motion_regressor = MotionRegressor(self.volreg, gs_mask=gs, wm_mask=wm, vent_mask=vent)
+        if REGRESSOR_SETTINGS.enable_motion_regression:
+            self.motion_regressor = MotionRegressor(
+                self.volreg,
+                gs_mask=gs,
+                wm_mask=wm,
+                vent_mask=vent,
+                mot_reg=REGRESSOR_SETTINGS.mot_reg,
+                max_poly_order=REGRESSOR_SETTINGS.max_poly_order,
+                TR=REGRESSOR_SETTINGS.TR,
+            )
+        else:
+            log.info("[REG] Motion regression disabled by config.")
+            self.motion_regressor = None
 
         # --- Decoder / scorer ---
         decoder_path = cfg.decoder_template or (
@@ -495,12 +544,17 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     # ---------- 2c) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
     mc_for_warp = mc_nii
-    cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx)
-    reg_dir = cfg.rt_reg_dir
-    reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-    nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
-    mc_for_warp = reg_nii
-    log_step("REG", volume_idx, "motion", start_t=reg_t0)
+    if handler.motion_regressor is not None:
+        cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx)
+        reg_dir = cfg.rt_reg_dir
+        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        mc_for_warp = reg_nii
+        log_step("REG", volume_idx, "motion", start_t=reg_t0)
+    else:
+        cleaned = np.asanyarray(mc_img.dataobj)
+        reg_ready = True
+        log_step("REG", volume_idx, "skipped", start_t=reg_t0)
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()

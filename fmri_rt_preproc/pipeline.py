@@ -21,6 +21,7 @@ import nibabel as nib
 import numpy as np
 import gzip
 import shutil
+import os
 
 def gunzip_python(gz_path):
     gz_path = Path(gz_path)
@@ -571,12 +572,14 @@ class FMRIRealtimePreprocessor:
 
     def _make_rtp_nuisance_masks(self):
         """
-        Create GS / WM / Vent masks for RTPSpy RtpRegress.
+        Create WM / Vent masks for RTPSpy RtpRegress.
 
         Outputs (all in EPI/RT grid):
-          trans/rt_GS_mask.nii
           trans/rt_WM_mask.nii
           trans/rt_Vent_mask.nii
+
+        Notes:
+          - GS uses epi_mask_mean directly (no rt_GS_mask file).
 
         Assumes:
           - FastSurfer outputs exist in anat/fastsurfer/<sid>/mri/
@@ -595,17 +598,14 @@ class FMRIRealtimePreprocessor:
 
         epi_ref = self.rt_ref_epi
         epi_brainmask = self.rt_ref_mask  # already EPI-space brain mask
+        fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
 
-        # GS mask: just use the EPI brain mask (best + simplest)
-        gs_epi = self.trans_dir / "rt_GS_mask.nii"
-        if not gs_epi.exists():
-            run(["fslmaths", str(epi_brainmask), "-thr", "0.5", "-bin", str(gs_epi)])
+        # GS regressor uses the EPI brain mask directly.
+        gs_epi = epi_brainmask
         slice_slab = self.trans_dir / "rt_slice_slab.nii"
         if not slice_slab.exists():
             # collapse x/y -> leaves a z “which slices have brain” mask (broadcasts back fine)
-            run(["fslmaths", str(gs_epi), "-Tmax", str(slice_slab)])
-
-        gunzip_python(self.trans_dir / "rt_GS_mask.nii.gz")
+            run(["fslmaths", str(gs_epi), "-Tmax", str(slice_slab)], env=fsl_env)
 
 
         # -----------------------------------------
@@ -676,14 +676,14 @@ class FMRIRealtimePreprocessor:
             run(cmd)
 
             # Clean binary + intersect with EPI brain mask (safety)
-            run(["fslmaths", str(out_mask_epi), "-thr", "0.5", "-bin", str(out_mask_epi)])
-            run(["fslmaths", str(out_mask_epi), "-mul", str(gs_epi), str(out_mask_epi)])
+            run(["fslmaths", str(out_mask_epi), "-thr", "0.5", "-bin", str(out_mask_epi)], env=fsl_env)
+            run(["fslmaths", str(out_mask_epi), "-mul", str(gs_epi), str(out_mask_epi)], env=fsl_env)
 
         _apply_t1_to_epi_nn(wm_t1, wm_epi)
         _apply_t1_to_epi_nn(vent_t1, vent_epi)
 
-        run(["fslmaths", str(wm_epi), "-mul", str(slice_slab), str(wm_epi)])
-        run(["fslmaths", str(vent_epi), "-mul", str(slice_slab), str(vent_epi)])
+        run(["fslmaths", str(wm_epi), "-mul", str(slice_slab), str(wm_epi)], env=fsl_env)
+        run(["fslmaths", str(vent_epi), "-mul", str(slice_slab), str(vent_epi)], env=fsl_env)
 
         # -----------------------------------------
         # 3) Final sanity check: shapes must match EPI volume shape
@@ -861,6 +861,3 @@ class FMRIRealtimePreprocessor:
             if bias_value is None:
                 bias_value = 0.0
             f.write(f"0 0 0 {bias_value:.6f} 0\n")
-
-
-
