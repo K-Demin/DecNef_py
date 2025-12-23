@@ -18,6 +18,7 @@ from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
+from biopac_rt.biopac_receiver import BiopacReceiverConfig, BiopacRetroTSReceiver
 
 # ---------- Logging setup ----------
 logging.basicConfig(
@@ -53,6 +54,14 @@ class RegressorSettings:
     censor_plus1: bool = True        # add +1 TR neighbor
     dvars_warmup: int = 20           # don’t compute robust stats until you have some history
     dvars_mask_source: str = "ref_mask"  # "ref_mask" uses cfg.rt_ref_mask
+
+    # --- BIOPAC physio regressors (RETROTS) ---
+    enable_biopac_physio: bool = False
+    biopac_phys_reg: str = "RICOR8"
+    biopac_host: str = "0.0.0.0"
+    biopac_port: int = 15000
+    biopac_timeout: float = 0.3
+    biopac_handshake: bool = True
 
 
 REGRESSOR_SETTINGS = RegressorSettings(
@@ -130,6 +139,8 @@ class MotionRegressor:
         max_scan_length: int = 1000,
         enable_fd_censor_reg: bool = False,
         enable_dvars_censor_reg: bool = False,
+        phys_reg: str = "None",
+        rtp_physio: Optional[object] = None,
     ):
 
         kwargs = dict(
@@ -143,6 +154,8 @@ class MotionRegressor:
             reg_retro_proc=False,
             max_scan_length=max_scan_length,
             spike_reg_num = 200,
+            phys_reg=phys_reg,
+            rtp_physio=rtp_physio,
         )
         self._regress = RtpRegress(**kwargs)
 
@@ -188,6 +201,24 @@ class MotionRegressor:
         if not self._ready:
             return np.asanyarray(mc_img.dataobj), False
 
+    def get_regressors(self, volume_idx: int) -> tuple[Optional[list[str]], Optional[np.ndarray]]:
+        des_mtx = getattr(self._regress, "desMtx", None)
+        if des_mtx is None:
+            return None, None
+        idx = volume_idx - 1
+        try:
+            row = des_mtx[idx]
+        except Exception:
+            return None, None
+
+        if hasattr(row, "detach"):
+            row = row.detach().cpu().numpy()
+        row = np.asarray(row, dtype=float)
+        reg_names = list(getattr(self._regress, "reg_names", []))
+        if len(reg_names) < row.shape[0]:
+            extra = row.shape[0] - len(reg_names)
+            reg_names.extend([f"poly_{i:02d}" for i in range(extra)])
+        return reg_names, row
         try:
             # Keep track of the internal volume counter
             prev_vol = getattr(self._regress, "_vol_num", 0)
@@ -348,6 +379,7 @@ class DICOMHandler(FileSystemEventHandler):
         self.current_run = int(cfg.run)
         self.next_volume_idx = 1
         self.score_queue = score_queue
+        self.biopac_receiver = None
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -378,6 +410,8 @@ class DICOMHandler(FileSystemEventHandler):
         self.dvars_hist = []  # store prior DVARS to compute robust stats
         self.censor_next_fd = False
         self.censor_next_dvars = False
+        self.last_dvars_val = float("nan")
+        self.last_dvars_z = float("nan")
 
         # --- NEW: load mask for DVARS (use cfg.rt_ref_mask) ---
         self.dvars_mask = None
@@ -411,6 +445,35 @@ class DICOMHandler(FileSystemEventHandler):
         else:
             log.info("[REG] No nuisance masks enabled; running motion-only regression.")
 
+        phys_reg = "None"
+        rtp_physio = None
+        if REGRESSOR_SETTINGS.enable_biopac_physio:
+            if not REGRESSOR_SETTINGS.enable_motion_regression:
+                log.warning("[BIOPAC] Motion regression disabled; skipping physio regressors.")
+            else:
+                expected_regressors = {
+                    "RICOR8": 8,
+                    "RVT5": 5,
+                    "RVT+RICOR13": 13,
+                }.get(REGRESSOR_SETTINGS.biopac_phys_reg, 8)
+                biopac_cfg = BiopacReceiverConfig(
+                    host=REGRESSOR_SETTINGS.biopac_host,
+                    port=REGRESSOR_SETTINGS.biopac_port,
+                    timeout=REGRESSOR_SETTINGS.biopac_timeout,
+                    expected_regressors=expected_regressors,
+                    handshake_tr=REGRESSOR_SETTINGS.TR if REGRESSOR_SETTINGS.biopac_handshake else None,
+                )
+                self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
+                self.biopac_receiver.start()
+                phys_reg = REGRESSOR_SETTINGS.biopac_phys_reg
+                rtp_physio = self.biopac_receiver
+                log.info(
+                    "[BIOPAC] Enabled physio regressors (%s) on %s:%s",
+                    phys_reg,
+                    biopac_cfg.host,
+                    biopac_cfg.port,
+                )
+
         if REGRESSOR_SETTINGS.enable_motion_regression:
             self.motion_regressor = MotionRegressor(
                 self.volreg,
@@ -423,6 +486,8 @@ class DICOMHandler(FileSystemEventHandler):
                 max_scan_length=1000,  # or your typical max TR count for a run
                 enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
                 enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
+                phys_reg=phys_reg,
+                rtp_physio=rtp_physio,
             )
         else:
             log.info("[REG] Motion regression disabled by config.")
@@ -446,6 +511,10 @@ class DICOMHandler(FileSystemEventHandler):
             roi_txt=roi_txt,
             n_baseline=20,   # keep your current baseline length
         )
+
+    def stop(self):
+        if self.biopac_receiver is not None:
+            self.biopac_receiver.stop()
 
     def on_created(self, event):
         if event.is_directory:
@@ -623,6 +692,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                 dvars_val,
                 z
             )
+            handler.last_dvars_val = dvars_val
+            handler.last_dvars_z = z
 
             # optional: ignore first few DVARS for robust stats stability
             enough = (len(handler.dvars_hist) >= REGRESSOR_SETTINGS.dvars_warmup)
@@ -638,6 +709,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         else:
             # first timepoint: no DVARS
             handler.dvars_hist.append(0.0)
+            handler.last_dvars_val = float("nan")
+            handler.last_dvars_z = float("nan")
 
     # update prev for next DVARS
     handler.prev_mc_for_dvars = mc_data.copy()
@@ -663,6 +736,26 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         cleaned = np.asanyarray(mc_img.dataobj)
         reg_ready = True
         log_step("REG", volume_idx, "skipped", start_t=reg_t0)
+
+    if handler.motion_regressor is not None:
+        reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
+        if reg_names and reg_row is not None:
+            append_regressors(handler.cfg.rt_work_dir / "regressors_rt.csv", volume_idx, reg_names, reg_row)
+
+    biopac_missing = False
+    if handler.biopac_receiver is not None:
+        biopac_missing = handler.biopac_receiver.was_missing(volume_idx)
+    append_regression_status(
+        handler.cfg.rt_work_dir / "regression_status_rt.csv",
+        volume_idx,
+        fd_to_save,
+        handler.last_dvars_val,
+        handler.last_dvars_z,
+        fd_censor,
+        dvars_censor,
+        reg_ready,
+        biopac_missing,
+    )
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()
@@ -797,6 +890,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
             time.sleep(0.2)
     except KeyboardInterrupt:
         observer.stop()
+    finally:
+        event_handler.stop()
     observer.join()
 
 def compute_dvars(prev_vol: np.ndarray, cur_vol: np.ndarray, mask: np.ndarray) -> float:
@@ -826,6 +921,47 @@ def append_dvars(qc_path: Path, volume_idx: int, fd: float, dvars: float, dvars_
         w.writerow([volume_idx, fd, dvars, dvars_z])
 
 
+def append_regressors(reg_path: Path, volume_idx: int, reg_names: list[str], reg_row: np.ndarray):
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = reg_path.exists()
+    with open(reg_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(["volume_idx", *reg_names])
+        w.writerow([volume_idx, *reg_row.tolist()])
+
+
+def append_regression_status(
+    qc_path: Path,
+    volume_idx: int,
+    fd: float,
+    dvars: float,
+    dvars_z: float,
+    fd_censor: int,
+    dvars_censor: int,
+    reg_ready: bool,
+    biopac_missing: bool,
+):
+    qc_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = qc_path.exists()
+    with open(qc_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(
+                [
+                    "volume_idx",
+                    "fd",
+                    "dvars",
+                    "dvars_z",
+                    "fd_censor",
+                    "dvars_censor",
+                    "reg_ready",
+                    "biopac_missing",
+                ]
+            )
+        w.writerow([volume_idx, fd, dvars, dvars_z, fd_censor, dvars_censor, int(reg_ready), int(biopac_missing)])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Real-time fMRI watcher pipeline")
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
@@ -848,7 +984,48 @@ def main():
         required=False,
         help="Optional decoder template path to override the default.",
     )
+    parser.add_argument(
+        "--biopac-enable",
+        action="store_true",
+        help="Enable BIOPAC RetroTS regressors via TCP.",
+    )
+    parser.add_argument(
+        "--biopac-host",
+        default=REGRESSOR_SETTINGS.biopac_host,
+        help="Host to bind BIOPAC receiver.",
+    )
+    parser.add_argument(
+        "--biopac-port",
+        type=int,
+        default=REGRESSOR_SETTINGS.biopac_port,
+        help="Port to bind BIOPAC receiver.",
+    )
+    parser.add_argument(
+        "--biopac-timeout",
+        type=float,
+        default=REGRESSOR_SETTINGS.biopac_timeout,
+        help="Seconds to wait for physio regressors before zero-fill.",
+    )
+    parser.add_argument(
+        "--biopac-phys-reg",
+        default=REGRESSOR_SETTINGS.biopac_phys_reg,
+        choices=["RICOR8", "RVT5", "RVT+RICOR13"],
+        help="Physio regressor family to expect from BIOPAC stream.",
+    )
+    parser.add_argument(
+        "--biopac-handshake",
+        action="store_true",
+        default=REGRESSOR_SETTINGS.biopac_handshake,
+        help="Send a handshake with TR to the BIOPAC streamer.",
+    )
     args = parser.parse_args()
+
+    REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
+    REGRESSOR_SETTINGS.biopac_host = args.biopac_host
+    REGRESSOR_SETTINGS.biopac_port = args.biopac_port
+    REGRESSOR_SETTINGS.biopac_timeout = args.biopac_timeout
+    REGRESSOR_SETTINGS.biopac_phys_reg = args.biopac_phys_reg
+    REGRESSOR_SETTINGS.biopac_handshake = args.biopac_handshake
 
     cfg = RTSessionConfig(
         subject=args.sub,
