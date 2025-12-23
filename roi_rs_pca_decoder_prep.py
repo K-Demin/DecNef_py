@@ -27,7 +27,7 @@ from __future__ import annotations
 ROI_NAMES = ["EVC", "LPFC", "Sensorimotor"]
 KVOX = 3000
 N_COMPONENTS = 10
-FD_THRESH = 0.2
+FD_THRESH = 0.3
 MIN_NEIGHBORS = 0  # 0 disables neighbor filtering
 USE_ZSCORE = True
 SEED = 0
@@ -37,12 +37,20 @@ SEED = 0
 #   "mc"   : force motion-corrected only (avoid regressed/denoised)
 #   "reg"  : force regressed/denoised only (prefer reg/)
 PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg"
-FORCE_REBUILD_4D = False  # True => always rebuild rs_4d_{mc,reg}.nii.gz from 3D series
 SEPARATE_OUTPUTS_BY_MODE = True  # True => write outputs under .../PCA/<run>/pca_<mode>/
 
 N_SKIP_START = 25
+# Proper, offline motion regression
+# Regress motion from ROI timeseries before PCA?
+REGRESS_MOTION_BEFORE_PCA = False
+# Motion model options:
+MOTION_MODEL = "mot6"   # "mot6" or "mot12" (based on motion_rt.1D)
+# Include intercept (always recommended)
+MOTION_ADD_INTERCEPT = False
+# (Optional) add linear trend regressor (helps if you don't high-pass)
+MOTION_ADD_LINEAR_TREND = False
 
-
+FORCE_REBUILD_4D = False  # True => always rebuild rs_4d_{mc,reg}.nii.gz from 3D series
 AUTO_FSLMERGE_4D = True
 FSLMERGE_OUTDIR_NAME = "analysis"  # where to write the merged 4D under run_dir
 PREFER_MERGED_BASENAME = "rs_4d"   # filename stem: rs_4d_mc.nii.gz / rs_4d_reg.nii.gz
@@ -745,6 +753,39 @@ def process_dataset(
 
         t_used = roi_ts.shape[0]
 
+        # --- OPTIONAL: regress motion from ROI time series before PCA ---
+        motion_regressed = False
+        motion_design_cols = 0
+
+        if REGRESS_MOTION_BEFORE_PCA and (motion_mat is not None):
+            # align motion to the exact same TRs used in roi_ts
+            if fd_used is not None:
+                motion_used = motion_mat[keep, :]
+            else:
+                motion_used = motion_mat[:roi_ts.shape[0], :]
+
+            if motion_used is not None and motion_used.shape[0] == roi_ts.shape[0]:
+                Xm = _expand_motion(motion_used, MOTION_MODEL)
+
+                regs = [Xm]
+
+                if MOTION_ADD_LINEAR_TREND:
+                    t = np.linspace(-1.0, 1.0, roi_ts.shape[0], dtype=np.float32)[:, None]
+                    regs.append(t)
+
+                if MOTION_ADD_INTERCEPT:
+                    regs.append(np.ones((roi_ts.shape[0], 1), dtype=np.float32))
+
+                X = np.hstack(regs).astype(np.float32)
+                motion_design_cols = X.shape[1]
+
+                # residualize (per-voxel)
+                roi_ts = _residualize(roi_ts.astype(np.float32), X)
+                motion_regressed = True
+            else:
+                print(
+                    "Warning: motion regression requested but motion/roi_ts alignment failed; skipping motion regression.")
+
         if USE_ZSCORE:
             mean_vox = np.mean(roi_ts, axis=0)
             std_vox = np.std(roi_ts, axis=0)
@@ -792,7 +833,7 @@ def process_dataset(
               f"FD={'None' if fd_used is None else fd_used.size} | "
               f"MOT={'None' if motion_used is None else motion_used.shape[0]}")
 
-        motion_qc = _pc1_motion_qc(timecourses[:, 0], motion_used) if USE_MOTION_QC else None
+        motion_qc = _pc_motion_qc(timecourses, motion_used) if USE_MOTION_QC else None
 
         # Save outputs
         np.save(roi_dir / "pca_explained.npy", explained)
@@ -826,7 +867,7 @@ def process_dataset(
             "t_original": t_all,
             "t_used": t_used,
             "motion_file": str(run_dir / "motion_rt.1D") if (run_dir / "motion_rt.1D").exists() else None,
-            "pc1_motion_corr": motion_qc,
+            "pc_motion_qc": motion_qc,
             "decoder_ready": "scores = weights @ voxel_values (optionally z-scored)",
         }
         with open(roi_dir / "decoder_metadata.json", "w") as f:
@@ -927,6 +968,63 @@ def _pc1_motion_qc(pc1: np.ndarray, motion: np.ndarray) -> Optional[dict]:
     vals = [abs(v) for v in out.values() if v is not None]
     out["max_abs_corr"] = float(max(vals)) if vals else None
     return out
+
+def _pc_motion_qc(timecourses: np.ndarray, motion: Optional[np.ndarray]) -> Optional[dict]:
+    """
+    timecourses: (T, nPC)
+    motion:      (T, nMot) e.g. 6 columns
+
+    Returns dict with:
+      - pc_motion_corr: { "PC01": {"mot01": r, ... , "max_abs_corr": ...}, ... }
+      - max_abs_any: float
+      - max_abs_pair: {"pc": "PC01", "mot": "mot03", "r": 0.52}
+    """
+    if motion is None or timecourses is None:
+        return None
+    if timecourses.ndim != 2:
+        return None
+    if motion.ndim != 2:
+        return None
+    if motion.shape[0] != timecourses.shape[0] or timecourses.shape[0] < 2:
+        return None
+
+    T, nPC = timecourses.shape
+    _, nMot = motion.shape
+
+    out = {}
+    best = {"pc": None, "mot": None, "r": None}
+
+    for i in range(nPC):
+        pc = timecourses[:, i]
+        row = {}
+        for j in range(nMot):
+            x = motion[:, j]
+            if np.std(pc) == 0 or np.std(x) == 0:
+                r = None
+            else:
+                r = float(np.corrcoef(pc, x)[0, 1])
+            row[f"mot{j+1:02d}"] = r
+
+        vals = [abs(v) for v in row.values() if v is not None]
+        row["max_abs_corr"] = float(max(vals)) if vals else None
+        out[f"PC{i+1:02d}"] = row
+
+        # track global best pair
+        for j in range(nMot):
+            r = row.get(f"mot{j+1:02d}")
+            if r is None:
+                continue
+            if best["r"] is None or abs(r) > abs(best["r"]):
+                best = {"pc": f"PC{i+1:02d}", "mot": f"mot{j+1:02d}", "r": float(r)}
+
+    max_abs_any = None if best["r"] is None else float(abs(best["r"]))
+
+    return {
+        "pc_motion_corr": out,
+        "max_abs_any": max_abs_any,
+        "max_abs_pair": best if best["r"] is not None else None,
+    }
+
 
 
 def _find_epi2t1_composite(run_dir: Path) -> Optional[Path]:
@@ -1291,6 +1389,28 @@ def _rs_priority_for_pca(path: Path, pca_mode: str) -> Tuple[int, int, int]:
     dir_score = 0 if is_reg else (2 if is_mc else 1)
     return (dir_score, 0 if has_denoise else 1, 0 if has_mc else 1)
 
+def _expand_motion(motion: np.ndarray, model: str) -> np.ndarray:
+    """Expand motion regressors. motion: (T, nMot)."""
+    model = (model or "mot6").lower()
+    if model == "mot12":
+        # temporal derivative (prepend 0 row)
+        d = np.vstack([np.zeros((1, motion.shape[1]), dtype=motion.dtype), np.diff(motion, axis=0)])
+        return np.hstack([motion, d]).astype(np.float32)
+    return motion.astype(np.float32)
+
+def _residualize(Y: np.ndarray, X: np.ndarray) -> np.ndarray:
+    """
+    Residualize Y w.r.t. design X using least squares.
+    Y: (T, V), X: (T, P)
+    Returns residuals: (T, V)
+    """
+    if Y.ndim != 2 or X.ndim != 2:
+        raise ValueError("Y and X must be 2D")
+    if Y.shape[0] != X.shape[0]:
+        raise ValueError(f"Time dimension mismatch: Y={Y.shape}, X={X.shape}")
+    # Solve min ||Xb - Y|| in least squares sense
+    beta, *_ = np.linalg.lstsq(X, Y, rcond=None)
+    return (Y - X @ beta).astype(np.float32)
 
 
 if __name__ == "__main__":

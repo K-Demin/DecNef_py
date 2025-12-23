@@ -19,9 +19,6 @@ from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
 
-log = logging.getLogger("rt_pipeline")
-logging.basicConfig(level=logging.INFO)
-
 # ---------- Logging setup ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +43,17 @@ class RegressorSettings:
     use_wm: bool = True
     use_vent: bool = True
 
+    # --- censor regressors ---
+    enable_fd_censor_reg: bool = True
+    fd_thr: float = 0.3            #  (units = mm)
+
+    enable_dvars_censor_reg: bool = True
+    dvars_thr_robust_z: float = 3.0  # robust z threshold
+
+    censor_plus1: bool = True        # add +1 TR neighbor
+    dvars_warmup: int = 20           # don’t compute robust stats until you have some history
+    dvars_mask_source: str = "ref_mask"  # "ref_mask" uses cfg.rt_ref_mask
+
 
 REGRESSOR_SETTINGS = RegressorSettings(
     # How to use:
@@ -58,7 +66,7 @@ REGRESSOR_SETTINGS = RegressorSettings(
     mot_reg="mot6",
     max_poly_order=np.inf,
     TR=0.9,
-    use_gs=True,
+    use_gs=False, # Probably it's better to avoid cause it correlates with global brain activity
     use_wm=True,
     use_vent=True,
 )
@@ -104,20 +112,26 @@ def append_fd(fd_path: Path, volume_idx: int, fd_value: float):
             w.writerow(["volume_idx", "fd"])
         w.writerow([volume_idx, fd_value])
 
+class ProcSrc:
+    """Holds the current 3D volume for RTPSpy mask regressors (GS/WM/Vent)."""
+    def __init__(self):
+        self.proc_data = None
 
 class MotionRegressor:
-    """Wrapper around RTPSpy's regression module for online motion denoising."""
-
     def __init__(
-            self,
-            volreg: RtpVolreg,
-            gs_mask: Optional[Path] = None,
-            wm_mask: Optional[Path] = None,
-            vent_mask: Optional[Path] = None,
-            mot_reg: str = "mot6",
-            max_poly_order: float = np.inf,
-            TR: float = 0.9,
+        self,
+        volreg: RtpVolreg,
+        gs_mask: Optional[Path] = None,
+        wm_mask: Optional[Path] = None,
+        vent_mask: Optional[Path] = None,
+        mot_reg: str = "mot6",
+        max_poly_order: float = np.inf,
+        TR: float = 0.9,
+        max_scan_length: int = 1000,
+        enable_fd_censor_reg: bool = False,
+        enable_dvars_censor_reg: bool = False,
     ):
+
         kwargs = dict(
             mot_reg=mot_reg,
             volreg=volreg,
@@ -127,21 +141,27 @@ class MotionRegressor:
             save_proc=False,
             online_saving=False,
             reg_retro_proc=False,
+            max_scan_length=max_scan_length,
+            spike_reg_num = 200,
         )
+        self._regress = RtpRegress(**kwargs)
 
         # If masks exist, enable those regressors
-        # (If your RTPSpy build uses different kw names, you’ll see it immediately as a TypeError.)
         if gs_mask is not None:
-            kwargs.update(dict(GS_reg=True, GS_mask=str(gs_mask)))
+            kwargs_mask = dict(GS_reg=True, GS_mask=str(gs_mask))
+            self._regress.set_param("GS_reg", True)
+            self._regress.set_param("GS_mask", str(gs_mask))
         if wm_mask is not None:
-            kwargs.update(dict(WM_reg=True, WM_mask=str(wm_mask)))
+            self._regress.set_param("WM_reg", True)
+            self._regress.set_param("WM_mask", str(wm_mask))
         if vent_mask is not None:
-            kwargs.update(dict(Vent_reg=True, Vent_mask=str(vent_mask)))
+            self._regress.set_param("Vent_reg", True)
+            self._regress.set_param("Vent_mask", str(vent_mask))
 
-        self._regress = RtpRegress(**kwargs)
         self._ready = False
 
-    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int) -> tuple[np.ndarray, bool]:
+    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int,
+              fd_censor: int = 0, dvars_censor: int = 0) -> tuple[np.ndarray, bool]:
         """
         Run motion regression using RTPSpy.
 
@@ -173,7 +193,12 @@ class MotionRegressor:
             prev_vol = getattr(self._regress, "_vol_num", 0)
 
             # RTPSpy modifies mc_img in-place
-            self._regress.do_proc(mc_img, vol_idx=volume_idx - 1)
+            self._regress.do_proc(
+                mc_img,
+                vol_idx=volume_idx - 1,
+                fd_censor=fd_censor,
+                dvars_censor=dvars_censor,
+            )
 
             # After do_proc, RtpRegress increments _vol_num and
             # only starts regression when _vol_num > wait_num
@@ -215,10 +240,6 @@ class RTSessionConfig:
     def trans_dir(self) -> Path:
         # precomputed transforms live here (from offline pipeline)
         return self.day_root / "func" / "trans"
-
-    @property
-    def rt_gs_mask(self) -> Path:
-        return self.trans_dir / "rt_GS_mask.nii"
 
     @property
     def rt_wm_mask(self) -> Path:
@@ -351,6 +372,25 @@ class DICOMHandler(FileSystemEventHandler):
         self.prev_motion = None              # previous 6-vector
         self.brain_radius_mm = 50.0          # standard radius for FD
         self.pre_trial_scans = 0             # if you ever want NaNs for early scans
+
+        # --- NEW: DVARS state ---
+        self.prev_mc_for_dvars = None
+        self.dvars_hist = []  # store prior DVARS to compute robust stats
+        self.censor_next_fd = False
+        self.censor_next_dvars = False
+
+        # --- NEW: load mask for DVARS (use cfg.rt_ref_mask) ---
+        self.dvars_mask = None
+        if REGRESSOR_SETTINGS.enable_dvars_censor_reg:
+            mpath = cfg.rt_ref_mask
+            if not mpath.exists():
+                log.warning(f"[DVARS] Mask missing at {mpath}; DVARS censor disabled.")
+            else:
+                mimg = nib.load(str(mpath))
+                mdat = np.asanyarray(mimg.dataobj)
+                self.dvars_mask = (mdat > 0.5)
+                log.info(f"[DVARS] Using mask for DVARS: {mpath}")
+
         # --- Nuisance masks (made offline by pipeline.py) ---
         def resolve_mask(label: str, path: Path, enabled: bool) -> Optional[Path]:
             if not enabled:
@@ -380,10 +420,18 @@ class DICOMHandler(FileSystemEventHandler):
                 mot_reg=REGRESSOR_SETTINGS.mot_reg,
                 max_poly_order=REGRESSOR_SETTINGS.max_poly_order,
                 TR=REGRESSOR_SETTINGS.TR,
+                max_scan_length=1000,  # or your typical max TR count for a run
+                enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
+                enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
             )
         else:
             log.info("[REG] Motion regression disabled by config.")
             self.motion_regressor = None
+
+        # --- Source container for GS/WM/Vent regressors (RTPSpy expects mask_src_proc.proc_data) ---
+        self.proc_src = ProcSrc()
+        if self.motion_regressor is not None:
+            self.motion_regressor._regress.mask_src_proc = self.proc_src
 
         # --- Decoder / scorer ---
         decoder_path = cfg.decoder_template or (
@@ -541,11 +589,71 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         start_t=t0,
     )
 
+    # ---------- 2b.5) CENSOR FLAGS (FD + DVARS) ----------
+    fd_censor = 0
+    dvars_censor = 0
+
+    # --- FD censor: FD > thr plus +1 TR ---
+    if REGRESSOR_SETTINGS.enable_fd_censor_reg:
+        hit_fd = np.isfinite(fd_to_save) and (fd_value > REGRESSOR_SETTINGS.fd_thr)
+        if handler.censor_next_fd:
+            fd_censor = 1
+            handler.censor_next_fd = False
+        if hit_fd:
+            fd_censor = 1
+            if REGRESSOR_SETTINGS.censor_plus1:
+                handler.censor_next_fd = True
+
+    # --- DVARS censor: raw DVARS robust_z > thr plus +1 TR ---
+    if REGRESSOR_SETTINGS.enable_dvars_censor_reg and handler.dvars_mask is not None:
+        if handler.prev_mc_for_dvars is not None:
+            dvars_val = compute_dvars(handler.prev_mc_for_dvars, mc_data, handler.dvars_mask)
+
+            # robust z against prior DVARS history (exclude current)
+            z = robust_z(dvars_val, handler.dvars_hist)
+
+            # update history after computing z
+            handler.dvars_hist.append(dvars_val)
+
+            # save to a file
+            append_dvars(
+                handler.cfg.rt_work_dir / "dvars_rt.csv",
+                volume_idx,
+                fd_to_save,
+                dvars_val,
+                z
+            )
+
+            # optional: ignore first few DVARS for robust stats stability
+            enough = (len(handler.dvars_hist) >= REGRESSOR_SETTINGS.dvars_warmup)
+            hit_dvars = enough and np.isfinite(z) and (z > REGRESSOR_SETTINGS.dvars_thr_robust_z)
+
+            if handler.censor_next_dvars:
+                dvars_censor = 1
+                handler.censor_next_dvars = False
+            if hit_dvars:
+                dvars_censor = 1
+                if REGRESSOR_SETTINGS.censor_plus1:
+                    handler.censor_next_dvars = True
+        else:
+            # first timepoint: no DVARS
+            handler.dvars_hist.append(0.0)
+
+    # update prev for next DVARS
+    handler.prev_mc_for_dvars = mc_data.copy()
+
+
     # ---------- 2c) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
     mc_for_warp = mc_nii
     if handler.motion_regressor is not None:
-        cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx)
+        handler.proc_src.proc_data = np.asanyarray(mc_img.dataobj)
+        cleaned, reg_ready = handler.motion_regressor.apply(
+            mc_img,
+            volume_idx,
+            fd_censor=fd_censor,
+            dvars_censor=dvars_censor,
+        )
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
@@ -690,6 +798,32 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
+
+def compute_dvars(prev_vol: np.ndarray, cur_vol: np.ndarray, mask: np.ndarray) -> float:
+    diff = (cur_vol - prev_vol)
+    if mask is not None:
+        diff = diff[mask]
+    diff = diff.astype(np.float32)
+    return float(np.sqrt(np.mean(diff * diff)))
+
+def robust_z(x: float, history: list[float]) -> float:
+    # robust z using median and MAD from history
+    if len(history) < 5:
+        return float("nan")
+    med = float(np.median(history))
+    mad = float(np.median(np.abs(np.asarray(history) - med)))
+    if mad < 1e-8:
+        return float("nan")
+    return float((x - med) / (1.4826 * mad))
+
+def append_dvars(qc_path: Path, volume_idx: int, fd: float, dvars: float, dvars_z: float):
+    qc_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = qc_path.exists()
+    with open(qc_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(["volume_idx", "fd", "dvars", "robust_z"])
+        w.writerow([volume_idx, fd, dvars, dvars_z])
 
 
 def main():

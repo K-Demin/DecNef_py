@@ -1,13 +1,3 @@
-###
-#
-#
-# Add denoising
-# Rearrange files a bit - most of anat in a subj folder
-#
-#
-#
-# from pathlib import Path
-
 import logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc_pipeline")

@@ -1,7 +1,7 @@
 # fmri_rt_preproc/prep_surface_rois.py
 #
 #
-#python -m fmri_rt_preproc.prep_surface_rois \
+# python -m fmri_rt_preproc.prep_surface_rois \
 # --root /SSD2/DecNef_py/data \
 # --subj 00085 \
 # --day 2_copy

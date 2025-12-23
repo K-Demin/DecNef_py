@@ -4,6 +4,10 @@
 RTP regression
 
 @author: mmisaki@laureateinstitute.org
+
+Some minor updates from Konstantin "Kostya" Demin:
+Introduced simple censor spike regressors
+@deminkasci@gmail.com
 """
 
 
@@ -93,7 +97,7 @@ class RtpRegress(RTP):
                  WM_mask=None, Vent_reg=False, Vent_mask=None,
                  mask_src_proc=None, phys_reg='None', rtp_physio=None,
                  tshift=0.0, desMtx=None, wait_num=0, mask_file=0,
-                 max_scan_length=800, onGPU=gpu_available, reg_retro_proc=True,
+                 max_scan_length=800, onGPU=gpu_available, reg_retro_proc=True, spike_reg_num=200,
                  **kwargs):
         """
         Parameters
@@ -199,6 +203,10 @@ class RtpRegress(RTP):
         self.onGPU = onGPU
         self.reg_retro_proc = reg_retro_proc
         self.wait_num = wait_num
+
+        self.spike_reg_num = int(spike_reg_num) if spike_reg_num else 0
+        self._spike_cols = []
+        self._next_spike = 0
 
         # --- Initialize working data ---
         # Mask matrices
@@ -460,6 +468,16 @@ class RtpRegress(RTP):
                     self.desMtx[vol_idx,
                                 self.motcols[0]:self.motcols[0]+6] = dmot
 
+            # --- Scrubbing via spike regressors (preallocated) ---
+            censor_hit = (float(kwargs.get("fd_censor", 0.0)) > 0.0) or (float(kwargs.get("dvars_censor", 0.0)) > 0.0)
+            if censor_hit and getattr(self, "_spike_cols", None):
+                if self._next_spike < len(self._spike_cols):
+                    j = self._spike_cols[self._next_spike]
+                    self.desMtx[vol_idx, j] = 1.0
+                    self._next_spike += 1
+                else:
+                    self._logger.warning("Ran out of preallocated spike regressors; censor event ignored.")
+
             # Append mask mean signal regressor from mask_src_proc
             if self.GS_reg or self.WM_reg or self.Vent_reg:
                 msk_src_data = self.mask_src_proc.proc_data[self.maskV]
@@ -680,6 +698,8 @@ class RtpRegress(RTP):
         self.GS_maskdata = None
         self.WM_maskdata = None
         self.Vent_maskdata = None
+        self._spike_cols = []
+        self._next_spike = 0
 
         return super(RtpRegress, self).end_reset()
 
@@ -718,12 +738,20 @@ class RtpRegress(RTP):
         if desMtx_read is None:
             desMtx = np.zeros([max_scan_length, 0], dtype=np.float32)
         else:
+            # ensure desMtx exists
             if max_scan_length <= desMtx_read.shape[0]:
                 max_scan_length = desMtx_read.shape[0]
+                desMtx = desMtx_read.astype(np.float32, copy=False)
             else:
-                desMtx = np.zeros([max_scan_length, desMtx_read.shape[1]],
-                                  dtype=np.float32)
+                desMtx = np.zeros([max_scan_length, desMtx_read.shape[1]], dtype=np.float32)
                 desMtx[:desMtx_read.shape[0], :] = desMtx_read
+
+            # Adjust col_names length to match desMtx columns
+            if len(col_names) > desMtx.shape[1]:
+                col_names = col_names[:desMtx.shape[1]]
+            elif len(col_names) < desMtx.shape[1]:
+                while len(col_names) < desMtx.shape[1]:
+                    col_names.append(f"Reg{len(col_names) + 1}")
 
             # Adjust col_names and desMtx columns
             if len(col_names) > desMtx.shape[1]:
@@ -731,6 +759,16 @@ class RtpRegress(RTP):
             elif len(col_names) < desMtx.shape[1]:
                 while len(col_names) < desMtx.shape[1]:
                     col_names.append("Reg{len(col_names)+2}")
+
+            # --- Preallocated spike regressors for scrubbing ---
+            self._spike_cols = []
+            self._next_spike = 0
+            if getattr(self, "spike_reg_num", 0) > 0:
+                nsp = int(self.spike_reg_num)
+                desMtx = np.concatenate([desMtx, np.zeros([max_scan_length, nsp], dtype=np.float32)], axis=1)
+                spike_names = [f"spike_{i:03d}" for i in range(nsp)]
+                col_names.extend(spike_names)
+                self._spike_cols = [col_names.index(nm) for nm in spike_names]
 
         # Append nuisunce regressors
         if self.mot_reg != 'None':

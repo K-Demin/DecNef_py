@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# a lot of args, use example: python plot_decoder_fd_filtered.py --sub 00000 --day 1 --run 2 --fd-thresh 0.3 --censor-next --skip-trs 25
 import argparse
 from pathlib import Path
 
@@ -27,7 +28,7 @@ def load_scores(run_dir: Path):
 
     data = np.genfromtxt(scores_path, delimiter=",", names=True)
     vol_idx = data["volume_idx"].astype(int)
-    z_dec = data["score_z"].astype(float)
+    z_dec = data["score_raw"].astype(float)
     return vol_idx, z_dec
 
 
@@ -177,6 +178,8 @@ def main():
         default=None,
         help="Output PNG path (default: run_dir/decoder_fd_censor.png).",
     )
+    parser.add_argument("--skip-trs", type=int, default=25,
+                        help="Skip first N TRs (default: 25).")
     args = parser.parse_args()
 
     base = Path(args.base_data)
@@ -199,6 +202,11 @@ def main():
 
     # --- align series ---
     fd_aligned, dec_aligned, vols = align_by_volume_idx(vol_fd, fd, vol_dec, dec_z)
+
+    keep = vols > args.skip_trs
+    fd_aligned = fd_aligned[keep]
+    dec_aligned = dec_aligned[keep]
+    vols = vols[keep]
 
     # Optionally z-score decoder across the run (on aligned volumes)
     if args.no_zscore_decoder:
