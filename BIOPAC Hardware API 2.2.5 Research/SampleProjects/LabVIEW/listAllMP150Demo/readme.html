@@ -1,0 +1,95 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>LabVIEW: listAllMP150Demo and listAllMP160Demo - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>listAllMP160Demo/listAllMP150Demo</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="listAllMP150Demo1.jpg" alt="listAllMP150Demo.vi" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> LabVIEW</li>
+		<li><b>Development Environment:</b> LabVIEW 2023</li>
+		<li><b>Most Recent Test Environment:</b> LabVIEW 2023 Q3</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP150 UDP (for listAllMP150Demo)</li>
+		<li><b>MP Device:</b> MP160 UDP (for listAllMP160Demo)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to create a list of all MP160s/MP150s in the network using the BIOPAC Hardware API.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="listAllMP150Demo2.jpg" alt="Block Diagram key portion" />
+				<p>
+					Figure 1: Block Diagram key portion
+				</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		These two projects utilize, in one case, the BIOPAC Hardware API functions 
+		<span class="fn">findAllMP160()</span> and <span class="fn">readAvailableMP160SN()</span>
+		to create a list of MP160s in the network, and in the other case, the corresponding MP150
+		functions to create a list of MP150s in the network.
+		</p>
+		<h2>Front Panel</h2>
+		<p>
+		The Front Panel is comprised of a Text Indicator and a Push button.  After running the VI, 
+		press the "Start" button and all the serial numbers for available MP160s/MP150s
+		in the network will appear in the Text Indicator.
+		</p>
+		<h2>Block Diagram</h2>
+		<p>
+		The Block Diagram consists of several Call Library Function Nodes.  These nodes interface with the BIOPAC Hardware API.
+		<span class="fn">Figure 1</span> is the key section of the block diagram.  The while loop calls on
+		<span class="fn">readAvailableMP160SN()</span> or <span class="fn">readAvailableMP150SN()</span> to read an array of 
+		characters and append it to the Text Indicator.
+		</p>
+		<p>
+		This VI passes an invalid MP160/MP150 serial number to the function <span class="fn">connectMPDev()</span>.  This is 
+		a specification requirement, in order to call the function <span class="fn">findAllMP160()</span> or
+		<span class="fn">findAllMP150()</span> successfully.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+			<li>
+				There are several ways of calling Shared Libraries (DLLs) from LabVIEW.  This project uses
+		  		the Call Library Function to call functions from the BIOPAC Hardware API in LabVIEW.  Please
+		  		read LabVIEW's documentation regarding usage of the Call Library Function.
+			</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>
+			NONE
+		</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','bwin'); bwin.focus(); return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

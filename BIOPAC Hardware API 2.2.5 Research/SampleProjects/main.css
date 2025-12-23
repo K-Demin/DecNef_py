@@ -1,0 +1,89 @@
+* {
+	margin: 10;
+	padding: 10;
+}
+
+html {
+	background: none;
+}
+
+body {
+	margin: 0px auto;
+	padding: 0px;
+	width: 98%;
+	border: none;
+	color: #666;
+	font: normal 16px/20px Verdana, Arial, Georgia; 
+}
+
+#sampleProgTitle{
+	margin: 0px;
+	padding: 0px;
+	background-color: #99ccff;
+	border: 1px solid #b0b0b0;
+	text-align: center;
+}
+
+#sampleProgTitle h1{
+	margin: 5px;
+	padding: 0px;
+	font-size: 150%;
+}
+
+#footer{
+	margin: 0px;
+	padding: 0px;
+	background-color: #99ccff;
+	border: 1px solid #b0b0b0;
+	text-align: center;
+	clear: both;
+	font-size: 75%;
+}
+
+.progLang {
+	margin: 10px;
+	padding: 10px;
+	background-color: #fafafa;
+	border-left: 2px solid #e0e0e0;
+	border-right: 2px solid #e0e0e0;
+	font-size: 80%;
+	clear: both;
+}
+
+.progLang h2 {
+	margin: 0px;
+	padding: 0px;
+	color: #333;
+	font-size: 125%;
+	border-bottom: 3px solid #666;
+}
+
+.progLang p{
+	margin: 0px;
+	padding: 0px;
+	padding-left: 20px;
+	text-align: left;
+	border-bottom: 1px solid #666;
+}
+
+.sampleProjects {
+	margin: 0px;
+	padding: 0px;
+}
+
+.sampleProjects a {
+	margin: 0px;
+	padding: 0px;
+	font-weight: bold;
+	font-size: 14px;
+}
+
+a:link, a:visited{
+	color: #00007b;
+	text-decoration: none;
+}
+
+a:hover {
+	color: #e0e0e0;
+	text-decoration: none;
+}

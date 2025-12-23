@@ -1,0 +1,85 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: MPCommander - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>MPCommander</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="mpcommander.jpg" alt="MPCommander.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> C#</li>
+		<li><b>Development Environment:</b> Visual Studio 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP, MP36R USB (source must be modified to work with MP200 if desired)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in C# to develop a command line interface to the MP device.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<h2>Introduction</h2>
+		<p>
+		The command line interface allows users to control the MP device by simply typing simple commands.  When configured to communicate
+		with the MP160 or the MP36, the user can perform simple tasks such as poll for the current values of the analog and digital channels.
+		</p>
+		<h2>Implementation</h2>
+		<p>
+		The main function of the program simply creates an instance of <span class="fn">CommandLineManager</span> class.  When the
+		<span class="fn">Start()</span> function is called the <span class="fn">CommandLineManager</span> object takes control of
+		input processing and execution.
+		</p>
+		<h2>Command Line Manager</h2>
+		<p>
+		The <span class="fn">CommandLineManager</span> class manages all supported commands.  Each user input on the console gets validated.
+		If the first token of the input is a valid command the corresponding execute function is called. For example, if the user enters
+		<span class="fn">mp36usb</span> the <span class="fn">ExecuteMP36USB()</span> function gets invoked.  The execute functions validate
+		the rest of the data and calls the functions from the <span class="fn">MPDevice</span> class.
+		</p>
+		<h2>MP Device</h2>
+		<p>
+		The <span class="fn">MPDevice</span> class is the base class for the <span class="fn">MP36USB</span> and <span class="fn">MP160UDP</span>
+		classes.  It abstracts the differences between function calls to the Hardware API when using the MP36R or the MP160.
+		The <span class="fn">CommandLineManager</span> class contain a <span class="fn">MP</span> variable of type <span class="fn">MPDevice</span>.
+		When the user invokes the <span class="fn">mp36usb</span> or the <span class="fn">mp160udp</span> command, an instance of the corresponding
+		class is assigned to the <span class="fn">MP</span> variable.
+		</p>
+		<h2>Expansion</h2>
+		<p>
+		The MPCommander program does not support the full Hardware API command set.  Additional Hardware API commands can be exposed through this program
+		by studying and modifying the source code.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>MPDevImports.cs is the C# wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

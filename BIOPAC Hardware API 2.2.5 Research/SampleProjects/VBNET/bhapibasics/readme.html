@@ -1,0 +1,74 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>Visual Basic .NET: bhapibasics - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>bhapibasics</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="bhapibasics.jpg" alt="bhapibasics.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> Visual Basic .NET</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP36R USB or MP160 UDP or MP200 UDP (code must be modified to work with MP150 if desired)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates the basic usage patterns the BIOPAC Hardware API in VB .NET.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<h2>Introduction</h2>
+		<p>
+		The sample project is a console application that demonstrates how to use
+		the <span class="fn">getMPBuffer()</span> and <span class="fn">getMostRecentSample()</span>.
+		It also shows how to create an application that supports the MP36R and the MP160 using the Hardware API.
+		</p>
+		<h2>Usage</h2>
+		<p>
+		When the program is launched, the user is prompted to enter "MP200UDP", "MP160UDP", "MP36USB" or "EXIT."  The program then
+		configures itself to run the demo for the MP200, the MP160, the MP36R or exit the application.  The program will execute
+		until it acquires data using poll for the most recent sample ten times.  It then starts a new acquisition and
+        gets the first two seconds of data.  Finally, it outputs some of the values acquired on the console.
+		</p>
+		<h2>MP36R and MP160</h2>
+		<p>
+		The Hardware API abstracts most of the differences between the MP36R and the MP160. However, the Hardware API users
+		must account for some of the physical differences between the two MP devices if they want to support both devices
+		like the number of analog and digital channels. This sample project shows how to programatically handle the differences
+		in the number analog and digital channels of the devices.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>MPDev.vb is the VB .NET wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

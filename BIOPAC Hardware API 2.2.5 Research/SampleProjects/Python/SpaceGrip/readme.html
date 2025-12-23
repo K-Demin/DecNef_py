@@ -1,0 +1,91 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>Python: SpaceGrip demo - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>SpaceGrip</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="spacegrip1.jpg" alt="spacegrip.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> Python 3 (last tested with version 3.12.2)</li>
+		<li><b>Development Environment:</b> PyCharm Community Edition</li>
+		<li><b>Version:</b> 2023.2.2</li>
+		<li><b>Dependency:</b> pygame; after installing Python, use &ldquo;pip3 install pygame&rdquo; to install</li> 
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP (see comments in spacegrip.py to use with other hardware)</li>
+		<li><b>Dynamometer:</b> Hand Dynamometer (TSD121C) (use SS25LB/A for MP36R and see comments in spacegrip.py for other required changes)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates basic usage of the BIOPAC Hardware API in Python 3 to develop a simple PyGame spaceship minigame. The program utilizes a Dynamometer (grip strength meter) as its human interface.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<h2>Introduction</h2>
+		<p>
+		The goal of the game is to control the spaceship by gripping the Dynamometer to accelerate upwards in order to avoid various asteroids. The user is prompted to start the game by pressing the spacebar
+		from the menu screen. Once started, the program will begin acquiring data from the Dynamometer, detecting any significant changes in grip and accelerating the spaceship accordingly; the stronger the grip,
+		the quicker the spaceship will accelerate. Once the player crashes into an obstacle, the user's final time is displayed and the game returns to the menu screen. The program includes two functions for acquiring
+		and analyzing the grip strength data: 
+		<span class="fn">getGripStrength()</span>, and <span class="fn">compareVolts()</span>.
+		</p>
+		<h2>Setup</h2>
+		<p>
+			The program was developed with control of the spaceship exerted via a TSD121C connected through a DA100C. Settings on the DA100C should be: Gain: 1000, 10HzLP: On, (other LP does not matter), HP: DC.  The Dynamometer (TSD121C) should be left at rest (or lightly held without gripping) when initially starting the game.
+			Once the game has started, the user may begin gripping/releasing to play.  Squeezing harder causes the spaceship to rise faster.
+		</p>
+		<p>
+			Note that control of the spaceship may be established via any voltage source that can be operated under the user's power.
+		</p>
+		<h2>Implementation</h2>
+		<p>
+			As soon as the program is launched, it connects to the MP device and is configured to acquire on channel 1 at 500Hz. An initial voltage reading is also taken using <span class="fn">getGripStrength()</span> in order
+			to compare against future readings. The game is initiated by the <span class="fn">game()</span> function, which is invoked when the player presses the spacebar on the menu screen. For each game tick, the game makes a call to 
+			<span class="fn">getGripStrength()</span> and passes the return value into <span class="fn">compareVolts()</span>. If a significant change is detected (> 0.02 difference), then the resulting value is passed into the ship's
+			<span class="fn">control()</span> function, which increases its acceleration in the y-direction accordingly.
+		</p>
+		<h2>getGripStrength()</h2>
+		<p>
+			The function <span class="fn">getGripStrength()</span> acquires data from the MP device through use of the <span class ="fn">getMostRecentSample()</span> function. The data values are stored in an array of size 16 and only the 
+			first index is returned, which corresponds to channel 1.
+		</p>
+		<h2>compareVolts()</h2>
+		<p>
+			The function <span class="fn">compareVolts()</span> takes in a voltage reading (from <span class="fn">getGripStrength()</span>) and compares the value to the voltage reading from the Dynamometer at rest. If the absolute difference between
+			these two values is above the threshold of 0.02, then the value is returned, otherwise 0 is returned. The purpose of this function is to prevent minute changes in voltage from affecting the spaceship controls.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>Calls to the API method <span class="fn">connectMPDev()</span> need to be modified to reflect your MP device configuration</li>
+				<li>File mpdev.lib needs to be referenced or moved to the project directory</li>
+				<li>Path to mpdev.h needs to be specified in the include statement or move to the project directory</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','bwin'); bwin.focus(); return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

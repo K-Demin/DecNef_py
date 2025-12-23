@@ -1,0 +1,112 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>Visual Basic .NET: ImageStim - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>ImageStim</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="imagestim.jpg" alt="imagestim.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> Visual Basic .NET</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP36R USB</li>
+		<li><b>Electrode:</b> General Purpose Electrodes (EL503)</li>
+		<li><b>Electrode Lead:</b> Shielded Lead Set (SS2L)</li>
+		<li><b>Transducer:</b> Eight-channel Marker Box, Digital (SS55L)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in VB .NET to create
+		an image rating system that also records the subject's physiological and subjective repsonse.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="imgstmout.jpg" alt="Image Stimulus XML Output" />
+				<p>
+					Figure 1: XML output file viewed in a web browser with XML Stylesheets support. <br />
+				</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		The sample project displays a set of images to the subject while it acquires and records data.
+		Each image is displayed for approximately five seconds.  While the image is displayed, the subject must
+		rate the stimulus using the Eight-channel Marker Box. The software also acquires and records data from
+		Analog Channel 1 of the MP36R.
+		</p>
+		<h2>Usage</h2>
+		<p>
+		When the program is launched, the user must specify a folder where images are stored.  The software only
+		accepts images with file extension, jpg, jpeg, and gif.  The user must also specify the directory where
+		it will save the output files.  When the "GO!!!" button is pressed, the user will be prompted to locate the
+		Channel Preset XML file. This is located in the Hardware API install directory in the PresetFiles folder.
+		From there, the images are displayed and data acquisition begins.
+		</p>
+		<h2>Program Logic</h2>
+		<p>
+		If all the configuration routines are successfully completed, the software follows this logic for each image:
+		</p>
+		<ul>
+			<li>Display the image</li>
+			<li>Start the acquisition</li>
+			<li>Get the first 5 seconds of data</li>
+			<li>Clear the screen</li>
+			<li>Stop the acquisition</li>
+			<li>Extract Analog Channel 1 from the data buffer</li>
+			<li>Extract the subjective score from the data buffer</li>
+		</ul>
+		<h2>Data Acquisition</h2>
+		<p>
+		The software uses <span class="fn">getMPBuffer()</span> function from the Hardware API to acquire data.
+		Since <span class="fn">getMPBuffer()</span> function is a blocking function, it is not necessary to time
+		the number of seconds the image has been displayed.  The software simply requests 5 seconds of data from
+		the <span class="fn">getMPBuffer()</span> function immediately after the image is displayed and the
+		start of acquisition.
+		</p>
+		<h2>Data Reporting</h2>
+		<p>
+		All the data from each stimulus is saved in memory until all the images have been displayed. A report is
+		generated from the serialization of the <span class="fn">StimulusReport</span> class into an XML file.  The
+		waveform from Analog Channel 1 is saved as an image into the specified directory.  The software also
+		saves a copy of XML Stylesheet that was compiled as a resource in the executable.  When the output XML
+		file is viewed in a web browser that supports XML Stylesheets, it will be displayed similar to
+		<span class="fn">Figure 1</span>.  The XML Stylesheet directs the browser to display the data from the XML
+		file in a table and sort it from highest to lowest subjective rating.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>MPDev.vb is the VB .NET wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

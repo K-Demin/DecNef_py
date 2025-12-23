@@ -1,0 +1,164 @@
+* {
+	margin: 0;
+	padding: 0;
+}
+
+html {
+	background: none;
+}
+
+body {
+	margin: 0px auto;
+	padding: 0px;
+	width: 98%;
+	border: none;
+	color: #666;
+	font: normal 16px/20px Verdana, Arial, Georgia; 
+}
+
+#sampleName{
+	margin: 0px;
+	padding: 0px;
+	background-color: #99ccff;
+	border: 1px solid #b0b0b0;
+	text-align: center;
+}
+
+#sampleName h1{
+	margin: 5px;
+	padding: 0px;
+	font-size: 150%;
+}
+
+#footer{
+	margin: 0px;
+	padding: 0px;
+	background-color: #99ccff;
+	border: 1px solid #b0b0b0;
+	text-align: center;
+	clear: both;
+	font-size: 75%;
+}
+
+#sampleInfo{
+	margin: 0px;
+	padding: 20px;
+	padding-bottom: 125px;
+	background-color: #fafafa;
+	border: 2px dotted #e0e0e0;
+	min-height: 275px;
+}
+
+#sampleDetail{
+	margin: 0px;
+	padding: 0px;
+	border-top: 3px solid #666;
+	border-bottom: 3px solid #666;
+}
+
+#sampleInfo h2, #sampleBrief h2,  #sampleDetail h2, #sampleNotes h2, #sampleIssue h2{
+	margin: 0px;
+	padding: 0px;
+	padding-top: 10px;
+	color: #333;
+	font-size: 125%;
+	border-bottom: 1px solid #666;
+}
+
+#sampleInfo p, #sampleBrief p,  #sampleDetail p, #sampleNotes p, #sampleIssue p{
+	margin: 0px;
+	padding: 0px;
+	padding-top: 10px;
+}
+
+#sampleInfo ul{
+	margin: 0px;
+	padding: 0px;
+	padding-left: 10px;
+	list-style-type: none;
+}
+
+#sampleInfo li{
+	margin: 0px;
+	padding: 0px;
+	font-size: 80%;
+}
+
+#screenShot {
+	margin: 0px;
+	padding: 0px;
+	float: right;
+}
+
+#screenShot h3{
+	margin: 0px;
+	padding: 0px;
+	font-size: 80%;
+	text-align: center;
+}
+
+#screenShot img{
+	border: 0px
+}
+
+#sampleBrief,  #sampleDetail, #sampleNotes, #sampleIssue{
+	margin: 0px;
+	padding: 10px;
+	font-size: 80%;
+	clear: both;
+}
+
+#sampleFigure {
+	margin: 0px;
+	padding: 0px;
+	float: right;
+	width: 260px;
+}
+
+
+.figure {
+	margin: 0px;
+	padding: 0px;
+	margin-bottom: 20px;
+	background-color: #ffff99;
+	text-align: center;
+	border-left: 2px dotted #b0b0b0;
+	border-right: 2px dotted #b0b0b0;
+	border-top: 2px dotted #b0b0b0;
+}
+
+.figure img{
+	border: 0px
+}
+
+.figure p {
+	margin: 0px;
+	padding: 0px;
+	text-align: center;
+	font-size: 75%;
+	border-bottom: 2px dotted #b0b0b0;
+}
+
+
+.fn{
+	font-style: italic;
+	color: #333;
+}
+
+ul{
+	margin: 0px;
+	padding: 0px;
+	padding-left: 30px;
+	list-style-type: square;
+}
+
+a:link, a:visited{
+	color: #00007b;
+	text-decoration: none;
+}
+
+a:hover {
+	color: #e0e0e0;
+	text-decoration: none;
+}
+

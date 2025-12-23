@@ -1,0 +1,100 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>LabVIEW: getBufferDemo - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>getBufferDemo</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="getBufferDemo1.jpg" alt="getBufferDemo.vi" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> LabVIEW</li>
+		<li><b>Development Environment:</b> LabVIEW 2023</li>
+		<li><b>Most Recent Test Environment:</b> LabVIEW 2023 Q3</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160/MP150 UDP or MP36R USB</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to acquire data from the MP device in LabVIEW using the BIOPAC Hardware API.
+		There are three VIs in this project. The VI getBufferDemo160 is configured for use with the MP160, the VI 
+		getBufferDemo150 is configured for use with the MP150, and the VI getBufferDemo36 is configured for use with the MP36R.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="getBufferDemo2.jpg" alt="Configuration Section of the Front Panel" />
+				<p>
+					Figure 1: Configuration Section of the Front Panel
+				</p>
+			</div>
+			<div class="figure">
+				<img src="getBufferDemo3.jpg" alt="Block Diagram key portion" />
+				<p>
+					Figure 2: Block Diagram key portion
+				</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		This project utilizes the BIOPAC Hardware API function <span class="fn">getMPBuffer()</span>.  According to its
+		specification, this function does not allow for real-time data processing, analysis or plotting.  However, it is good
+		for acquiring data for a short interval and at a high sampling rate.
+		</p>
+		<h2>Front Panel</h2>
+		<p>
+		The Front Panel is comprised of three Waveform Charts that are hard wired to plot data from 3 analog channels.
+		It also has a configuration section that must be modified for your MP device configuration (see <span class="fn">Figure 1</span>).
+		In accordance to the specification of the <span class="fn">getMPBuffer()</span> function, the number of samples to acquire must be
+		specified. After running the VI, configure the DLL, configure the acquisition, and
+		then press the "Start" button to initiate the acquisition. The VI will block until the desired number of samples has been
+		acquired or an error occurs.
+		</p>
+		<h2>Block Diagram</h2>
+		<p>
+		The Block Diagram consists of several Call Library Function Nodes.  These nodes interface with the BIOPAC Hardware API.
+		<span class="fn">Figure 2</span> is the key section of the block diagram.  It starts the data acquisition, calls to the
+		<span class="fn">getMPBuffer()</span> function and plots the samples in the appropriate Waveform Charts.
+		Since there are three active channels, the VI allocates an array that can hold three times the number of samples.
+		The array that the <span class="fn">getMPBuffer()</span> function returns is interleaved and must be decimated.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+			<li>
+				There are several ways of calling Shared Libraries (DLLs) from LabVIEW.  This project uses
+		  		the Call Library Function to call functions from the BIOPAC Hardware API in LabVIEW.  Please
+		  		read LabVIEW's documentation regarding usage of the Call Library Function.
+			</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>
+			NONE
+		</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','bwin'); bwin.focus(); return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

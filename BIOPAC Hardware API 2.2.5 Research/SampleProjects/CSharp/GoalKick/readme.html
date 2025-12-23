@@ -1,0 +1,135 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: GoalKick - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>GoalKick</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="goalkick1.jpg" alt="GoalKick.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> C#</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.1</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP (Modify .cs files to test with MP200)</li>
+		<li><b>Module:</b> Amplifier Input Module (AMI100D)</li>
+		<li><b>Transducer:</b> Tri-axial Accelerometer (TSD109F)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in C# to develop a simple soccer game.
+		The game utilizes an accelerometer as its human interface.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="goalkick2.jpg" alt="TSD109F Orientation" />
+				<p>Figure 1: TSD109F orientation</p>
+			</div>
+			<div class="figure">
+				<img src="goalkick3.jpg" alt="Signal produced while performing a kicking motion." />
+				<p>Figure 2: Signal produced while performing a kicking motion.</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		The objective of the game is to get the soccer ball into the goal.  When the user initiates the game play, the application
+		prompts the user to kick.  Once the game detects the start of a kicking motion it begins acquiring data.
+		Based on this acquired data, it determines whether the ball will go into the goal and animates the soccer ball accordingly.
+		</p>
+		<h2>Setup</h2>
+		<p>
+		All three components of acceleration can be obtained with the TSD109F. For simplicity, this game only uses the X component
+		of the Tri-axial Accelerometer (TSD109F). The TSD109F should
+		be placed on the user's ankle.  The positive direction of the X component should point towards the back
+		of the user (see <span class="fn">Figure 1</span>). Using BIOPAC's Acq<em>Knowledge</em> software, it was determined that in the
+		X component of the TSD109F, positive 1 g maps to 2.897 volts and negative 1 g maps to 2.976 volts.
+		</p>
+		<h2>Signal Classification</h2>
+		<p>
+		The game classifies the beginning of a kicking motion (the "wind-up") as a negative peak, similar to peak number 1 of
+		<span class="fn">Figure 2</span>.  This peak occurs around -1.5 g.  This peak is generated when the
+		user's leg moves from the neutral position towards the back to prepare for the kick.
+		</p>
+		<p>
+		The game classifies the point of impact of a kicking motion as a negative peak, similar to peak number 2 of
+		<span class="fn">Figure 2</span>.
+		This peak is generated when the user's leg moves from the wind-up position and accelerates towards the ball.
+		Its amplitude determines whether the ball will end up in or miss the goal.
+		</p>
+		<h2>Implementation</h2>
+		<p>
+		Make sure that the X component of the TSD109F is connected to the channel 1 input on the AMI100D.
+		As soon as the game is launched, it connects to the specified MP device and configures it to acquire on
+		channel 1 at 500Hz. It also sets the trigger to -1.5 g positive edge.  This is all performed in the
+		<span class="fn">GoalKick_Load()</span> function.  Since the Hardware API function
+		<span class="fn">disconnectMPDev()</span> is only invoked when an error occurs or the program exits,
+		the trigger setup will persist for every acquisition.
+		</p>
+		<p>
+		The game play is initiated by the <span class="fn">startStopButton_Click()</span> function.
+		This function is invoked when the user clicks on the "START" button.  The program prompts the
+		user to kick and calls the function <span class="fn">getKickStrength()</span>. Once getKickStrength()
+		returns, the game determines if the acceleration is within the valid range.  In this case, the valid range is
+		-4.0 g to -6.0 g.  If it is in the valid range, the program sets the variable
+		<span class="fn">dy</span> so that the ball is guaranteed to go in the goal.  Otherwise, <span class="fn">dy</span>
+		will be set so that the ball will miss the goal. The variable <span class="fn">dy</span> is the offset of y component
+		of the ball's location on the form each time it is redrawn.
+		</p>
+		<h2>getKickStrength()</h2>
+		<p>
+		The function <span class="fn">getKickStrength()</span> is the key method of the game.  It acquires the data from
+		the MP device and analyzes it.  The function acquires 2 seconds of data using the Hardware API function <span class="fn">getMPBuffer()</span>.
+		The program looks for the minimum value and assumes that to be peak number 2 of
+		<span class="fn">Figure 2</span>.  Peak number 1 of <span class="fn">Figure 2</span> is assumed to be the trigger value of
+		the acquisition.
+		</p>
+		<h2>Animation</h2>
+		<p>
+		The animation of the ball is handled by a timer called <span class="fn">refreshBall</span>.  Each time
+		the timer elapses, the function <span class="fn">refreshBall_Tick()</span> is invoked.  It checks if the game is at
+		an end state.  End states occurs when the ball is out of bounds, the ball is in the goal or it missed the goal.
+		Otherwise, it continues updating the position of the ball.
+		It also invalidates the form which forces the operating system to invoke the overridden function
+		<span class="fn">OnPaint()</span>, this animates the game.
+		</p>
+		<p>
+		The size of the ball is determined by its location on the screen.
+		To simulate a rolling or spinning ball a random rotation transformation is performed on the image.
+		The ball will never be smaller than 20x20 pixels.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>Calls to the API method <span class="fn">connectMPDev()</span> need to be modified to reflect your MP device configuration</li>
+				<li>MPDevImports.cs is the C# wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

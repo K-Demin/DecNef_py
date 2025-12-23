@@ -1,0 +1,100 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: Biofeedback - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>Biofeedback</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="biofeedback1.jpg" alt="Biofeedback.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> C#</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP (Modify Biofeedback.cs to test with MP200)</li>
+		<li><b>Amplifier:</b> Electrodermal Response Amplifier (EDA100C)</li>
+		<li><b>Transducer:</b> Electrodermal Response Transducer (TSD203)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in C# to create a simple biofeedback application.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="biofeedback2.jpg" alt="Make the red circle smaller than the green circle by relaxing." />
+				<p>Figure 1: Make the red circle smaller than the green circle by relaxing.</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		Biofeedback is a method of training subjects to gain some control over physiological response. This usually involves
+		monitoring the subject's physiological signal and presenting some visual, auditory, or physical stimulus.  The stimulus
+		reacts according to the subject's physiological response.
+		</p>
+		<h2>Galvanic Skin Response (Electrodermal Activity)</h2>
+		<p>
+		One of the most common methods of training a person to relax is to monitor eccrine activity.
+		Electrodermal Activity is the measure of skin's conductiveness.  As a person's stress level increases,
+		the body begins to perspire.  Increased eccrine activity (perspiration) increases the skin's conductiveness.
+		</p>
+		<h2>Design</h2>
+		<p>
+		This basic Biofeedback system is designed to train a subject to relax.  The subject is connected to the MP device
+		via the TSD203 and EDA100C.  Amplifier settings can be found in the documentation that shipped with your MP System.
+		The subject is asked to keep the red circle inside the green circle.  The green circle represents the desired relaxation
+		state and the red circle represents the subject's stress level.
+		</p>
+		<h2>Implementation</h2>
+		<p>
+		As soon as the application is launched, it calls on <span class="fn">initAcquistionUnit()</span>.
+		Using the Hardware API, this function configures the MP device to acquire on channel 1 at 500 Hz.
+		It also starts the acquisition.
+		</p>
+		<p>
+		The form contains a timer called <span class="fn">updateTimer</span> that has a tick interval of 500 msec.
+		The tick event is handled by the <span class="fn">UpdateScreen()</span> function which redraws the circles.
+		The red circle's diameter is determined by the function called <span class="fn">GetCircleDiameter()</span>.
+		</p>
+		<h2>GetCircleDiameter()</h2>
+		<p>
+		The <span class="fn">GetCircleDiameter()</span> calls the Hardware API function <span class="fn">getMostRecentSample()</span>.
+		Since EDA does not drastically change within a short period of time, polling the MP device for the most recent sample will suffice.
+		Before <span class="fn">GetCircleDiameter()</span> returns, the EDA voltage level is scaled;  zero volts maps to 50 pixels and
+		10 volts maps to 600 pixels.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>Calls to the API method <span class="fn">connectMPDev()</span> need to be modified to reflect your MP device configuration</li>
+				<li>MPDevImports.cs is the C# wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','bwin'); bwin.focus(); return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

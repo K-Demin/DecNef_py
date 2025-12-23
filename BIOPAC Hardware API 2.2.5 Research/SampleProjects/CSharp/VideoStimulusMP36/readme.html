@@ -1,0 +1,98 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: VideoStimulus - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>VideoStimulus MP36R</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="videostimulus.jpg" alt="VideoStimulus.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> C#</li>
+		<li><b>Development Environment:</b> Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		<li><b>Additional Dependencies:</b> Windows Media Player 10</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP36R USB</li>
+		<li><b>Electrode:</b> General Purpose Electrodes (EL503)</li>
+		<li><b>Electrode Lead:</b> Shielded Lead Set (SS2L)</li>
+		<li><b>Transducer:</b> Temperature Transducer (SS6L)</li>
+		<li><b>Transducer:</b> Variable Assessment Transducer (SS43L)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in C# to develop a software program that acquires
+		and displays data from a subject while the subject views a video stimulus.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="videostimfull250.jpg" alt="Video Stimulus Screenshot" />
+				<p>
+					Figure 1: Video Stimulus Screenshot. <br />
+					<a href="./videostimfull1024.jpg" onclick="scrshot = window.open('./videostimfull1024.jpg','schematic', 'height=768,width=1024,toolbar=no,scrollbar=yes,menubar=no,resizable=yes,location=no, directories=no, status=no'); scrshot.focus(); return false;">VIEW HIGH RESOLUTION IMAGE</a>
+				</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		The sample project utilizes an embedded Windows Media Player for video sitmulus playback.  It uses a custom
+		plotting alogrithm to display the data acquired from the subject using the Hardware API.  When the software is launched
+		the program prompts the user to specify a video file or a DVD drive. The specified video is then loaded into an embedded
+		Windows Media Player.  At this point, the user can choose to cue the video. Finally, the data acquisition can be started by pressing "GO."
+		</p>
+		<h2>Windows Media Player</h2>
+		<p>
+		The Windows Media Player 10 SDK does not need to be installed for this project to compile and run. However, knowing
+		how to use the Windows Media Player Control in a C# application is critical in understanding
+		this sample project.  This information can be found in the Windows Media Player 10 SDK's documentation or on the web.
+		</p>
+		<h2>Acquisition Module</h2>
+		<p>
+		The <span class="fn">AcquisitionModule</span> class manages handles all the software program's interaction with the Hardware API.  It
+		acquires from channel 1, 2, and 3 from the MP36R.  It assumes that the data being collected are ECG from the General Purpose Electrode,
+		temperature from the Temperature Transducer, and the subjective response from the Variable Assessment Transducer, connected to the
+		respective channels. The module will prompt the user to locate the Channel Preset XML file.  This is located in the Hardware API install
+		directory in the PresetFiles folder.
+		</p>
+		<h2>Data Visualization</h2>
+		<p>
+		The <span class="fn">AcquisitionModule</span> class contains the <span class="fn">DrawData()</span> function.  This function takes a
+		<span class="fn">Graphics</span> object where data from channel 1 is plotted as a waveform and the data from channel 2 and 3 are displayed
+		as text.  The <span class="fn">VideoPresentation</span> class invokes this function when the <span class="fn">NewData</span> event is triggered
+		by the <span class="fn">AcquisitionModule</span> object.  Using an event to trigger drawing will lessen the number of redraws.
+		The <span class="fn">NewData</span> event is currently triggered when the length of the acquisition waveform is a 50 sample increment.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>MPDevImports.cs is the C# wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<p>NONE</p>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

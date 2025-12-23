@@ -1,0 +1,130 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: FunctionGenerator - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>FunctionGenerator</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="FunctionGenerator1.jpg" alt="FunctionGenerator.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> Visual Basic .NET</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.1</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP (code must be modified to work with MP200 if desired)</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in VB .NET to turn
+		the MP device into an arbitrary function generator.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="FunctionGenerator2.jpg" alt="Output a function" />
+				<p>Figure 1: Output a function</p>
+			</div>
+			<div class="figure">
+				<img src="FunctionGenerator3.jpg" alt="Signal produced by the equation from Figure 1" />
+				<p>Figure 2: Signal produced by the equation from Figure 1.</p>
+			</div>
+			<div class="figure">
+				<img src="FunctionGenerator4.jpg" alt="Output a file" />
+				<p>Figure 3: Output a file</p>
+				</div>
+				<div class="figure">
+				<img src="FunctionGenerator5.jpg" alt="Signal produced by the file from Figure 3" />
+				<p>Figure 4: Signal produced by the file from Figure 3.</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		This software program simulates a basic function generator.  It takes a user-provided equation
+		or text file of numerical values and outputs the values at a given time interval.  The user can select
+		which analog output the values will be sent to and the interval at which the values are updated. The start of a
+		function generator can also be triggered.
+		</p>
+		<h2>Arbitrary Function</h2>
+		<p>
+		The user can enter an arbitrary function to output.  The function has to be a function of <span class="fn">x</span>,
+		where <span class="fn">x</span> is the time value starting at zero.  This program supports the following built in functions:
+		<span class="fn">Abs</span>,
+		<span class="fn">Cos</span>,
+		<span class="fn">Exp</span>,
+		<span class="fn">Floor</span>,
+		<span class="fn">Sin</span>,
+		<span class="fn">Sign</span>,
+		<span class="fn">Sqrt</span>, and
+		<span class="fn">Tan</span>.
+		It also supports built-in constants <span class="fn">E</span> and <span class="fn">PI</span>.
+		</p>
+		<p>
+		<span class="fn">Figure 1</span> shows the program configured to output the sum of a square wave and a sine wave on Analog Output 0.  The values are updated
+		every 50 ms.  <span class="fn">Figure 2</span> is the resulting waveform.
+		</p>
+		<h2>Arbitrary Function Implementation</h2>
+		<p>
+		The .NET Framework allows dynamic creation, compilation and execution of code.  This program takes advantage of that feature.  In the
+		<span class="fn">PrepareFunction()</span>, the user-specified function gets inserted in a template class source code.  The program compiles
+		the class in memory.  Once the code is successfully compiled, the reflection of the method gets stored in the variable
+		<span class="fn">calcMeth</span> for later invocation.  A caveat of this approach is that the compiler object serves as the
+		parser and validator of the function the user inputs.
+		</p>
+		<h2>Arbitrary File</h2>
+		<p>
+		The user can also specify a file to output.  The file must contain values that are separated by the line-feed character ("\n").  The program
+		sequentially outputs the values and loops to the first value once it reaches the last value of the file.
+		</p>
+		<p>
+		<span class="fn">Figure 3</span> shows the program configured to output a file called "sharp.txt."  A copy of this file is located in this project's directory.  The values
+		are updated every 10 ms.  <span class="fn">Figure 4</span> is the resulting waveform
+		</p>
+		<h2>Updating Values</h2>
+		<p>
+		The values are updated with calls to the BIOPAC Hardware API <span class="fn">setAnalogOut()</span> function.  This function is called when the
+		<span class="fn">TimerDelay1</span> or <span class="fn">TimerDelay2</span> ticks.  These functions update the Analog Output values for
+		the arbitrary function and the arbitrary file, respectively.
+		</p>
+		<h2>External Trigger</h2>
+		<p>
+		When external triggering is set, the function <span class="fn">WaitForTrigger()</span> is called.  This function blocks until the external trigger is received
+		by the MP device.  A dummy acquisition is configured and triggering is set by a call to <span class="fn">setMPTrigger()</span>.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>Calls to the API method <span class="fn">connectMPDev()</span> need to be modified to reflect your MP device configuration</li>
+				<li>MPDev.vb is the VB .NET wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<ul>
+				<li>There are timing issues with the sample project: it behaves unpredictably when the update interval is set very low.</li>
+				<li>Triggering implementation may not be precise enough for	certain applications.</li>
+		</ul>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','biopac'); if(window.focus){ bwin.focus(); } return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>

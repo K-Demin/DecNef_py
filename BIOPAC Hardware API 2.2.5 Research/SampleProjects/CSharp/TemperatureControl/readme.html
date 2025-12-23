@@ -1,0 +1,158 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
+<head>
+	<meta http-equiv="content-type" content="text/html; charset=iso-8859-1" />
+	<title>C#: TemperatureControl - BIOPAC HARDWARE API</title>
+	<style type="text/css">
+				@import "../../samplereadme.css";
+	</style>
+</head>
+<body id="sampleReadMe">
+	<div id="sampleName">
+		<h1>TemperatureControl</h1>
+	</div>
+	<div id="sampleInfo">
+		<div id="screenShot">
+			<img src="temperaturecontrol1.jpg" alt="TemperatureControl.exe" />
+			<h3><a href="./" onclick="window.open('./'); return false;">View Project</a></h3>
+		</div>
+		<h2>Project Info</h2>
+		<ul>
+		<li><b>Language:</b> C#</li>
+		<li><b>Development Environment:</b> Microsoft Visual Studio .NET 2019</li>
+		<li><b>Version:</b> 1.1.0</li>
+		</ul>
+		<h2>BIOPAC Products Used</h2>
+		<ul>
+		<li><b>MP Device:</b> MP160 UDP (code must be modified to work with MP200 if desired)</li>
+		<li><b>Amplifier:</b> Temperature Amplifier (SKT100C)</li>
+		<li><b>Transducer:</b> General-purpose Temperature Probe (TSD202E)</li>
+		</ul>
+		<h2>Other Products Used</h2>
+		<ul>
+		<li>2 7-segment LEDs</li>
+		<li>5VDC Solid State Relay</li>
+		<li>115VAC Cooling Fan</li>
+		</ul>
+	</div>
+	<div id="sampleBrief">
+		<h2>Summary</h2>
+		<p>
+		This sample project demonstrates how to use the BIOPAC Hardware API in C# to develop a temperature control system.
+		This system utilizes BIOPAC's  temperature amplifier and transducer to acquire the current temperature and
+		a custom circuit to display the current temperature and maintain it below a specified temperature threshold.
+		</p>
+	</div>
+	<div id="sampleDetail">
+		<div id="sampleFigure">
+			<div class="figure">
+				<img src="db25pinout.jpg" alt="MP150 DB25 Pin Outs" />
+				<p>
+					Figure 1: MP160 DB25 (MALE) Pin Outs.  This can also be found in the MP Hardware Guide that shipped
+					with your system.
+				</p>
+			</div>
+			<div class="figure">
+				<img src="tmpctrlschematic250.jpg" alt="Temperature control circuit schematic" />
+				<p>
+					Figure 2: Temperature control circuit schematic. <br />
+					<a href="./tmpctrlschematic1024.jpg" onclick="sch = window.open('./tmpctrlschematic1024.jpg','schematic', 'height=768,width=1024,toolbar=no,scrollbar=yes,menubar=no,resizable=yes,location=no, directories=no, status=no'); sch.focus(); return false;">VIEW HIGH RESOLUTION IMAGE</a>
+				</p>
+			</div>
+		</div>
+		<h2>Introduction</h2>
+		<p>
+		The sample project is divided into two parts: the circuit and the software.  The MP device will interface these
+		two parts.
+		</p>
+		<h2>Interfacing</h2>
+		<p>
+		The preferred method of interfacing custom circuits to the MP device is via the Digital I/O.  This can be achieved
+		through interface modules or directly connecting to the DB25 of the MP device (see <span class="fn">Figure 1</span>).
+		</p>
+		<p>
+		This project connects the custom circuit directly to the MP device directly to its DB25.  This approach has some drawbacks
+		depending on your MP system configuration:
+		</p>
+		<ul>
+		<li>May require extra DB25 and DB37 cables</li>
+		<li>May require extra DB25 and DB37 connectors or gender changers</li>
+		<li>Some modules and amplifiers may not function properly; they draw power from the DB25</li>
+		</ul>
+		<p>
+		The Temperature Amplifier (SKT100C) does not draw power from the DB25. The system can be rigged with off-the-shelf
+		connectors and gender changers in order for the temperature control system to function.  Therefore, this approach is
+		sufficient for this project.
+		</p>
+		<h2>Circuit</h2>
+		<p>
+		The circuit consists of off-the-shelf components that are readily available at most local electronic stores.  Its major components
+		are two 7-segment LEDs, one solid state relay and a cooling fan.  The LEDs are controlled by the Digital I/O lines, the solid
+		state relay controls the cooling fan, and Analog Out 1 triggers the relay (see <span class="fn">Figure 2</span>).
+		</p>
+		<p>
+		<b>Warning</b>: The cooling fan in this circuit is AC powered.  If wired incorrectly it can be a shock hazard.
+		</p>
+		<h2>Setup</h2>
+		<p>
+		Once the circuit has been built according to <span class="fn">Figure 2</span>, connect it and the Temperature Amplifier (SKT100C) to the MP device.
+		This may require extra DB25 and DB37 cables or gender changers.  Connect the General-purpose Temperature Probe (TSD202E) to the  Temperature Amplifier (SKT100C).
+		Make sure that the Temperature Amplifier is set to Analog Channel 1.
+		</p>
+		<h2>Software</h2>
+		<p>
+		The software program consist of two classes, the TempControl class and TempControlGUI class. The TempControl class abstracts the temperature
+		control system while TempControlGUI class drives the system.
+		</p>
+		<h2>TempControlGUI</h2>
+		<p>
+		TempControlGUI class is the user interface of the software program.  Once the "Start" button is clicked, it initiates the temperature control system.
+		It displays the current temperature and the state of the fan at an interval controlled by two timer components.  All system information is
+		gathered through the TempControl class.
+		</p>
+		<h2>TempControl</h2>
+		<p>
+		TempControl class is the abstraction of the temperature control system.  It is the class that actually interfaces with the Hardware API to control
+		the system.  It has mechanisms to monitor the current temperature, display it on the two LEDs, and activate and deactivate the fan.
+		</p>
+		<h2>Temperature Property</h2>
+		<p>
+		TempControl's <span class="fn">Temperature</span> property invokes the Hardware API function <span class="fn">getMostRecentSample()</span> to get
+		the current value of Analog Channel 1.  According to the Temperature Amplifier (SKT100C) documentation, zero volts maps to 90 degrees Fahrenheit and 1 volt maps to 95 degrees Fahrenheit.
+		This conversion from volts to degrees Fahrenheit is degrees Fahrenheit = (5 * voltage) + 90.  This is reflected in
+		the <span class="fn">Temperature</span> property's return statement.
+		</p>
+		<h2>SendToLED()</h2>
+		<p>
+		TempControl's <span class="fn">SendToLED()</span> function controls the circuit's LED display.  It manipulates the MP device's digital I/O lines to manipulate the appropriate
+		LED segments to represent a numeral.  To minimize unnecessary data communication, the function checks if the value displayed on the LED is the same.  It does
+		so by tracking the current value on the display in a variable called <span class="fn">ledCurrVal</span>. If it is a different value, it sets all digital I/O lines to false,
+		which in turn outputs zero volts.  The auxiliary functions <span class="fn">SendToTensLED()</span> and <span class="fn">SendToOnesLED()</span> then set the appropriate
+		digital I/O lines to true ,which outputs 5 volts.  This displays the current value.
+		</p>
+		<h2>ActivateFan()</h2>
+		<p>
+		TempControl's <span class="fn">ActivateFan()</span> function controls the circuit's relay that is connected to a fan.  It checks if the current temperature is above the
+		specified threshold.  If it is, it sends 5 volts to Analog Output 1, which triggers the relay to close.  Otherwise, it sends zero volts.
+		</p>
+	</div>
+	<div id="sampleNotes">
+		<h2>Notes</h2>
+		<ul>
+				<li>Calls to the API method <span class="fn">connectMPDev()</span> need to be modified to reflect your MP device configuration</li>
+				<li>MPDevImports.cs is the C# wrapper for the Hardware API's methods</li>
+		</ul>
+	</div>
+	<div id="sampleIssue">
+		<h2>Known Issues</h2>
+		<ul>
+				<li>Connecting custom circuit (hardware) to the MP system may compromise system isolation and therefore should NOT be used in concert with human measurements</li>
+		</ul>
+	</div>
+	<div id="footer">
+	All trademarks and copyrights used are properties of their respective owners.
+	<br />
+	Copyright &copy; 2005-2024 <a href="http://www.biopac.com/" onclick="bwin = window.open('http://www.biopac.com/','bwin'); bwin.focus(); return false;">BIOPAC Systems, Inc.</a> All Rights Reserved.
+	</div>
+</body>
+</html>
