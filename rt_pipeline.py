@@ -62,6 +62,7 @@ class RegressorSettings:
     biopac_port: int = 15000
     biopac_timeout: float = 0.3
     biopac_handshake: bool = True
+    biopac_start_online_only: bool = False
 
 
 REGRESSOR_SETTINGS = RegressorSettings(
@@ -366,13 +367,19 @@ def parse_dicom_name(name: str):
 # ---------- Watchdog event handler ----------
 
 class DICOMHandler(FileSystemEventHandler):
-    def __init__(self, cfg: RTSessionConfig, score_queue: Optional[object] = None):
+    def __init__(
+        self,
+        cfg: RTSessionConfig,
+        score_queue: Optional[object] = None,
+        start_biopac: bool = True,
+    ):
         super().__init__()
         self.cfg = cfg
         self.current_run = int(cfg.run)
         self.next_volume_idx = 1
         self.score_queue = score_queue
         self.biopac_receiver = None
+        self._biopac_timeout = None
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -457,7 +464,12 @@ class DICOMHandler(FileSystemEventHandler):
                     handshake_tr=REGRESSOR_SETTINGS.TR if REGRESSOR_SETTINGS.biopac_handshake else None,
                 )
                 self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
-                self.biopac_receiver.start()
+                self._biopac_timeout = biopac_cfg.timeout
+                if start_biopac:
+                    self.biopac_receiver.start()
+                else:
+                    biopac_cfg.timeout = 0.0
+                    log.info("[BIOPAC] Deferring receiver start until online mode.")
                 phys_reg = REGRESSOR_SETTINGS.biopac_phys_reg
                 rtp_physio = self.biopac_receiver
                 log.info(
@@ -508,6 +520,13 @@ class DICOMHandler(FileSystemEventHandler):
     def stop(self):
         if self.biopac_receiver is not None:
             self.biopac_receiver.stop()
+
+    def start_biopac(self):
+        if self.biopac_receiver is None:
+            return
+        if self._biopac_timeout is not None:
+            self.biopac_receiver.config.timeout = self._biopac_timeout
+        self.biopac_receiver.start()
 
     def on_created(self, event):
         if event.is_directory:
@@ -864,16 +883,24 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
 # ---------- Main ----------
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
-    event_handler = DICOMHandler(cfg, score_queue=score_queue)
+    # Process existing DICOMs first (offline-style), but only for this run
+    existing = sorted(cfg.incoming_dir.glob("*.dcm"))
+    defer_biopac = REGRESSOR_SETTINGS.biopac_start_online_only and bool(existing)
+    event_handler = DICOMHandler(
+        cfg,
+        score_queue=score_queue,
+        start_biopac=not defer_biopac,
+    )
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
-    # Process existing DICOMs first (offline-style), but only for this run
-    existing = sorted(cfg.incoming_dir.glob("*.dcm"))
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
             event_handler.process_file(Path(f))
+
+    if defer_biopac:
+        event_handler.start_biopac()
 
     print("[RT] Switching to online mode.")
     observer.start()
@@ -1012,6 +1039,12 @@ def main():
         default=REGRESSOR_SETTINGS.biopac_handshake,
         help="Send a handshake with TR to the BIOPAC streamer.",
     )
+    parser.add_argument(
+        "--biopac-start-online",
+        action="store_true",
+        default=REGRESSOR_SETTINGS.biopac_start_online_only,
+        help="Defer BIOPAC receiver start until after offline DICOM processing.",
+    )
     args = parser.parse_args()
 
     REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
@@ -1020,6 +1053,7 @@ def main():
     REGRESSOR_SETTINGS.biopac_timeout = args.biopac_timeout
     REGRESSOR_SETTINGS.biopac_phys_reg = args.biopac_phys_reg
     REGRESSOR_SETTINGS.biopac_handshake = args.biopac_handshake
+    REGRESSOR_SETTINGS.biopac_start_online_only = args.biopac_start_online
 
     cfg = RTSessionConfig(
         subject=args.sub,
