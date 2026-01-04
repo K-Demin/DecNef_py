@@ -637,7 +637,7 @@ def run_streamer(config: StreamerConfig):
                             regressors_writer.writerow([time.time(), vol_idx, tr_value, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
                             log.info(
-                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) \n reg=%s conn=%s",
                                 vol_idx,
                                 meta["tr"],
                                 meta["sample_idx"],
@@ -679,7 +679,7 @@ def run_streamer(config: StreamerConfig):
                             regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
                             log.info(
-                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) \n reg=%s conn=%s",
                                 vol_idx,
                                 meta["tr"],
                                 meta["sample_idx"],
@@ -718,7 +718,7 @@ def run_streamer(config: StreamerConfig):
                             regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
                             log.info(
-                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) \n reg=%s conn=%s",
                                 vol_idx,
                                 meta["tr"],
                                 meta["sample_idx"],
