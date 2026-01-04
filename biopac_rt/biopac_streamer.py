@@ -124,8 +124,8 @@ class StreamerConfig:
     port: int
     tr: float
     phys_fs: float
-    resp_channel: int
-    card_channel: int
+    resp_channel: 2
+    card_channel: 3
     mode: str
     csv_path: Optional[str] = None
     mpdev_dll: Optional[str] = None
@@ -143,6 +143,47 @@ class StreamerConfig:
     plot_update_hz: float = 10.0
     connect_retry_s: float = 2.0
     print_every: int = 1
+    card_source: str = "ecg"
+    downsample_hz: float = 0.0
+
+class _IntFactorDownsampler:
+    """
+    Very small causal downsampler for streaming:
+      - optional 1-pole lowpass (anti-alias-ish)
+      - keep every Nth sample (integer factor)
+    Returns (y or None) per input sample.
+
+    We DO NOT downsample the trigger (TTL) because you can miss narrow pulses.
+    """
+    def __init__(self, fs_in: float, fs_out: float, alpha: float = 0.2):
+        if fs_out <= 0 or fs_out >= fs_in:
+            raise ValueError("fs_out must be >0 and < fs_in")
+        ratio = fs_in / fs_out
+        factor = int(round(ratio))
+        if not np.isfinite(ratio) or factor < 1 or abs(ratio - factor) > 1e-3:
+            raise ValueError(f"Downsample requires near-integer factor: fs_in/fs_out={ratio:.6f} (rounded={factor})")
+        self.fs_in = float(fs_in)
+        self.fs_out = float(fs_out)
+        self.factor = factor
+        self.alpha = float(alpha)  # 0..1 ; smaller = smoother
+        self._k = 0
+        self._y = 0.0
+        self._init = False
+
+    def step(self, x: float) -> Optional[float]:
+        # one-pole lowpass (cheap, causal)
+        if not self._init:
+            self._y = float(x)
+            self._init = True
+        else:
+            self._y = (1.0 - self.alpha) * self._y + self.alpha * float(x)
+
+        self._k += 1
+        if self._k >= self.factor:
+            self._k = 0
+            return float(self._y)
+        return None
+
 
 
 class RetroTSStreamer:
@@ -153,6 +194,14 @@ class RetroTSStreamer:
         self._card = []
         self._vol_idx = 0
         self._start_time = time.monotonic()
+        self._sample_idx = 0  # how many samples have been ingested
+        self._proc_fs = float(self.config.downsample_hz) if (self.config.downsample_hz and self.config.downsample_hz > 0) else float(self.config.phys_fs)
+
+        self._samples_per_tr = int(max(1, round(self._proc_fs * self.config.tr)))
+
+        # Minimum samples needed before we attempt RetroTS.
+        # One TR worth is usually the bare minimum; 2 TRs is safer.
+        self._min_samples = int(max(1, round(self._proc_fs * self.config.tr * 5)))
 
     def reset_start_time(self):
         self._start_time = time.monotonic()
@@ -160,31 +209,117 @@ class RetroTSStreamer:
     def add_sample(self, resp: float, card: float):
         self._resp.append(resp)
         self._card.append(card)
+        self._sample_idx += 1
+
 
     def maybe_emit(self):
         elapsed = time.monotonic() - self._start_time
         while elapsed >= (self._vol_idx + 1) * self.config.tr:
+            # Don't compute RetroTS until we have enough samples
+            if len(self._resp) < self._min_samples or len(self._card) < self._min_samples:
+                return  # wait for more samples
+
             self._vol_idx += 1
             regressors = self._compute_retrots(self._vol_idx, self.config.tr)
-            yield self._vol_idx, regressors
+            meta = self._emit_meta(self.config.tr)
+            yield self._vol_idx, regressors, meta
             elapsed = time.monotonic() - self._start_time
 
-    def emit_on_trigger(self, tr_value: float) -> Tuple[int, List[float]]:
+    def emit_on_trigger(self, tr_value: float) -> Tuple[int, List[float], dict]:
         self._vol_idx += 1
         regressors = self._compute_retrots(self._vol_idx, tr_value)
-        return self._vol_idx, regressors
+        meta = self._emit_meta(tr_value)
+        return self._vol_idx, regressors, meta
+
+
 
     def _compute_retrots(self, n_vol: int, tr_value: float) -> List[float]:
         resp = np.asarray(self._resp, dtype=np.float32)
         card = np.asarray(self._card, dtype=np.float32)
-        reg = self._retrots.RetroTs(
-            resp,
-            card,
-            TR=tr_value,
-            physFS=self.config.phys_fs,
-            Nvol=n_vol,
-        )
-        return reg[n_vol - 1].astype(float).tolist()
+            # ---- Robustify inputs (helps RetroTS peak/phase detection) ----
+        def _z(x: np.ndarray) -> np.ndarray:
+            x = x - np.nanmean(x)
+            sd = np.nanstd(x)
+            if not np.isfinite(sd) or sd < 1e-6:
+                return np.zeros_like(x)
+            return x / sd
+
+        # If ECG is inverted (stronger negative excursions), flip it
+        if np.nanmin(card) < 0 and abs(np.nanmin(card)) > abs(np.nanmax(card)):
+            card = -card
+
+        # Optional: rectify ECG to emphasize R peaks (try if still unstable)
+        # card = np.abs(card)
+
+        resp = _z(resp)
+        card = _z(card)
+        # --------------------------------------------------------------
+        log.info("[DBG] resp: min=%.4g max=%.4g std=%.4g | card: min=%.4g max=%.4g std=%.4g",
+                float(resp.min()), float(resp.max()), float(resp.std()),
+                float(card.min()), float(card.max()), float(card.std()))
+        try:
+            reg = self._retrots.RetroTs(
+                resp,
+                card,
+                TR=tr_value,
+                physFS=self._proc_fs,
+                Nvol=n_vol,
+            )
+        except Exception as exc:
+            # Never crash streaming because RetroTS had a short-window edge case
+            log.warning("[RETROTS] RetroTs failed (n_vol=%d, nsamp=%d): %s",
+                        n_vol, resp.size, exc)
+            return [0.0] * 8  # typical RetroTS is 8 regressors (4 resp + 4 card)
+
+        # reg can be shorter than Nvol early on or if detection failed
+        if reg is None or len(reg) == 0:
+            return [0.0] * 8
+
+        # If fewer rows returned than requested, use the last available row
+        idx = min(n_vol - 1, reg.shape[0] - 1)
+        row = reg[idx]
+
+        # Defensive: if shape is weird, fall back
+        try:
+            out = np.asarray(row, dtype=float).tolist()
+        except Exception:
+            out = [0.0] * 8
+
+        # Ensure exactly 8 floats (pad/truncate)
+        if len(out) < 8:
+            out = out + [0.0] * (8 - len(out))
+        elif len(out) > 8:
+            out = out[:8]
+
+        return out
+
+    def add_sample_and_maybe_emit_by_samples(self, resp: float, card: float):
+    # CSV/offline mode: drive volume emission purely from sample count.
+    # Every samples_per_tr samples => one TR.
+        self._resp.append(resp)
+        self._card.append(card)
+        self._sample_idx += 1
+
+        # Emit volumes whenever we've crossed the next TR boundary in sample space
+        while self._sample_idx >= (self._vol_idx + 1) * self._samples_per_tr:
+            # Need enough historical data before computing RetroTS
+            if len(self._resp) < self._min_samples or len(self._card) < self._min_samples:
+                return
+
+            self._vol_idx += 1
+            regressors = self._compute_retrots(self._vol_idx, self.config.tr)
+            meta = self._emit_meta(self.config.tr)
+            yield self._vol_idx, regressors, meta
+    def _emit_meta(self, tr_value: float) -> dict:
+        return {
+            "phys_fs": float(self._proc_fs),
+            "tr": float(tr_value),
+            "samples_per_tr": int(max(1, round(self._proc_fs * tr_value))),
+            "sample_idx": int(self._sample_idx),
+            "nsamp_total": int(len(self._resp)),
+        }
+
+
 
 
 class LivePlotter:
@@ -248,7 +383,7 @@ class LivePlotter:
 def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
     t0 = time.monotonic()
     idx = 0
-    next_trigger = tr
+    next_trigger = tr * 5
     while True:
         now = time.monotonic()
         t = now - t0
@@ -265,22 +400,41 @@ def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, f
             time.sleep(sleep_for)
 
 
-def csv_samples(path: str, sample_rate: float) -> Iterator[Tuple[float, float, float]]:
-    with open(path, newline="") as handle:
-        reader = csv.DictReader(handle)
-        rows = list(reader)
-    if not rows:
-        return
-    t0 = time.monotonic()
-    for idx, row in enumerate(rows):
-        resp = float(row.get("resp", row.get("respiration", 0.0)))
-        card = float(row.get("card", row.get("cardiac", 0.0)))
-        trigger = float(row.get("trigger", row.get("ttl", 0.0)))
-        yield resp, card, trigger
-        next_time = t0 + (idx + 1) / sample_rate
-        sleep_for = next_time - time.monotonic()
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+def csv_samples(path: str, sample_rate: float, card_source: str = "ecg") -> Iterator[Tuple[float, float, float]]:
+    """
+    Headerless CSV/TSV/whitespace file with 5 columns:
+      0: trigger (V)
+      1: resp (cmH2O)
+      2: ppg (V)
+      3: ecg (mV)
+      4: eda (uS)
+    Returns (resp, card, trigger) with NO pacing/sleep.
+    Timing is defined by --phys-fs (sample_rate) in the consumer.
+    """
+    card_source = card_source.lower().strip()
+    if card_source not in ("ppg", "ecg"):
+        raise ValueError("card_source must be 'ppg' or 'ecg'")
+
+    with open(path, "r", newline="") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            parts = ln.replace(",", " ").split()
+            if len(parts) < 5:
+                continue
+            try:
+                vals = [float(x) for x in parts[:5]]
+            except ValueError:
+                continue
+
+            trigger = vals[0]
+            resp = vals[1]
+            ppg = vals[2]
+            ecg = vals[3]
+            card = ppg if card_source == "ppg" else ecg
+            yield resp, card, trigger
+
 
 
 def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float]]:
@@ -340,7 +494,7 @@ def run_streamer(config: StreamerConfig):
     elif config.mode == "csv":
         if not config.csv_path:
             raise ValueError("--csv-path is required for csv mode.")
-        source = csv_samples(config.csv_path, config.phys_fs)
+        source = csv_samples(config.csv_path, config.phys_fs, card_source=config.card_source)
     elif config.mode == "biopac":
         source = biopac_samples(config)
     else:
@@ -356,6 +510,14 @@ def run_streamer(config: StreamerConfig):
     samples_handle = None
     sent_handle = None
     regressors_handle = None
+    # Optional downsampling for resp/card (trigger stays raw)
+    ds_resp = None
+    ds_card = None
+    if config.downsample_hz and config.downsample_hz > 0:
+        ds_resp = _IntFactorDownsampler(fs_in=config.phys_fs, fs_out=config.downsample_hz, alpha=0.2)
+        ds_card = _IntFactorDownsampler(fs_in=config.phys_fs, fs_out=config.downsample_hz, alpha=0.8)
+        log.info("[DS] Software downsample enabled: %.1f -> %.1f Hz (factor=%d)",
+                config.phys_fs, config.downsample_hz, ds_resp.factor)
     if config.log_samples_csv:
         samples_handle = open(config.log_samples_csv, "a", newline="")
         samples_writer = csv.writer(samples_handle)
@@ -365,12 +527,13 @@ def run_streamer(config: StreamerConfig):
         sent_handle = open(config.log_sent_csv, "a", newline="")
         sent_writer = csv.writer(sent_handle)
         if sent_handle.tell() == 0:
-            sent_writer.writerow(["timestamp", "volume_idx", "tr", "regressors"])
+           sent_writer.writerow(["timestamp", "volume_idx", "tr", "sample_idx", "nsamp_total", "samples_per_tr", "regressors"])
     if config.log_regressors_csv:
         regressors_handle = open(config.log_regressors_csv, "a", newline="")
         regressors_writer = csv.writer(regressors_handle)
         if regressors_handle.tell() == 0:
-            regressors_writer.writerow(["timestamp", "volume_idx", "tr", "regressors"])
+            regressors_writer.writerow(["timestamp", "volume_idx", "tr", "sample_idx", "nsamp_total", "samples_per_tr", "regressors"])
+
 
     plotter = LivePlotter(config.plot_window_s, config.plot_update_hz) if config.live_plot else None
     sock = None
@@ -397,8 +560,41 @@ def run_streamer(config: StreamerConfig):
             sock = None
 
     try:
+        sample_idx = 0  # raw sample counter (always raw-rate)
         for resp, card, trigger in source:
-            retro.add_sample(resp, card)
+            sample_idx += 1
+
+            # Downsample resp/card if requested (trigger remains raw)
+            have_phys = True
+            if ds_resp is not None and ds_card is not None:
+                resp_ds = ds_resp.step(resp)
+                card_ds = ds_card.step(card)
+                if resp_ds is None or card_ds is None:
+                    have_phys = False
+                else:
+                    resp_use, card_use = resp_ds, card_ds
+            else:
+                resp_use, card_use = resp, card
+
+
+            # Ingest resp/card (possibly downsampled) into RetroTS buffers
+            if have_phys:
+                if ds_resp is None:
+                    # old path (no DS): keep your original semantics
+                    if config.mode == "csv":
+                        retro._resp.append(resp_use)
+                        retro._card.append(card_use)
+                        retro._sample_idx += 1
+                    else:
+                        retro.add_sample(resp_use, card_use)
+                else:
+                    # DS path: treat all modes the same on ingest (we are already controlling rate)
+                    retro._resp.append(resp_use)
+                    retro._card.append(card_use)
+                    retro._sample_idx += 1
+
+
+            # Logging/plot stays RAW (so you can inspect real signals)
             if samples_writer is not None:
                 samples_writer.writerow([time.time(), resp, card, trigger])
             if plotter is not None:
@@ -423,7 +619,11 @@ def run_streamer(config: StreamerConfig):
                 trigger_now = trigger >= config.trigger_threshold
                 trigger_prev = prev_trigger >= config.trigger_threshold
                 if trigger_now and not trigger_prev:
-                    now = time.monotonic()
+                    if config.mode == "csv":
+                        now = sample_idx / config.phys_fs   # raw trigger timebase
+                    else:
+                        now = time.monotonic()
+
                     if last_trigger_time is None:
                         tr_value = config.tr
                     else:
@@ -432,28 +632,33 @@ def run_streamer(config: StreamerConfig):
                             tr_value = config.tr
                     if last_trigger_time is None or tr_value >= config.trigger_min_interval:
                         last_trigger_time = now
-                        vol_idx, regressors = retro.emit_on_trigger(tr_value)
+                        vol_idx, regressors, meta = retro.emit_on_trigger(tr_value)
                         if regressors_writer is not None:
                             regressors_writer.writerow([time.time(), vol_idx, tr_value, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
                             log.info(
-                                "[RETROTS] vol=%s tr=%.3f reg=%s conn=%s",
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
                                 vol_idx,
-                                tr_value,
+                                meta["tr"],
+                                meta["sample_idx"],
+                                meta["samples_per_tr"],
+                                meta["nsamp_total"],
                                 regressors,
                                 "up" if sock is not None else "down",
                             )
                         if sock is not None:
-                            payload = json.dumps(
-                                {
-                                    "kind": "retrots",
-                                    "volume_idx": vol_idx,
-                                    "n_regressors": len(regressors),
-                                    "regressors": regressors,
-                                    "timestamp": time.time(),
-                                    "tr": tr_value,
-                                }
-                            )
+                            payload = json.dumps({
+                                "kind": "retrots",
+                                "volume_idx": vol_idx,
+                                "n_regressors": len(regressors),
+                                "regressors": regressors,
+                                "timestamp": time.time(),
+                                "tr": meta["tr"],
+                                "phys_fs": meta["phys_fs"],
+                                "sample_idx": meta["sample_idx"],
+                                "nsamp_total": meta["nsamp_total"],
+                                "samples_per_tr": meta["samples_per_tr"],
+                            })
                             try:
                                 sock.sendall((payload + "\n").encode("utf-8"))
                             except OSError as exc:
@@ -462,40 +667,90 @@ def run_streamer(config: StreamerConfig):
                                 sock = None
                             else:
                                 if sent_writer is not None:
-                                    sent_writer.writerow([time.time(), vol_idx, tr_value, regressors])
+                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
                 prev_trigger = trigger
             else:
-                for vol_idx, regressors in retro.maybe_emit():
-                    if regressors_writer is not None:
-                        regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
-                    if config.print_every > 0 and (vol_idx % config.print_every == 0):
-                        log.info(
-                            "[RETROTS] vol=%s tr=%.3f reg=%s conn=%s",
-                            vol_idx,
-                            config.tr,
-                            regressors,
-                            "up" if sock is not None else "down",
-                        )
-                    if sock is not None:
-                        payload = json.dumps(
-                            {
+                if config.mode == "csv":
+                    if not have_phys:
+                        continue
+                    # Emit based on sample counts, not wall time
+                    for vol_idx, regressors, meta in retro.add_sample_and_maybe_emit_by_samples(resp_use, card_use):
+                        if regressors_writer is not None:
+                            regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
+                        if config.print_every > 0 and (vol_idx % config.print_every == 0):
+                            log.info(
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
+                                vol_idx,
+                                meta["tr"],
+                                meta["sample_idx"],
+                                meta["samples_per_tr"],
+                                meta["nsamp_total"],
+                                regressors,
+                                "up" if sock is not None else "down",
+                            )
+                        if sock is not None:
+                            payload = json.dumps({
                                 "kind": "retrots",
                                 "volume_idx": vol_idx,
                                 "n_regressors": len(regressors),
                                 "regressors": regressors,
                                 "timestamp": time.time(),
-                                "tr": config.tr,
-                            }
-                        )
-                        try:
-                            sock.sendall((payload + "\n").encode("utf-8"))
-                        except OSError as exc:
-                            log.warning("[NET] Send failed: %s", exc)
-                            sock.close()
-                            sock = None
-                        else:
-                            if sent_writer is not None:
-                                sent_writer.writerow([time.time(), vol_idx, config.tr, regressors])
+                                "tr": meta["tr"],
+                                "phys_fs": meta["phys_fs"],
+                                "sample_idx": meta["sample_idx"],
+                                "nsamp_total": meta["nsamp_total"],
+                                "samples_per_tr": meta["samples_per_tr"],
+                            })
+
+                            try:
+                                sock.sendall((payload + "\n").encode("utf-8"))
+                            except OSError as exc:
+                                log.warning("[NET] Send failed: %s", exc)
+                                sock.close()
+                                sock = None
+                            else:
+                                if sent_writer is not None:
+                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+
+                else:
+                    for vol_idx, regressors, meta in retro.maybe_emit():
+                        if regressors_writer is not None:
+                            regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
+                        if config.print_every > 0 and (vol_idx % config.print_every == 0):
+                            log.info(
+                                "[RETROTS] vol=%s tr=%.3f samp=%d (perTR=%d, total=%d) reg=%s conn=%s",
+                                vol_idx,
+                                meta["tr"],
+                                meta["sample_idx"],
+                                meta["samples_per_tr"],
+                                meta["nsamp_total"],
+                                regressors,
+                                "up" if sock is not None else "down",
+                            )
+                        if sock is not None:
+                            payload = json.dumps({
+                                "kind": "retrots",
+                                "volume_idx": vol_idx,
+                                "n_regressors": len(regressors),
+                                "regressors": regressors,
+                                "timestamp": time.time(),
+                                "tr": meta["tr"],
+                                "phys_fs": meta["phys_fs"],
+                                "sample_idx": meta["sample_idx"],
+                                "nsamp_total": meta["nsamp_total"],
+                                "samples_per_tr": meta["samples_per_tr"],
+                            })
+
+                            try:
+                                sock.sendall((payload + "\n").encode("utf-8"))
+                            except OSError as exc:
+                                log.warning("[NET] Send failed: %s", exc)
+                                sock.close()
+                                sock = None
+                            else:
+                                if sent_writer is not None:
+                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+
     finally:
         if samples_handle is not None:
             samples_handle.close()
@@ -575,6 +830,15 @@ def main():
         default=1,
         help="Print regressor status every N volumes (0 to disable).",
     )
+    parser.add_argument("--card-source", choices=("ppg", "ecg"), default="ecg",
+                    help="Which CSV column to use as cardiac: PPG or ECG.")
+    parser.add_argument(
+    "--downsample-hz",
+    type=float,
+    default=0.0,
+    help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
+)
+
     args = parser.parse_args()
 
     config = StreamerConfig(
@@ -601,6 +865,9 @@ def main():
         plot_update_hz=args.plot_update_hz,
         connect_retry_s=args.connect_retry_s,
         print_every=args.print_every,
+        card_source=args.card_source,
+        downsample_hz=args.downsample_hz,
+
     )
     run_streamer(config)
 
