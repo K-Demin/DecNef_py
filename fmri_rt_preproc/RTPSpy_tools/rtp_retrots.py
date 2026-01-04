@@ -4,6 +4,7 @@ RTP retrots for making online RETROICOR regressors
 
 @author: mmisaki@laureateinstitute.org
 """
+# Added phase extrapolation for the case we miss a peak on this TR - Konstantin "Kostya" Demin
 
 
 # %% import ===================================================================
@@ -296,23 +297,34 @@ class RtpRetroTS():
         prd = peak_vars['prd']
 
         if amp_type == 0:
-            # Calculate the phase of the trace, with the peak to be the start
-            # of the phase
             phase = -2 * np.ones_like(t)
+
             for ii, tp0 in enumerate(tp_trace[:-1]):
                 tp1 = tp_trace[ii+1]
                 for jj in np.argwhere((t >= tp0) & (t < tp1)).ravel():
-                    phase[jj] = (t[jj] - tp0) / prd[ii] + \
-                        self.zero_phase_offset
+                    phase[jj] = (t[jj] - tp0) / prd[ii] + self.zero_phase_offset
                     if phase[jj] < 0:
                         phase[jj] = -phase[jj]
                     if phase[jj] > 1:
                         phase[jj] -= 1
 
+            # ===== Option 2: extrapolate phase AFTER the last peak using last RR =====
+            # This prevents the tail segment (after the last detected peak) from
+            # staying "unset" and collapsing to phase=0 -> [0,1,0,1] regressors.
+            if len(tp_trace) >= 2 and len(prd) >= 1:
+                tp_last = tp_trace[-1]
+                rr_last = prd[-1]  # last observed R-R interval (seconds)
+                tail_idx = np.nonzero(t >= tp_last)[0]
+                if len(tail_idx):
+                    ph = (t[tail_idx] - tp_last) / rr_last + self.zero_phase_offset
+                    phase[tail_idx] = np.mod(ph, 1.0)
+            # =======================================================================
+
             # Remove the points flagged as unset
             phase[np.nonzero(phase < -1)[0]] = 0.0
             # Change phase to radians
             phase = phase * 2 * np.pi
+
         else:
             '''
             import numpy as np
