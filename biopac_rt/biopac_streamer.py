@@ -45,7 +45,7 @@ Simulated stream (no trigger channel):
 """
 
 from dataclasses import dataclass
-from typing import Iterator, Optional, Tuple
+from typing import Deque, Iterator, List, Optional, Tuple
 
 import numpy as np
 from ctypes import c_bool, c_double, c_int, c_char_p, cdll
@@ -90,7 +90,7 @@ def _wait_for_handshake(sock: socket.socket, fallback_tr: float) -> Optional[flo
                 return tr_value
 
 
-def _poll_handshake(sock: socket.socket, buffer: str, fallback_tr: float) -> tuple[Optional[float], str]:
+def _poll_handshake(sock: socket.socket, buffer: str, fallback_tr: float) -> Tuple[Optional[float], str]:
     try:
         chunk = sock.recv(4096)
     except (BlockingIOError, socket.timeout):
@@ -169,12 +169,12 @@ class RetroTSStreamer:
             yield self._vol_idx, regressors
             elapsed = time.monotonic() - self._start_time
 
-    def emit_on_trigger(self, tr_value: float) -> Tuple[int, list[float]]:
+    def emit_on_trigger(self, tr_value: float) -> Tuple[int, List[float]]:
         self._vol_idx += 1
         regressors = self._compute_retrots(self._vol_idx, tr_value)
         return self._vol_idx, regressors
 
-    def _compute_retrots(self, n_vol: int, tr_value: float) -> list[float]:
+    def _compute_retrots(self, n_vol: int, tr_value: float) -> List[float]:
         resp = np.asarray(self._resp, dtype=np.float32)
         card = np.asarray(self._card, dtype=np.float32)
         reg = self._retrots.RetroTs(
@@ -192,10 +192,10 @@ class LivePlotter:
         self._window_s = window_s
         self._update_every = 1.0 / max(update_hz, 0.1)
         self._last_update = 0.0
-        self._resp = deque()
-        self._card = deque()
-        self._trigger = deque()
-        self._time = deque()
+        self._resp: Deque[float] = deque()
+        self._card: Deque[float] = deque()
+        self._trigger: Deque[float] = deque()
+        self._time: Deque[float] = deque()
         self._enabled = False
         self._fig = None
         self._ax = None
@@ -245,7 +245,7 @@ class LivePlotter:
         self._fig.canvas.flush_events()
 
 
-def sim_samples(sample_rate: float, tr: float) -> Iterator[tuple[float, float, float]]:
+def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
     t0 = time.monotonic()
     idx = 0
     next_trigger = tr
@@ -265,7 +265,7 @@ def sim_samples(sample_rate: float, tr: float) -> Iterator[tuple[float, float, f
             time.sleep(sleep_for)
 
 
-def csv_samples(path: str, sample_rate: float) -> Iterator[tuple[float, float, float]]:
+def csv_samples(path: str, sample_rate: float) -> Iterator[Tuple[float, float, float]]:
     with open(path, newline="") as handle:
         reader = csv.DictReader(handle)
         rows = list(reader)
@@ -283,7 +283,7 @@ def csv_samples(path: str, sample_rate: float) -> Iterator[tuple[float, float, f
             time.sleep(sleep_for)
 
 
-def biopac_samples(config: StreamerConfig) -> Iterator[tuple[float, float, float]]:
+def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float]]:
     if not config.mpdev_dll:
         raise ValueError("mpdev.dll path required for biopac mode.")
 
