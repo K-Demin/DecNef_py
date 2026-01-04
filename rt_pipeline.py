@@ -39,8 +39,8 @@ class RegressorSettings:
     enable_motion_regression: bool = True
     mot_reg: str = "mot6"
     max_poly_order: float = np.inf
-    TR: float = 0.9
-    use_gs: bool = True
+    TR: float = 1.4
+    use_gs: bool = False
     use_wm: bool = True
     use_vent: bool = True
 
@@ -142,7 +142,6 @@ class MotionRegressor:
         phys_reg: str = "None",
         rtp_physio: Optional[object] = None,
     ):
-
         kwargs = dict(
             mot_reg=mot_reg,
             volreg=volreg,
@@ -153,15 +152,13 @@ class MotionRegressor:
             online_saving=False,
             reg_retro_proc=False,
             max_scan_length=max_scan_length,
-            spike_reg_num = 200,
+            spike_reg_num=200,
             phys_reg=phys_reg,
             rtp_physio=rtp_physio,
         )
         self._regress = RtpRegress(**kwargs)
 
-        # If masks exist, enable those regressors
         if gs_mask is not None:
-            kwargs_mask = dict(GS_reg=True, GS_mask=str(gs_mask))
             self._regress.set_param("GS_reg", True)
             self._regress.set_param("GS_mask", str(gs_mask))
         if wm_mask is not None:
@@ -173,54 +170,30 @@ class MotionRegressor:
 
         self._ready = False
 
-    def apply(self, mc_img: nib.Nifti1Image, volume_idx: int,
-              fd_censor: int = 0, dvars_censor: int = 0) -> tuple[np.ndarray, bool]:
+    def apply(
+        self,
+        mc_img: nib.Nifti1Image,
+        volume_idx: int,
+        fd_censor: int = 0,
+        dvars_censor: int = 0,
+    ) -> tuple[np.ndarray, bool]:
         """
-        Run motion regression using RTPSpy.
-
-        Returns
-        -------
-        cleaned_vol : np.ndarray
-            The (possibly regressed) volume data.
-        regressed   : bool
-            True if RtpRegress is actually active for this volume
-            (i.e., _vol_num > wait_num); False if this is still
-            effectively unregressed.
+        Returns (cleaned_vol, regressed_bool). Always returns a tuple.
         """
 
-        # Make sure the regressor has enough data/history
+        # Ensure regressor init/ready state
         if not self._ready:
             try:
                 self._ready = bool(self._regress.ready_proc())
             except Exception as exc:
                 log.error(f"[REG] Failed to prepare regressor: {exc}")
-                # fall back to unregressed data
                 return np.asanyarray(mc_img.dataobj), False
 
-        # If still not ready, just pass original data through
         if not self._ready:
             return np.asanyarray(mc_img.dataobj), False
 
-    def get_regressors(self, volume_idx: int) -> tuple[Optional[list[str]], Optional[np.ndarray]]:
-        des_mtx = getattr(self._regress, "desMtx", None)
-        if des_mtx is None:
-            return None, None
-        idx = volume_idx - 1
+        # Do regression
         try:
-            row = des_mtx[idx]
-        except Exception:
-            return None, None
-
-        if hasattr(row, "detach"):
-            row = row.detach().cpu().numpy()
-        row = np.asarray(row, dtype=float)
-        reg_names = list(getattr(self._regress, "reg_names", []))
-        if len(reg_names) < row.shape[0]:
-            extra = row.shape[0] - len(reg_names)
-            reg_names.extend([f"poly_{i:02d}" for i in range(extra)])
-        return reg_names, row
-        try:
-            # Keep track of the internal volume counter
             prev_vol = getattr(self._regress, "_vol_num", 0)
 
             # RTPSpy modifies mc_img in-place
@@ -231,19 +204,39 @@ class MotionRegressor:
                 dvars_censor=dvars_censor,
             )
 
-            # After do_proc, RtpRegress increments _vol_num and
-            # only starts regression when _vol_num > wait_num
             cur_vol = getattr(self._regress, "_vol_num", prev_vol + 1)
-            regressed = cur_vol > self._regress.wait_num
+            regressed = cur_vol > getattr(self._regress, "wait_num", 0)
 
-            # Grab the (maybe regressed) data from the image
             cleaned = np.asarray(mc_img.dataobj, dtype=np.float32)
             return cleaned, regressed
 
         except Exception as exc:
             log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
-            # fall back to unregressed
             return np.asanyarray(mc_img.dataobj), False
+
+    def get_regressors(self, volume_idx: int) -> tuple[Optional[list[str]], Optional[np.ndarray]]:
+        des_mtx = getattr(self._regress, "desMtx", None)
+        if des_mtx is None:
+            return None, None
+
+        idx = volume_idx - 1
+        try:
+            row = des_mtx[idx]
+        except Exception:
+            return None, None
+
+        if hasattr(row, "detach"):
+            row = row.detach().cpu().numpy()
+
+        row = np.asarray(row, dtype=float)
+
+        reg_names = list(getattr(self._regress, "reg_names", []))
+        if len(reg_names) < row.shape[0]:
+            extra = row.shape[0] - len(reg_names)
+            reg_names.extend([f"poly_{i:02d}" for i in range(extra)])
+
+        return reg_names, row
+
 
 
 
@@ -884,7 +877,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
 
     print("[RT] Switching to online mode.")
     observer.start()
-
+    # observer.stop()
+    # event_handler.stop()
     try:
         while True:
             time.sleep(0.2)

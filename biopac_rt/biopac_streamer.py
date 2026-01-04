@@ -30,14 +30,14 @@ EXAMPLES
 ========
 BIOPAC device + trigger:
   python -m biopac_rt.biopac_streamer \
-    --host 10.0.0.5 --port 15000 --tr 0.9 --phys-fs 100 \
+    --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 100 \
     --mode biopac --mpdev-dll "C:\\Program Files\\BIOPAC Systems, Inc\\...\\mpdev.dll" \
     --resp-channel 1 --card-channel 2 --trigger-channel 3 \
     --log-samples-csv biopac_samples.csv --log-sent-csv biopac_regressors.csv
 
 Simulated stream (no trigger channel):
   python -m biopac_rt.biopac_streamer \
-    --host 10.0.0.5 --port 15000 --tr 0.9 --phys-fs 100 --mode sim
+    --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 100 --mode sim
 """
 
 from dataclasses import dataclass
