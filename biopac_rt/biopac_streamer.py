@@ -52,7 +52,7 @@ from ctypes import c_bool, c_double, c_int, c_char_p, cdll
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_retrots import RtpRetroTS
 
-
+MP150 = 101
 MP160 = 103
 MPUDP = 11
 MPSUCCESS = 1
@@ -129,7 +129,7 @@ class StreamerConfig:
     mode: str
     csv_path: Optional[str] = None
     mpdev_dll: Optional[str] = None
-    mp_device: int = MP160
+    mp_device: int = MP150
     mp_comm: int = MPUDP
     trigger_channel: Optional[int] = None
     trigger_threshold: float = 0.5
@@ -536,7 +536,7 @@ def main():
     parser.add_argument("--mode", choices=("sim", "csv", "biopac"), default="sim")
     parser.add_argument("--csv-path", help="CSV path with resp/card columns.")
     parser.add_argument("--mpdev-dll", help="Path to mpdev.dll for biopac mode.")
-    parser.add_argument("--mp-device", type=int, default=MP160, help="BIOPAC device enum.")
+    parser.add_argument("--mp-device", type=int, default=MP150, help="BIOPAC device enum.")
     parser.add_argument("--mp-comm", type=int, default=MPUDP, help="BIOPAC comm enum.")
     parser.add_argument("--log-samples-csv", help="Optional CSV for raw samples.")
     parser.add_argument("--log-sent-csv", help="Optional CSV for sent regressors.")
