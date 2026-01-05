@@ -5,6 +5,7 @@ import logging
 import socket
 import time
 from collections import deque
+from pathlib import Path
 """
 BIOPAC RetroTS streamer.
 
@@ -61,43 +62,27 @@ MPSUCCESS = 1
 log = logging.getLogger("biopac_streamer")
 
 
-def _wait_for_handshake(sock: socket.socket, fallback_tr: float) -> Optional[float]:
-    sock.settimeout(0.5)
-    buffer = ""
-    while True:
-        try:
-            chunk = sock.recv(4096)
-        except socket.timeout:
-            continue
-        if not chunk:
-            return None
-        buffer += chunk.decode("utf-8")
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            if line == "s":
-                return None
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if payload.get("kind") == "handshake":
-                try:
-                    tr_value = float(payload.get("tr", fallback_tr))
-                except (TypeError, ValueError):
-                    tr_value = fallback_tr
-                return tr_value
+@dataclass
+class RunInfo:
+    subject: str
+    day: str
+    run: str
 
 
-def _poll_handshake(sock: socket.socket, buffer: str, fallback_tr: float) -> Tuple[Optional[float], str]:
+def _poll_control(
+    sock: socket.socket,
+    buffer: str,
+    fallback_tr: float,
+) -> Tuple[Optional[float], Optional[RunInfo], bool, str]:
+    tr_value = None
+    run_info = None
+    run_end = False
     try:
         chunk = sock.recv(4096)
     except (BlockingIOError, socket.timeout):
-        return None, buffer
+        return tr_value, run_info, run_end, buffer
     if not chunk:
-        return None, buffer
+        return tr_value, run_info, run_end, buffer
     buffer += chunk.decode("utf-8")
     while "\n" in buffer:
         line, buffer = buffer.split("\n", 1)
@@ -105,18 +90,116 @@ def _poll_handshake(sock: socket.socket, buffer: str, fallback_tr: float) -> Tup
         if not line:
             continue
         if line == "s":
-            return None, buffer
+            continue
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if payload.get("kind") == "handshake":
+        kind = payload.get("kind")
+        if kind == "handshake":
             try:
                 tr_value = float(payload.get("tr", fallback_tr))
             except (TypeError, ValueError):
                 tr_value = fallback_tr
-            return tr_value, buffer
-    return None, buffer
+        elif kind == "run_start":
+            subject = payload.get("subject")
+            day = payload.get("day")
+            run = payload.get("run")
+            if subject and day and run:
+                run_info = RunInfo(str(subject), str(day), str(run))
+        elif kind == "run_end":
+            run_end = True
+    return tr_value, run_info, run_end, buffer
+
+
+class RunDataLogger:
+    def __init__(self, base_dir: Path):
+        self._base_dir = Path(base_dir)
+        self._run_dir: Optional[Path] = None
+        self._raw_handle = None
+        self._raw_writer = None
+        self._reg_handle = None
+        self._reg_writer = None
+        self._last_flush = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self._raw_handle is not None or self._reg_handle is not None
+
+    def start_run(self, run_info: Optional[RunInfo]) -> Path:
+        self.stop_run()
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        if run_info is None:
+            run_dir = self._base_dir / timestamp
+        else:
+            run_dir = (
+                self._base_dir
+                / run_info.subject
+                / run_info.day
+                / f"run{run_info.run}_{timestamp}"
+            )
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._run_dir = run_dir
+        self._raw_handle = open(run_dir / "raw_channels.csv", "w", newline="")
+        self._raw_writer = csv.writer(self._raw_handle)
+        self._raw_writer.writerow(["timestamp", "resp", "card", "trigger"])
+        self._reg_handle = open(run_dir / "regressors.csv", "w", newline="")
+        self._reg_writer = csv.writer(self._reg_handle)
+        self._reg_writer.writerow(
+            [
+                "timestamp",
+                "volume_idx",
+                "tr",
+                "sample_idx",
+                "nsamp_total",
+                "samples_per_tr",
+                "regressors",
+            ]
+        )
+        self._last_flush = time.monotonic()
+        return run_dir
+
+    def stop_run(self):
+        if self._raw_handle is not None:
+            self._raw_handle.close()
+        if self._reg_handle is not None:
+            self._reg_handle.close()
+        self._raw_handle = None
+        self._raw_writer = None
+        self._reg_handle = None
+        self._reg_writer = None
+        self._run_dir = None
+
+    def log_sample(self, resp: float, card: float, trigger: float):
+        if self._raw_writer is None:
+            return
+        self._raw_writer.writerow([time.time(), resp, card, trigger])
+        self._maybe_flush()
+
+    def log_regressors(self, vol_idx: int, meta: dict, regressors: List[float]):
+        if self._reg_writer is None:
+            return
+        self._reg_writer.writerow(
+            [
+                time.time(),
+                vol_idx,
+                meta["tr"],
+                meta["sample_idx"],
+                meta["nsamp_total"],
+                meta["samples_per_tr"],
+                regressors,
+            ]
+        )
+        self._maybe_flush()
+
+    def _maybe_flush(self):
+        now = time.monotonic()
+        if now - self._last_flush >= 1.0:
+            if self._raw_handle is not None:
+                self._raw_handle.flush()
+            if self._reg_handle is not None:
+                self._reg_handle.flush()
+            self._last_flush = now
 
 
 @dataclass
@@ -146,6 +229,8 @@ class StreamerConfig:
     print_every: int = 1
     card_source: str = "ecg"
     downsample_hz: float = 0.0
+    data_dir: str = "biopac_rt/data"
+    run_control: bool = True
     # --- Offline reporting / behavior ---
     offline_status_every_s: float = 1.0   # print "I'm alive" line every N seconds
     handshake_grace_s: float = 2.0        # how long to wait for handshake after connect
@@ -210,6 +295,17 @@ class RetroTSStreamer:
 
     def reset_start_time(self):
         self._start_time = time.monotonic()
+
+    def reset_for_run(self, tr_value: Optional[float] = None):
+        if tr_value is not None:
+            self.config.tr = float(tr_value)
+        self._resp = []
+        self._card = []
+        self._vol_idx = 0
+        self._sample_idx = 0
+        self._start_time = time.monotonic()
+        self._samples_per_tr = int(max(1, round(self._proc_fs * self.config.tr)))
+        self._min_samples = int(max(1, round(self._proc_fs * self.config.tr * 5)))
 
     def add_sample(self, resp: float, card: float):
         self._resp.append(resp)
@@ -546,6 +642,11 @@ def run_streamer(config: StreamerConfig):
     prev_trigger = 0.0
     last_trigger_time = None
     handshake_done = False
+    run_active = False
+    run_info: Optional[RunInfo] = None
+    run_control_enabled = bool(config.run_control)
+    rt_control_seen = False
+    data_logger = RunDataLogger(Path(config.data_dir))
     samples_writer = None
     sent_writer = None
     regressors_writer = None
@@ -584,6 +685,28 @@ def run_streamer(config: StreamerConfig):
     sock = None
     last_connect_attempt = 0.0
     handshake_buffer = ""
+    run_log_dir = None
+
+    def _start_run(info: Optional[RunInfo], reason: str):
+        nonlocal run_active, run_info, prev_trigger, last_trigger_time, run_log_dir
+        retro.reset_for_run()
+        prev_trigger = 0.0
+        last_trigger_time = None
+        run_info = info
+        run_log_dir = data_logger.start_run(info)
+        run_active = True
+        label = "offline" if info is None else f"{info.subject}/{info.day}/run{info.run}"
+        log.info("[RUN] Started (%s) for %s in %s", reason, label, run_log_dir)
+
+    def _stop_run(reason: str):
+        nonlocal run_active, run_info, run_log_dir
+        if not run_active and not data_logger.active:
+            return
+        data_logger.stop_run()
+        run_active = False
+        log.info("[RUN] Stopped (%s).", reason)
+        run_info = None
+        run_log_dir = None
 
     def _maybe_connect():
         nonlocal sock, last_connect_attempt, handshake_done, handshake_buffer
@@ -604,6 +727,9 @@ def run_streamer(config: StreamerConfig):
             log.warning("[NET] Connection failed: %s", exc)
             sock = None
 
+    if not run_control_enabled:
+        _start_run(None, "no-run-control")
+
     try:
         sample_idx = 0  # raw sample counter (always raw-rate)
         for resp, card, trigger in source:
@@ -621,6 +747,30 @@ def run_streamer(config: StreamerConfig):
             else:
                 resp_use, card_use = resp, card
 
+            _maybe_connect()
+            if sock is not None:
+                tr_value, new_run_info, run_end, handshake_buffer = _poll_control(
+                    sock, handshake_buffer, config.tr
+                )
+                if tr_value is not None:
+                    config.tr = tr_value
+                    if retro._vol_idx == 0:
+                        retro.reset_start_time()
+                    handshake_done = True
+                    fixed_tr_allowed = True
+                    log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                if new_run_info is not None:
+                    rt_control_seen = True
+                    _start_run(new_run_info, "rt")
+                if run_end:
+                    rt_control_seen = True
+                    _stop_run("rt")
+
+            if run_control_enabled and not run_active:
+                if sock is None and not data_logger.active and not rt_control_seen:
+                    _start_run(None, "offline")
+                else:
+                    continue
 
             # Ingest resp/card (possibly downsampled) into RetroTS buffers
             if have_phys:
@@ -661,12 +811,13 @@ def run_streamer(config: StreamerConfig):
                     )
 
             # Logging/plot stays RAW (so you can inspect real signals)
+            if run_active:
+                data_logger.log_sample(resp, card, trigger)
             if samples_writer is not None:
                 samples_writer.writerow([time.time(), resp, card, trigger])
             if plotter is not None:
                 plotter.add_sample(time.monotonic(), resp, card, trigger)
 
-            _maybe_connect()
             # ---------------------------------------------------------
             # Handshake gating (only relevant if NO trigger channel)
             # ---------------------------------------------------------
@@ -676,25 +827,11 @@ def run_streamer(config: StreamerConfig):
                     if last_handshake_wait_start is None:
                         last_handshake_wait_start = time.monotonic()
 
-                    tr_value, handshake_buffer = _poll_handshake(sock, handshake_buffer, config.tr)
-                    if tr_value is not None:
-                        config.tr = tr_value
-                        if retro._vol_idx == 0:
-                            retro.reset_start_time()
-                        handshake_done = True
-                        fixed_tr_allowed = True
-                        log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                    waited = time.monotonic() - last_handshake_wait_start
+                    if waited >= config.handshake_grace_s:
+                        fixed_tr_allowed = bool(config.allow_offline_fixed_tr)
                     else:
-                        # If connected but handshake hasn't arrived yet, gate only for a short grace
-                        waited = time.monotonic() - last_handshake_wait_start
-                        if waited >= config.handshake_grace_s:
-                            if config.allow_offline_fixed_tr:
-                                fixed_tr_allowed = True
-                                # Don't mark handshake_done; still accept it later if it comes
-                            else:
-                                fixed_tr_allowed = False
-                        else:
-                            fixed_tr_allowed = False
+                        fixed_tr_allowed = False
                 else:
                     # Not connected at all -> either allow offline fixed TR or fully gate
                     fixed_tr_allowed = bool(config.allow_offline_fixed_tr)
@@ -720,6 +857,8 @@ def run_streamer(config: StreamerConfig):
                     if last_trigger_time is None or tr_value >= config.trigger_min_interval:
                         last_trigger_time = now
                         vol_idx, regressors, meta = retro.emit_on_trigger(tr_value)
+                        if run_active:
+                            data_logger.log_regressors(vol_idx, meta, regressors)
                         if regressors_writer is not None:
                             regressors_writer.writerow([time.time(), vol_idx, tr_value, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
@@ -762,6 +901,8 @@ def run_streamer(config: StreamerConfig):
                         continue
                     # Emit based on sample counts, not wall time
                     for vol_idx, regressors, meta in retro.add_sample_and_maybe_emit_by_samples(resp_use, card_use):
+                        if run_active:
+                            data_logger.log_regressors(vol_idx, meta, regressors)
                         if regressors_writer is not None:
                             regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
@@ -803,6 +944,8 @@ def run_streamer(config: StreamerConfig):
                     if not fixed_tr_allowed:
                         continue
                     for vol_idx, regressors, meta in retro.maybe_emit():
+                        if run_active:
+                            data_logger.log_regressors(vol_idx, meta, regressors)
                         if regressors_writer is not None:
                             regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
                         if config.print_every > 0 and (vol_idx % config.print_every == 0):
@@ -841,6 +984,7 @@ def run_streamer(config: StreamerConfig):
                                     sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
 
     finally:
+        data_logger.stop_run()
         if samples_handle is not None:
             samples_handle.close()
         if sent_handle is not None:
@@ -919,13 +1063,17 @@ def main():
         default=1,
         help="Print regressor status every N volumes (0 to disable).",
     )
-    parser.add_argument("--card-source", choices=("ppg", "ecg"), default="ecg",
-                    help="Which CSV column to use as cardiac: PPG or ECG.")
     parser.add_argument(
-    "--downsample-hz",
-    type=float,
-    default=0.0,
-    help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
+        "--card-source",
+        choices=("ppg", "ecg"),
+        default="ecg",
+        help="Which CSV column to use as cardiac: PPG or ECG.",
+    )
+    parser.add_argument(
+        "--downsample-hz",
+        type=float,
+        default=0.0,
+        help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
     )
 
     parser.add_argument("--offline-status-every-s", type=float, default=1.0,
@@ -934,6 +1082,10 @@ def main():
                         help="Seconds to wait for handshake after connect (no trigger mode).")
     parser.add_argument("--no-offline-fixed-tr", action="store_true",
                         help="If set, and --wait-for-handshake is enabled (no trigger), do not emit fixed-TR volumes until handshake arrives.")
+    parser.add_argument("--data-dir", default="biopac_rt/data",
+                        help="Base directory for run data logs.")
+    parser.add_argument("--no-run-control", action="store_true",
+                        help="Disable run start/stop control messages from the RT PC.")
 
 
     args = parser.parse_args()
@@ -967,6 +1119,8 @@ def main():
         offline_status_every_s=args.offline_status_every_s,
         handshake_grace_s=args.handshake_grace_s,
         allow_offline_fixed_tr=(not args.no_offline_fixed_tr),
+        data_dir=args.data_dir,
+        run_control=(not args.no_run_control),
 
     )
     run_streamer(config)
