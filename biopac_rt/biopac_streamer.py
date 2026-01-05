@@ -54,6 +54,7 @@ from fmri_rt_preproc.RTPSpy_tools.rtp_retrots import RtpRetroTS
 
 MP150 = 101
 MP160 = 103
+
 MPUDP = 11
 MPSUCCESS = 1
 
@@ -124,8 +125,8 @@ class StreamerConfig:
     port: int
     tr: float
     phys_fs: float
-    resp_channel: 2
-    card_channel: 3
+    resp_channel: 12
+    card_channel: 14
     mode: str
     csv_path: Optional[str] = None
     mpdev_dll: Optional[str] = None
@@ -145,6 +146,10 @@ class StreamerConfig:
     print_every: int = 1
     card_source: str = "ecg"
     downsample_hz: float = 0.0
+    # --- Offline reporting / behavior ---
+    offline_status_every_s: float = 1.0   # print "I'm alive" line every N seconds
+    handshake_grace_s: float = 2.0        # how long to wait for handshake after connect
+    allow_offline_fixed_tr: bool = True   # if wait_for_handshake but no RT PC, still emit locally
 
 class _IntFactorDownsampler:
     """
@@ -323,17 +328,25 @@ class RetroTSStreamer:
 
 
 class LivePlotter:
+    """
+    Live plot: separate axes for resp / card / trigger (no saving).
+    Call:
+        plotter = LivePlotter(window_s, update_hz)   # if enabled
+        plotter.add_sample(t, resp, card, trigger)   # each sample
+    """
     def __init__(self, window_s: float, update_hz: float):
-        self._window_s = window_s
-        self._update_every = 1.0 / max(update_hz, 0.1)
+        self._window_s = float(window_s)
+        self._update_every = 1.0 / max(float(update_hz), 0.1)
         self._last_update = 0.0
+
+        self._time: Deque[float] = deque()
         self._resp: Deque[float] = deque()
         self._card: Deque[float] = deque()
         self._trigger: Deque[float] = deque()
-        self._time: Deque[float] = deque()
+
         self._enabled = False
         self._fig = None
-        self._ax = None
+        self._axes = None
         self._lines = None
 
         try:
@@ -344,40 +357,69 @@ class LivePlotter:
 
         self._plt = plt
         self._plt.ion()
-        self._fig, self._ax = self._plt.subplots(num="BIOPAC Live")
+
+        # 3 rows, shared X axis (time)
+        self._fig, self._axes = self._plt.subplots(
+            3, 1, sharex=True, num="BIOPAC Live", figsize=(10, 7)
+        )
+
+        # Create one line per axis
         self._lines = {
-            "resp": self._ax.plot([], [], label="resp")[0],
-            "card": self._ax.plot([], [], label="card")[0],
-            "trigger": self._ax.plot([], [], label="trigger")[0],
+            "resp": self._axes[0].plot([], [])[0],
+            "card": self._axes[1].plot([], [])[0],
+            "trigger": self._axes[2].plot([], [])[0],
         }
-        self._ax.set_xlabel("Time (s)")
-        self._ax.set_ylabel("Signal")
-        self._ax.legend(loc="upper right")
+
+        self._axes[0].set_title("Respiration")
+        self._axes[0].set_ylabel("Resp")
+
+        self._axes[1].set_title("Cardiac")
+        self._axes[1].set_ylabel("Card")
+
+        self._axes[2].set_title("Trigger")
+        self._axes[2].set_ylabel("Trig")
+        self._axes[2].set_xlabel("Time (s)")
+
+        for ax in self._axes:
+            ax.grid(True, alpha=0.3)
+
         self._enabled = True
 
     def add_sample(self, t: float, resp: float, card: float, trigger: float):
         if not self._enabled:
             return
+
+        t = float(t)
         self._time.append(t)
-        self._resp.append(resp)
-        self._card.append(card)
-        self._trigger.append(trigger)
+        self._resp.append(float(resp))
+        self._card.append(float(card))
+        self._trigger.append(float(trigger))
+
+        # keep last window_s seconds
         while self._time and (self._time[-1] - self._time[0]) > self._window_s:
             self._time.popleft()
             self._resp.popleft()
             self._card.popleft()
             self._trigger.popleft()
+
         now = time.monotonic()
         if now - self._last_update < self._update_every:
             return
         self._last_update = now
+
         self._lines["resp"].set_data(self._time, self._resp)
         self._lines["card"].set_data(self._time, self._card)
         self._lines["trigger"].set_data(self._time, self._trigger)
-        self._ax.relim()
-        self._ax.autoscale_view()
+
+        # autoscale each axis independently
+        for ax in self._axes:
+            ax.relim()
+            ax.autoscale_view()
+
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()
+
+
 
 
 def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
@@ -448,7 +490,7 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
         raise RuntimeError(f"connectMPDev failed with code {retval}")
 
     mpdev.setSampleRate.argtypes = [c_double]
-    retval = mpdev.setSampleRate(1.0 / config.phys_fs)
+    retval = mpdev.setSampleRate(config.phys_fs/1000) # X = msec per sample, e.g. 2 = 500 Hz, 1 = 1000 Hz
     if retval != MPSUCCESS:
         raise RuntimeError(f"setSampleRate failed with code {retval}")
 
@@ -536,6 +578,9 @@ def run_streamer(config: StreamerConfig):
 
 
     plotter = LivePlotter(config.plot_window_s, config.plot_update_hz) if config.live_plot else None
+    last_status_t = 0.0
+    last_handshake_wait_start = None
+    fixed_tr_allowed = True  # will be controlled below
     sock = None
     last_connect_attempt = 0.0
     handshake_buffer = ""
@@ -593,6 +638,27 @@ def run_streamer(config: StreamerConfig):
                     retro._card.append(card_use)
                     retro._sample_idx += 1
 
+            # -----------------------------
+            # Offline heartbeat / warmup
+            # -----------------------------
+            now_m = time.monotonic()
+            if config.offline_status_every_s and config.offline_status_every_s > 0:
+                if (now_m - last_status_t) >= config.offline_status_every_s:
+                    last_status_t = now_m
+                    conn_state = "up" if sock is not None else "down"
+                    # Show warmup progress for RetroTS
+                    nsamp = len(retro._resp)
+                    warm = f"warmup {nsamp}/{retro._min_samples}" if nsamp < retro._min_samples else "warm"
+                    log.info(
+                        "[LIVE] conn=%s | raw(resp=%.4g card=%.4g trig=%.3g) | ds_ingest=%s | %s | vol=%d",
+                        conn_state,
+                        float(resp),
+                        float(card),
+                        float(trigger),
+                        "yes" if have_phys else "no",
+                        warm,
+                        retro._vol_idx,
+                    )
 
             # Logging/plot stays RAW (so you can inspect real signals)
             if samples_writer is not None:
@@ -601,19 +667,40 @@ def run_streamer(config: StreamerConfig):
                 plotter.add_sample(time.monotonic(), resp, card, trigger)
 
             _maybe_connect()
-            if (
-                sock is not None
-                and config.wait_for_handshake
-                and config.trigger_channel is None
-                and not handshake_done
-            ):
-                tr_value, handshake_buffer = _poll_handshake(sock, handshake_buffer, config.tr)
-                if tr_value is not None:
-                    config.tr = tr_value
-                    if retro._vol_idx == 0:
-                        retro.reset_start_time()
-                    handshake_done = True
-                    log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+            # ---------------------------------------------------------
+            # Handshake gating (only relevant if NO trigger channel)
+            # ---------------------------------------------------------
+            if config.trigger_channel is None and config.wait_for_handshake and not handshake_done:
+                if sock is not None:
+                    # Start grace timer on first connect
+                    if last_handshake_wait_start is None:
+                        last_handshake_wait_start = time.monotonic()
+
+                    tr_value, handshake_buffer = _poll_handshake(sock, handshake_buffer, config.tr)
+                    if tr_value is not None:
+                        config.tr = tr_value
+                        if retro._vol_idx == 0:
+                            retro.reset_start_time()
+                        handshake_done = True
+                        fixed_tr_allowed = True
+                        log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                    else:
+                        # If connected but handshake hasn't arrived yet, gate only for a short grace
+                        waited = time.monotonic() - last_handshake_wait_start
+                        if waited >= config.handshake_grace_s:
+                            if config.allow_offline_fixed_tr:
+                                fixed_tr_allowed = True
+                                # Don't mark handshake_done; still accept it later if it comes
+                            else:
+                                fixed_tr_allowed = False
+                        else:
+                            fixed_tr_allowed = False
+                else:
+                    # Not connected at all -> either allow offline fixed TR or fully gate
+                    fixed_tr_allowed = bool(config.allow_offline_fixed_tr)
+            else:
+                fixed_tr_allowed = True
+
 
             if config.trigger_channel is not None:
                 trigger_now = trigger >= config.trigger_threshold
@@ -671,7 +758,7 @@ def run_streamer(config: StreamerConfig):
                 prev_trigger = trigger
             else:
                 if config.mode == "csv":
-                    if not have_phys:
+                    if not have_phys or not fixed_tr_allowed:
                         continue
                     # Emit based on sample counts, not wall time
                     for vol_idx, regressors, meta in retro.add_sample_and_maybe_emit_by_samples(resp_use, card_use):
@@ -713,6 +800,8 @@ def run_streamer(config: StreamerConfig):
                                     sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
 
                 else:
+                    if not fixed_tr_allowed:
+                        continue
                     for vol_idx, regressors, meta in retro.maybe_emit():
                         if regressors_writer is not None:
                             regressors_writer.writerow([time.time(), vol_idx, config.tr, regressors])
@@ -837,7 +926,15 @@ def main():
     type=float,
     default=0.0,
     help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
-)
+    )
+
+    parser.add_argument("--offline-status-every-s", type=float, default=1.0,
+                        help="Print local status every N seconds even if RT PC is down (0 disables).")
+    parser.add_argument("--handshake-grace-s", type=float, default=2.0,
+                        help="Seconds to wait for handshake after connect (no trigger mode).")
+    parser.add_argument("--no-offline-fixed-tr", action="store_true",
+                        help="If set, and --wait-for-handshake is enabled (no trigger), do not emit fixed-TR volumes until handshake arrives.")
+
 
     args = parser.parse_args()
 
@@ -867,6 +964,9 @@ def main():
         print_every=args.print_every,
         card_source=args.card_source,
         downsample_hz=args.downsample_hz,
+        offline_status_every_s=args.offline_status_every_s,
+        handshake_grace_s=args.handshake_grace_s,
+        allow_offline_fixed_tr=(not args.no_offline_fixed_tr),
 
     )
     run_streamer(config)
