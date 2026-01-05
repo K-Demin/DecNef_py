@@ -46,6 +46,9 @@ class BiopacReceiverConfig:
     timeout: float = 0.3
     expected_regressors: Optional[int] = None
     handshake_tr: Optional[float] = None
+    subject: Optional[str] = None
+    day: Optional[str] = None
+    run: Optional[str] = None
 
 
 class BiopacRetroTSReceiver:
@@ -59,6 +62,7 @@ class BiopacRetroTSReceiver:
         self._n_reg: Optional[int] = None
         self._missing_vols: set[int] = set()
         self._server_sock: Optional[socket.socket] = None
+        self._conn: Optional[socket.socket] = None
 
     def start(self):
         if self._thread is not None:
@@ -69,6 +73,7 @@ class BiopacRetroTSReceiver:
 
     def stop(self):
         self._stop.set()
+        self._send_run_end()
         if self._server_sock is not None:
             try:
                 self._server_sock.close()
@@ -133,6 +138,8 @@ class BiopacRetroTSReceiver:
                     break
 
                 log.info("[BIOPAC] Connected from %s:%s", addr[0], addr[1])
+                with self._lock:
+                    self._conn = conn
                 if self.config.handshake_tr is not None:
                     payload = json.dumps(
                         {
@@ -145,6 +152,7 @@ class BiopacRetroTSReceiver:
                         conn.sendall((payload + "\n").encode("utf-8"))
                     except OSError:
                         log.warning("[BIOPAC] Failed to send handshake.")
+                self._send_run_start()
                 with conn:
                     conn.settimeout(0.5)
                     buffer = ""
@@ -165,6 +173,37 @@ class BiopacRetroTSReceiver:
                                 continue
                             self._handle_line(line)
                 log.info("[BIOPAC] Connection closed.")
+                with self._lock:
+                    self._conn = None
+
+    def _send_run_start(self):
+        if not (self.config.subject and self.config.day and self.config.run):
+            return
+        payload = {
+            "kind": "run_start",
+            "subject": self.config.subject,
+            "day": self.config.day,
+            "run": self.config.run,
+            "timestamp": time.time(),
+        }
+        self._send_control(payload)
+
+    def _send_run_end(self):
+        payload = {
+            "kind": "run_end",
+            "timestamp": time.time(),
+        }
+        self._send_control(payload)
+
+    def _send_control(self, payload: dict):
+        with self._lock:
+            conn = self._conn
+        if conn is None:
+            return
+        try:
+            conn.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        except OSError:
+            log.warning("[BIOPAC] Failed to send control message.")
 
     def _handle_line(self, line: str):
         try:

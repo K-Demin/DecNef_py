@@ -462,6 +462,9 @@ class DICOMHandler(FileSystemEventHandler):
                     timeout=REGRESSOR_SETTINGS.biopac_timeout,
                     expected_regressors=expected_regressors,
                     handshake_tr=REGRESSOR_SETTINGS.TR if REGRESSOR_SETTINGS.biopac_handshake else None,
+                    subject=cfg.subject,
+                    day=cfg.day,
+                    run=cfg.run,
                 )
                 self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
                 self._biopac_timeout = biopac_cfg.timeout
