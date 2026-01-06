@@ -40,6 +40,9 @@ BIOPAC device + trigger:
     --resp-channel 1 --card-channel 2 --trigger-channel 3 \
     --log-samples-csv biopac_samples.csv --log-sent-csv biopac_regressors.csv
 
+    # to run with TR from the data
+    python -m biopac_rt.biopac_streamer --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 1000 --mode biopac --triger-channel 1 --mpdev-dll "D:\SIN_LAB RT-BIOPAC\DecNef_py\BIOPAC Hardware API 2.2.5 Research\VC10\x64\mpdev.dll" --downsample-hz 100 --live-plot
+    # to run with exact TR
     python -m biopac_rt.biopac_streamer --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 1000 --mode biopac --mpdev-dll "D:\SIN_LAB RT-BIOPAC\DecNef_py\BIOPAC Hardware API 2.2.5 Research\VC10\x64\mpdev.dll" --downsample-hz 100 --live-plot
 
 Simulated stream (no trigger channel):
@@ -221,7 +224,7 @@ class StreamerConfig:
     mp_device: int = MP150
     mp_comm: int = MPUDP
     mp_chunk_samples: int = 50
-    trigger_channel: Optional[int] = 1
+    trigger_channel: Optional[int] = None
     trigger_threshold: float = 1.0
     trigger_min_interval: float = 0.0
     log_samples_csv: Optional[str] = None
@@ -1073,7 +1076,7 @@ def main():
     parser.add_argument("--phys-fs", type=float, default=100.0, help="Physio sampling rate (Hz).")
     parser.add_argument("--resp-channel", type=int, default=12, help="BIOPAC resp channel (1-16).")
     parser.add_argument("--card-channel", type=int, default=14, help="BIOPAC card channel (1-16).")
-    parser.add_argument("--trigger-channel", type=int, default = 1, help="BIOPAC trigger channel (1-16).")
+    parser.add_argument("--trigger-channel", type=int, default = None, help="BIOPAC trigger channel (1-16).")
     parser.add_argument(
         "--trigger-threshold",
         type=float,
@@ -1094,7 +1097,7 @@ def main():
     parser.add_argument(
         "--mp-chunk-samples",
         type=int,
-        default=500,
+        default=10000,
         help="BIOPAC daemon read size in samples per channel (used with receiveMPData).",
     )
     parser.add_argument("--log-samples-csv", help="Optional CSV for raw samples.")
@@ -1174,7 +1177,7 @@ def main():
         mp_device=args.mp_device,
         mp_comm=args.mp_comm,
         mp_chunk_samples=args.mp_chunk_samples,
-        trigger_channel=args.trigger_channel,
+        trigger_channel=args.trigger_channel, 
         trigger_threshold=args.trigger_threshold,
         trigger_min_interval=(args.trigger_min_interval if args.trigger_min_interval is not None else args.tr * 0.9),
         log_samples_csv=args.log_samples_csv,
