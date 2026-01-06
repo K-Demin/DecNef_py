@@ -222,8 +222,8 @@ class StreamerConfig:
     mp_comm: int = MPUDP
     mp_chunk_samples: int = 50
     trigger_channel: Optional[int] = 1
-    trigger_threshold: float = 0.5
-    trigger_min_interval: float = 0.3
+    trigger_threshold: float = 1.0
+    trigger_min_interval: float = 0.0
     log_samples_csv: Optional[str] = None
     log_sent_csv: Optional[str] = None
     log_regressors_csv: Optional[str] = None
@@ -1077,14 +1077,14 @@ def main():
     parser.add_argument(
         "--trigger-threshold",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Threshold for trigger edge detection.",
     )
     parser.add_argument(
         "--trigger-min-interval",
         type=float,
-        default=0.3,
-        help="Minimum seconds between trigger edges.",
+        default=None,
+        help="Minimum seconds between trigger edges. Defaults to TR*0.9.",
     )
     parser.add_argument("--mode", choices=("sim", "csv", "biopac"), default="sim")
     parser.add_argument("--csv-path", help="CSV path with resp/card columns.")
@@ -1176,7 +1176,7 @@ def main():
         mp_chunk_samples=args.mp_chunk_samples,
         trigger_channel=args.trigger_channel,
         trigger_threshold=args.trigger_threshold,
-        trigger_min_interval=args.trigger_min_interval,
+        trigger_min_interval=(args.trigger_min_interval if args.trigger_min_interval is not None else args.tr * 0.9),
         log_samples_csv=args.log_samples_csv,
         log_sent_csv=args.log_sent_csv,
         log_regressors_csv=args.log_regressors_csv,
