@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from typing import Deque, Iterator, List, Optional, Tuple
 
 import numpy as np
-from ctypes import c_bool, c_double, c_int, c_char_p, cdll
+from ctypes import POINTER, c_bool, c_double, c_int, c_char_p, c_uint32, cdll
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_retrots import RtpRetroTS
 
@@ -221,6 +221,7 @@ class StreamerConfig:
     mpdev_dll: Optional[str] = None
     mp_device: int = MP150
     mp_comm: int = MPUDP
+    mp_chunk_samples: int = 50
     trigger_channel: Optional[int] = 1
     trigger_threshold: float = 0.5
     trigger_min_interval: float = 0.3
@@ -616,33 +617,69 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
     if retval != MPSUCCESS:
         raise RuntimeError(f"setAcqChannels failed with code {retval}")
 
+    active_channels = [idx for idx, enabled in enumerate(channels) if enabled]
+    if not active_channels:
+        raise RuntimeError("No active BIOPAC channels selected.")
+    channel_index = {ch: i for i, ch in enumerate(active_channels)}
+    resp_idx = channel_index[config.resp_channel - 1]
+    card_idx = channel_index[config.card_channel - 1]
+    trigger_idx = channel_index[config.trigger_channel - 1] if config.trigger_channel is not None else None
+
+    mpdev.startMPAcqDaemon.argtypes = []
+    retval = mpdev.startMPAcqDaemon()
+    if retval != MPSUCCESS:
+        raise RuntimeError(f"startMPAcqDaemon failed with code {retval}")
+
     retval = mpdev.startAcquisition()
     if retval != MPSUCCESS:
         raise RuntimeError(f"startAcquisition failed with code {retval}")
 
-    arr_type_double = c_double * 16
+    mpdev.receiveMPData.argtypes = [POINTER(c_double), c_uint32, POINTER(c_uint32)]
+    samples_per_read = max(1, int(config.mp_chunk_samples))
+    points_per_read = samples_per_read * len(active_channels)
+    arr_type_double = c_double * points_per_read
+    leftover: List[float] = []
     last_rate_t = time.monotonic()
-    ok = 0
-    tot = 0
+    samples = 0
+    points = 0
+    reads = 0
 
     try:
         while True:
-            samples = arr_type_double(0.0)
-            retval = mpdev.getMostRecentSample(samples)
-            tot += 1
-            if retval == MPSUCCESS:
-                ok += 1
-                resp = samples[config.resp_channel - 1]
-                card = samples[config.card_channel - 1]
-                trigger = samples[config.trigger_channel - 1] if config.trigger_channel is not None else 0.0
-                yield resp, card, trigger
+            buffer = arr_type_double()
+            received = c_uint32(0)
+            retval = mpdev.receiveMPData(buffer, points_per_read, received)
+            reads += 1
+            if retval == MPSUCCESS and received.value > 0:
+                points += received.value
+                data = list(buffer[:received.value])
+                if leftover:
+                    data = leftover + data
+                    leftover = []
+
+                full_samples = len(data) // len(active_channels)
+                remainder = len(data) % len(active_channels)
+                if remainder:
+                    leftover = data[-remainder:]
+                    data = data[:-remainder]
+
+                for i in range(full_samples):
+                    base = i * len(active_channels)
+                    resp = data[base + resp_idx]
+                    card = data[base + card_idx]
+                    trigger = data[base + trigger_idx] if trigger_idx is not None else 0.0
+                    yield resp, card, trigger
+                samples += full_samples
+            else:
+                time.sleep(0.001)
 
             now = time.monotonic()
             if now - last_rate_t >= 1.0:
-                log.info("[BIOPAC] ok/s=%d  tot/s=%d  ok%%=%.1f",
-                         ok, tot, 100.0 * ok / max(tot, 1))
-                ok = 0
-                tot = 0
+                log.info("[BIOPAC] samples/s=%d  points/s=%d  reads/s=%d",
+                         samples, points, reads)
+                samples = 0
+                points = 0
+                reads = 0
                 last_rate_t = now
 
             time.sleep(0.0)  # yield to scheduler
@@ -1055,6 +1092,12 @@ def main():
     parser.add_argument("--mpdev-dll", help="Path to mpdev.dll for biopac mode.")
     parser.add_argument("--mp-device", type=int, default=MP150, help="BIOPAC device enum.")
     parser.add_argument("--mp-comm", type=int, default=MPUDP, help="BIOPAC comm enum.")
+    parser.add_argument(
+        "--mp-chunk-samples",
+        type=int,
+        default=50,
+        help="BIOPAC daemon read size in samples per channel (used with receiveMPData).",
+    )
     parser.add_argument("--log-samples-csv", help="Optional CSV for raw samples.")
     parser.add_argument("--log-sent-csv", help="Optional CSV for sent regressors.")
     parser.add_argument("--log-regressors-csv", help="Optional CSV for computed regressors.")
@@ -1131,6 +1174,7 @@ def main():
         mpdev_dll=args.mpdev_dll,
         mp_device=args.mp_device,
         mp_comm=args.mp_comm,
+        mp_chunk_samples=args.mp_chunk_samples,
         trigger_channel=args.trigger_channel,
         trigger_threshold=args.trigger_threshold,
         trigger_min_interval=args.trigger_min_interval,
