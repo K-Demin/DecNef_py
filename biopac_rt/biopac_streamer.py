@@ -40,6 +40,9 @@ BIOPAC device + trigger:
     --resp-channel 1 --card-channel 2 --trigger-channel 3 \
     --log-samples-csv biopac_samples.csv --log-sent-csv biopac_regressors.csv
 
+    python -m biopac_rt.biopac_streamer --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 1000 --mode biopac 
+    --mpdev-dll "D:\SIN_LAB RT-BIOPAC\DecNef_py\BIOPAC Hardware API 2.2.5 Research\VC10\x64\mpdev.dll" --downsample-hz 100 --live-plot
+
 Simulated stream (no trigger channel):
   python -m biopac_rt.biopac_streamer \
     --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 100 --mode sim
@@ -204,18 +207,21 @@ class RunDataLogger:
 
 @dataclass
 class StreamerConfig:
+    # If you want to change the default values make sure
+    # you also change parser.add_argument section cause it
+    # doesn't copy it directly at the moment
     host: str
     port: int
     tr: float
     phys_fs: float
-    resp_channel: 12
-    card_channel: 14
     mode: str
+    resp_channel: int = 12
+    card_channel: int = 14
     csv_path: Optional[str] = None
     mpdev_dll: Optional[str] = None
     mp_device: int = MP150
     mp_comm: int = MPUDP
-    trigger_channel: Optional[int] = None
+    trigger_channel: Optional[int] = 1
     trigger_threshold: float = 0.5
     trigger_min_interval: float = 0.3
     log_samples_csv: Optional[str] = None
@@ -337,7 +343,16 @@ class RetroTSStreamer:
     def _compute_retrots(self, n_vol: int, tr_value: float) -> List[float]:
         resp = np.asarray(self._resp, dtype=np.float32)
         card = np.asarray(self._card, dtype=np.float32)
-            # ---- Robustify inputs (helps RetroTS peak/phase detection) ----
+
+        # --- EARLY GUARDS (prevents zero-size nanmin/nanmax + unstable early RetroTS) ---
+        if resp.size == 0 or card.size == 0:
+            return [0.0] * 8
+        if resp.size < self._min_samples or card.size < self._min_samples:
+            return [0.0] * 8
+        # -----------------------------------------------------------------------------
+
+
+        # ---- Robustify inputs (helps RetroTS peak/phase detection) ----
         def _z(x: np.ndarray) -> np.ndarray:
             x = x - np.nanmean(x)
             sd = np.nanstd(x)
@@ -346,6 +361,7 @@ class RetroTSStreamer:
             return x / sd
 
         # If ECG is inverted (stronger negative excursions), flip it
+        # (safe now because card.size > 0)
         if np.nanmin(card) < 0 and abs(np.nanmin(card)) > abs(np.nanmax(card)):
             card = -card
 
@@ -527,7 +543,7 @@ def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, f
         t = now - t0
         resp = np.sin(2 * np.pi * 0.25 * t) + 0.02 * np.random.randn()
         card = np.sin(2 * np.pi * 1.1 * t) + 0.01 * np.random.randn()
-        trigger = 1.0 if t >= next_trigger else 0.0
+        trigger = 5.0 if t >= next_trigger else 0.0
         if trigger > 0:
             next_trigger += tr
         yield resp, card, trigger
@@ -1006,9 +1022,9 @@ def main():
         help="Fallback fMRI TR (s) used before trigger-derived TR.",
     )
     parser.add_argument("--phys-fs", type=float, default=100.0, help="Physio sampling rate (Hz).")
-    parser.add_argument("--resp-channel", type=int, default=1, help="BIOPAC resp channel (1-16).")
-    parser.add_argument("--card-channel", type=int, default=2, help="BIOPAC card channel (1-16).")
-    parser.add_argument("--trigger-channel", type=int, help="BIOPAC trigger channel (1-16).")
+    parser.add_argument("--resp-channel", type=int, default=12, help="BIOPAC resp channel (1-16).")
+    parser.add_argument("--card-channel", type=int, default=14, help="BIOPAC card channel (1-16).")
+    parser.add_argument("--trigger-channel", type=int, default = 1, help="BIOPAC trigger channel (1-16).")
     parser.add_argument(
         "--trigger-threshold",
         type=float,
