@@ -223,7 +223,8 @@ class StreamerConfig:
     mpdev_dll: Optional[str] = None
     mp_device: int = MP150
     mp_comm: int = MPUDP
-    mp_chunk_samples: int = 50
+    mp_chunk_samples: int = 10
+    mp_poll_sleep_ms: float = 0.0
     trigger_channel: Optional[int] = None
     trigger_threshold: float = 1.0
     trigger_min_interval: float = 0.0
@@ -642,6 +643,7 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
     arr_type_double = c_double * points_per_read
     leftover: List[float] = []
     last_rate_t = time.monotonic()
+    last_rate_warn_t = last_rate_t
     samples = 0
     points = 0
     reads = 0
@@ -673,12 +675,30 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
                     yield resp, card, trigger
                 samples += full_samples
             else:
-                time.sleep(0.0001)
+                if config.mp_poll_sleep_ms > 0:
+                    time.sleep(config.mp_poll_sleep_ms / 1000.0)
 
             now = time.monotonic()
             if now - last_rate_t >= 1.0:
                 log.info("[BIOPAC] samples/s=%d  points/s=%d  reads/s=%d",
                          samples, points, reads)
+                expected_samples = int(round(config.phys_fs))
+                expected_points = int(round(config.phys_fs * len(active_channels)))
+                if (now - last_rate_warn_t) >= 5.0:
+                    if samples < expected_samples * 0.9:
+                        log.warning(
+                            "[BIOPAC] Low throughput: %d samples/s (expected ~%d). Consider lowering --mp-chunk-samples or setting --mp-poll-sleep-ms 0.",
+                            samples,
+                            expected_samples,
+                        )
+                    if points < expected_points * 0.9:
+                        log.warning(
+                            "[BIOPAC] Low throughput: %d points/s (expected ~%d). Active channels=%d.",
+                            points,
+                            expected_points,
+                            len(active_channels),
+                        )
+                    last_rate_warn_t = now
                 samples = 0
                 points = 0
                 reads = 0
@@ -802,6 +822,7 @@ def run_streamer(config: StreamerConfig):
         sample_idx = 0  # raw sample counter (always raw-rate)
         for resp, card, trigger in source:
             sample_idx += 1
+            raw_time = sample_idx / config.phys_fs
 
             # Downsample resp/card if requested (trigger remains raw)
             have_phys = True
@@ -884,7 +905,7 @@ def run_streamer(config: StreamerConfig):
             if samples_writer is not None:
                 samples_writer.writerow([time.time(), resp, card, trigger])
             if plotter is not None:
-                plotter.add_sample(time.monotonic(), resp, card, trigger)
+                plotter.add_sample(raw_time, resp, card, trigger)
 
             # ---------------------------------------------------------
             # Handshake gating (only relevant if NO trigger channel)
@@ -911,10 +932,7 @@ def run_streamer(config: StreamerConfig):
                 trigger_now = trigger >= config.trigger_threshold
                 trigger_prev = prev_trigger >= config.trigger_threshold
                 if trigger_now and not trigger_prev:
-                    if config.mode == "csv":
-                        now = sample_idx / config.phys_fs   # raw trigger timebase
-                    else:
-                        now = time.monotonic()
+                    now = raw_time
 
                     if last_trigger_time is None:
                         tr_value = config.tr
@@ -1097,8 +1115,14 @@ def main():
     parser.add_argument(
         "--mp-chunk-samples",
         type=int,
-        default=10000,
+        default=10,
         help="BIOPAC daemon read size in samples per channel (used with receiveMPData).",
+    )
+    parser.add_argument(
+        "--mp-poll-sleep-ms",
+        type=float,
+        default=0.0,
+        help="Sleep duration (ms) when receiveMPData returns no data. 0 disables sleeping.",
     )
     parser.add_argument("--log-samples-csv", help="Optional CSV for raw samples.")
     parser.add_argument("--log-sent-csv", help="Optional CSV for sent regressors.")
@@ -1177,6 +1201,7 @@ def main():
         mp_device=args.mp_device,
         mp_comm=args.mp_comm,
         mp_chunk_samples=args.mp_chunk_samples,
+        mp_poll_sleep_ms=args.mp_poll_sleep_ms,
         trigger_channel=args.trigger_channel, 
         trigger_threshold=args.trigger_threshold,
         trigger_min_interval=(args.trigger_min_interval if args.trigger_min_interval is not None else args.tr * 0.9),
