@@ -40,8 +40,7 @@ BIOPAC device + trigger:
     --resp-channel 1 --card-channel 2 --trigger-channel 3 \
     --log-samples-csv biopac_samples.csv --log-sent-csv biopac_regressors.csv
 
-    python -m biopac_rt.biopac_streamer --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 1000 --mode biopac 
-    --mpdev-dll "D:\SIN_LAB RT-BIOPAC\DecNef_py\BIOPAC Hardware API 2.2.5 Research\VC10\x64\mpdev.dll" --downsample-hz 100 --live-plot
+    python -m biopac_rt.biopac_streamer --host 115.145.189.30 --port 15000 --tr 0.9 --phys-fs 1000 --mode biopac --mpdev-dll "D:\SIN_LAB RT-BIOPAC\DecNef_py\BIOPAC Hardware API 2.2.5 Research\VC10\x64\mpdev.dll" --downsample-hz 100 --live-plot
 
 Simulated stream (no trigger channel):
   python -m biopac_rt.biopac_streamer \
@@ -671,7 +670,7 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
                     yield resp, card, trigger
                 samples += full_samples
             else:
-                time.sleep(0.001)
+                time.sleep(0.0001)
 
             now = time.monotonic()
             if now - last_rate_t >= 1.0:
@@ -1095,7 +1094,7 @@ def main():
     parser.add_argument(
         "--mp-chunk-samples",
         type=int,
-        default=50,
+        default=500,
         help="BIOPAC daemon read size in samples per channel (used with receiveMPData).",
     )
     parser.add_argument("--log-samples-csv", help="Optional CSV for raw samples.")
