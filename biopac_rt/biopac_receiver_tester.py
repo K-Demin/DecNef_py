@@ -60,7 +60,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="BIOPAC receiver test harness",
     )
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="115.145.189.30")
     parser.add_argument("--port", type=int, default=15000)
     parser.add_argument("--timeout", type=float, default=0.3)
     parser.add_argument("--expected-regressors", type=int, default=None)
@@ -72,6 +72,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=True,
         help="Send simulated RetroTS messages to the receiver.",
     )
+    parser.add_argument("--poll", type=float, default=0.002)
+    parser.add_argument("--max-wait", type=float, default=None,
+                        help="Max seconds to wait per volume. Default: wait forever.")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -102,13 +105,20 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     missing_count = 0
     for vol_idx in range(1, args.volumes + 1):
-        receiver.get_retrots(args.tr, vol_idx, 0.0)
-        missing = receiver.was_missing(vol_idx)
+        waited_s, missing = wait_for_volume(
+            receiver=receiver,
+            tr=args.tr,
+            vol_idx=vol_idx,
+            default_fill=0.0,
+            poll_s=0.002,  # tighter polling for RT; adjust if you want less CPU
+            max_wait_s=None,  # None = wait indefinitely
+        )
+
         if missing:
             missing_count += 1
-            log.info("Volume %s missing regressors (zero-filled).", vol_idx)
+            log.info("Volume %s STILL missing after waiting %.3fs (zero-filled).", vol_idx, waited_s)
         else:
-            log.info("Volume %s received regressors.", vol_idx)
+            log.info("Volume %s received regressors after waiting %.3fs.", vol_idx, waited_s)
 
     receiver.stop()
     if sender_thread is not None:
@@ -116,6 +126,39 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     log.info("Test complete. Missing volumes: %s/%s", missing_count, args.volumes)
     return 0 if missing_count == 0 else 1
+
+def wait_for_volume(
+    receiver: BiopacRetroTSReceiver,
+    tr: float,
+    vol_idx: int,
+    default_fill: float = 0.0,
+    poll_s: float = 0.005,
+    max_wait_s: Optional[float] = None,  # None = wait forever
+) -> tuple[float, bool]:
+    """
+    Block until regressors for `vol_idx` are available, then fetch them.
+
+    Returns:
+        waited_s: seconds spent waiting
+        missing:  True if receiver still returned missing (should be False if we truly waited)
+                 (kept as a sanity check in case receiver logic changes)
+    """
+    t0 = time.time()
+    while True:
+        # If your receiver exposes a "has(vol_idx)" or similar, use it here.
+        # Otherwise we poll by attempting to fetch but *not* accepting missing results:
+        receiver.get_retrots(tr, vol_idx, default_fill)
+        missing = receiver.was_missing(vol_idx)
+
+        if not missing:
+            return (time.time() - t0), False
+
+        # Not available yet → keep waiting
+        if max_wait_s is not None and (time.time() - t0) >= max_wait_s:
+            # Give up: last call already produced a missing/zero-filled result
+            return (time.time() - t0), True
+
+        time.sleep(poll_s)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ log = logging.getLogger("biopac_receiver")
 
 @dataclass
 class BiopacReceiverConfig:
-    host: str = "0.0.0.0"
+    host: str = "115.145.189.30"
     port: int = 15000
     timeout: float = 0.3
     expected_regressors: Optional[int] = None
