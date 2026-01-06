@@ -621,18 +621,31 @@ def biopac_samples(config: StreamerConfig) -> Iterator[Tuple[float, float, float
         raise RuntimeError(f"startAcquisition failed with code {retval}")
 
     arr_type_double = c_double * 16
+    last_rate_t = time.monotonic()
+    ok = 0
+    tot = 0
+
     try:
         while True:
             samples = arr_type_double(0.0)
             retval = mpdev.getMostRecentSample(samples)
+            tot += 1
             if retval == MPSUCCESS:
+                ok += 1
                 resp = samples[config.resp_channel - 1]
                 card = samples[config.card_channel - 1]
-                trigger = 0.0
-                if config.trigger_channel is not None:
-                    trigger = samples[config.trigger_channel - 1]
+                trigger = samples[config.trigger_channel - 1] if config.trigger_channel is not None else 0.0
                 yield resp, card, trigger
-            time.sleep(1.0 / config.phys_fs)
+
+            now = time.monotonic()
+            if now - last_rate_t >= 1.0:
+                log.info("[BIOPAC] ok/s=%d  tot/s=%d  ok%%=%.1f",
+                         ok, tot, 100.0 * ok / max(tot, 1))
+                ok = 0
+                tot = 0
+                last_rate_t = now
+
+            time.sleep(0.0)  # yield to scheduler
     finally:
         mpdev.stopAcquisition()
         mpdev.disconnectMPDev()

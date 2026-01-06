@@ -109,6 +109,7 @@ class BiopacRetroTSReceiver:
 
             return retro
 
+
     def was_missing(self, vol_idx: int) -> bool:
         with self._lock:
             return vol_idx in self._missing_vols
@@ -225,3 +226,26 @@ class BiopacRetroTSReceiver:
                 self._n_reg = int(payload.get("n_regressors", reg.shape[0]))
             self._regressors_by_vol[vol_idx] = reg
             self._cond.notify_all()
+
+    def wait_for_volume(self, vol_idx: int, timeout: Optional[float] = None) -> bool:
+        """
+        Block until `vol_idx` exists in the buffer.
+
+        Returns True if available, False if timed out or stopped.
+        - timeout=None means wait indefinitely.
+        - NO side effects: does not zero-fill and does not mark missing.
+        """
+        with self._cond:
+            if timeout is None:
+                while vol_idx not in self._regressors_by_vol and not self._stop.is_set():
+                    self._cond.wait(timeout=0.5)  # periodic wake to re-check stop
+                return (vol_idx in self._regressors_by_vol) and (not self._stop.is_set())
+
+            deadline = time.monotonic() + max(0.0, timeout)
+            while vol_idx not in self._regressors_by_vol and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=min(0.5, remaining))
+            return vol_idx in self._regressors_by_vol
+
