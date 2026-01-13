@@ -756,6 +756,113 @@ def _net_worker(
             except OSError:
                 pass
 
+def _plotter_worker(
+    plot_queue: mp.Queue,
+    stop_event: mp.Event,
+    window_s: float,
+    update_hz: float,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    plotter = LivePlotter(window_s, update_hz)
+    try:
+        while not stop_event.is_set():
+            try:
+                t, resp, card, trigger = plot_queue.get(timeout=0.1)
+            except queue_mod.Empty:
+                continue
+            plotter.add_sample(t, resp, card, trigger)
+    except Exception as exc:
+        log = logging.getLogger("biopac_streamer.plot")
+        log.warning("[PLOT] Plotter exited: %s", exc)
+
+
+def _net_worker(
+    host: str,
+    port: int,
+    connect_retry_s: float,
+    payload_queue: mp.Queue,
+    control_queue: mp.Queue,
+    stop_event: mp.Event,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("biopac_streamer.net")
+    sock = None
+    last_connect_attempt = 0.0
+    handshake_buffer = ""
+    net_connected = False
+
+    def _connect():
+        nonlocal sock, last_connect_attempt, handshake_buffer
+        now = time.monotonic()
+        if now - last_connect_attempt < connect_retry_s:
+            return
+        last_connect_attempt = now
+        try:
+            sock = socket.create_connection((host, port), timeout=2.0)
+            sock.settimeout(0.0)
+            log.info("[NET] Connected to RT PC %s:%s", host, port)
+            handshake_buffer = ""
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": True})
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            sock = None
+            log.warning("[NET] Connection failed: %s", exc)
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+
+    try:
+        while not stop_event.is_set():
+            if sock is None:
+                _connect()
+                time.sleep(0.05)
+                continue
+
+            tr_value, run_info, run_end, handshake_buffer = _poll_control(
+                sock, handshake_buffer, fallback_tr=0.0
+            )
+            if tr_value is not None:
+                _put_with_drop(control_queue, {"kind": "handshake", "tr": tr_value})
+            if run_info is not None:
+                _put_with_drop(
+                    control_queue,
+                    {
+                        "kind": "run_start",
+                        "subject": run_info.subject,
+                        "day": run_info.day,
+                        "run": run_info.run,
+                    },
+                )
+            if run_end:
+                _put_with_drop(control_queue, {"kind": "run_end"})
+
+            payload = _drain_latest(payload_queue)
+            if payload is None:
+                time.sleep(0.005)
+                continue
+
+            try:
+                sock.sendall((payload + "\n").encode("utf-8"))
+            except OSError as exc:
+                log.warning("[NET] Send failed: %s", exc)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
 def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
     t0 = time.monotonic()
     idx = 0
@@ -1129,6 +1236,38 @@ def run_streamer(config: StreamerConfig):
             if start_ts is None:
                 start_ts = ts
             raw_time = ts - start_ts
+
+            if control_queue is not None:
+                while True:
+                    try:
+                        msg = control_queue.get_nowait()
+                    except queue_mod.Empty:
+                        break
+                    kind = msg.get("kind")
+                    if kind == "handshake":
+                        try:
+                            config.tr = float(msg.get("tr", config.tr))
+                        except (TypeError, ValueError):
+                            config.tr = config.tr
+                        if retro._vol_idx == 0:
+                            retro.reset_start_time()
+                        handshake_done = True
+                        fixed_tr_allowed = True
+                        log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                    elif kind == "run_start":
+                        rt_control_seen = True
+                        info = RunInfo(
+                            str(msg.get("subject", "")),
+                            str(msg.get("day", "")),
+                            str(msg.get("run", "")),
+                        )
+                        if info.subject and info.day and info.run:
+                            _start_run(info, "rt")
+                    elif kind == "run_end":
+                        rt_control_seen = True
+                        _stop_run("rt")
+                    elif kind == "net_status":
+                        net_connected = bool(msg.get("connected", False))
 
             if control_queue is not None:
                 while True:
