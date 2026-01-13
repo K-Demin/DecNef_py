@@ -235,7 +235,7 @@ class StreamerConfig:
     log_regressors_csv: Optional[str] = None
     wait_for_handshake: bool = False
     live_plot: bool = False
-    plot_window_s: float = 10.0
+    plot_window_s: float = 0.0
     plot_update_hz: float = 10.0
     connect_retry_s: float = 2.0
     print_every: int = 1
@@ -290,6 +290,51 @@ class _IntFactorDownsampler:
             return float(self._y)
         return None
 
+
+class _TimeBucketDownsampler:
+    def __init__(self, target_hz: float, mode: str = "mean"):
+        if target_hz <= 0:
+            raise ValueError("target_hz must be > 0")
+        if mode not in ("mean", "max"):
+            raise ValueError("mode must be 'mean' or 'max'")
+        self._dt = 1.0 / float(target_hz)
+        self._mode = mode
+        self._t0 = None
+        self._bucket_idx = None
+        self._sum = 0.0
+        self._count = 0
+        self._max = None
+
+    def step(self, t: float, x: float) -> List[Tuple[float, float]]:
+        t = float(t)
+        x = float(x)
+        if self._t0 is None:
+            self._t0 = t
+            self._bucket_idx = 0
+
+        bucket_idx = int((t - self._t0) / self._dt)
+        outputs: List[Tuple[float, float]] = []
+
+        while self._bucket_idx is not None and bucket_idx > self._bucket_idx:
+            if self._count > 0:
+                value = (
+                    (self._sum / self._count)
+                    if self._mode == "mean"
+                    else float(self._max)
+                )
+                t_out = self._t0 + (self._bucket_idx + 1) * self._dt
+                outputs.append((t_out, value))
+            self._sum = 0.0
+            self._count = 0
+            self._max = None
+            self._bucket_idx += 1
+
+        self._sum += x
+        self._count += 1
+        if self._mode == "max":
+            self._max = x if self._max is None else max(self._max, x)
+
+        return outputs
 
 
 class RetroTSStreamer:
@@ -595,10 +640,121 @@ def _acquisition_worker(config: StreamerConfig, sample_queue: mp.Queue, stop_eve
             if stop_event.is_set():
                 break
             sample_idx += 1
-            _put_with_drop(sample_queue, (sample_idx, resp, card, trigger))
+            if config.mode == "csv":
+                timestamp = sample_idx / float(config.phys_fs)
+            else:
+                timestamp = time.monotonic()
+            _put_with_drop(sample_queue, (sample_idx, timestamp, resp, card, trigger))
     except Exception as exc:
         log.error("[ACQ] Acquisition stopped: %s", exc)
 
+
+def _plotter_worker(
+    plot_queue: mp.Queue,
+    stop_event: mp.Event,
+    window_s: float,
+    update_hz: float,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    plotter = LivePlotter(window_s, update_hz)
+    try:
+        while not stop_event.is_set():
+            try:
+                t, resp, card, trigger = plot_queue.get(timeout=0.1)
+            except queue_mod.Empty:
+                continue
+            plotter.add_sample(t, resp, card, trigger)
+    except Exception as exc:
+        log = logging.getLogger("biopac_streamer.plot")
+        log.warning("[PLOT] Plotter exited: %s", exc)
+
+
+def _net_worker(
+    host: str,
+    port: int,
+    connect_retry_s: float,
+    payload_queue: mp.Queue,
+    control_queue: mp.Queue,
+    stop_event: mp.Event,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("biopac_streamer.net")
+    sock = None
+    last_connect_attempt = 0.0
+    handshake_buffer = ""
+    net_connected = False
+
+    def _connect():
+        nonlocal sock, last_connect_attempt, handshake_buffer
+        now = time.monotonic()
+        if now - last_connect_attempt < connect_retry_s:
+            return
+        last_connect_attempt = now
+        try:
+            sock = socket.create_connection((host, port), timeout=2.0)
+            sock.settimeout(0.0)
+            log.info("[NET] Connected to RT PC %s:%s", host, port)
+            handshake_buffer = ""
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": True})
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            sock = None
+            log.warning("[NET] Connection failed: %s", exc)
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+
+    try:
+        while not stop_event.is_set():
+            if sock is None:
+                _connect()
+                time.sleep(0.05)
+                continue
+
+            tr_value, run_info, run_end, handshake_buffer = _poll_control(
+                sock, handshake_buffer, fallback_tr=0.0
+            )
+            if tr_value is not None:
+                _put_with_drop(control_queue, {"kind": "handshake", "tr": tr_value})
+            if run_info is not None:
+                _put_with_drop(
+                    control_queue,
+                    {
+                        "kind": "run_start",
+                        "subject": run_info.subject,
+                        "day": run_info.day,
+                        "run": run_info.run,
+                    },
+                )
+            if run_end:
+                _put_with_drop(control_queue, {"kind": "run_end"})
+
+            payload = _drain_latest(payload_queue)
+            if payload is None:
+                time.sleep(0.005)
+                continue
+
+            try:
+                sock.sendall((payload + "\n").encode("utf-8"))
+            except OSError as exc:
+                log.warning("[NET] Send failed: %s", exc)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 def _plotter_worker(
     plot_queue: mp.Queue,
@@ -894,6 +1050,7 @@ def run_streamer(config: StreamerConfig):
     plot_queue = None
     payload_queue = None
     control_queue = None
+    plot_window_s = config.plot_window_s if config.plot_window_s > 0 else config.tr
 
     if config.use_multiprocess:
         mp_context = mp.get_context("spawn")
@@ -909,7 +1066,7 @@ def run_streamer(config: StreamerConfig):
             plot_queue = mp_context.Queue(maxsize=max(1, int(config.plot_queue_max)))
             plot_process = mp_context.Process(
                 target=_plotter_worker,
-                args=(plot_queue, stop_event, config.plot_window_s, config.plot_update_hz),
+                args=(plot_queue, stop_event, plot_window_s, config.plot_update_hz),
                 daemon=True,
             )
             plot_process.start()
@@ -946,14 +1103,16 @@ def run_streamer(config: StreamerConfig):
     samples_handle = None
     sent_handle = None
     regressors_handle = None
-    # Optional downsampling for resp/card (trigger stays raw)
+    # Optional downsampling for resp/card using timestamps
     ds_resp = None
     ds_card = None
     if config.downsample_hz and config.downsample_hz > 0:
-        ds_resp = _IntFactorDownsampler(fs_in=config.phys_fs, fs_out=config.downsample_hz, alpha=0.2)
-        ds_card = _IntFactorDownsampler(fs_in=config.phys_fs, fs_out=config.downsample_hz, alpha=0.8)
-        log.info("[DS] Software downsample enabled: %.1f -> %.1f Hz (factor=%d)",
-                config.phys_fs, config.downsample_hz, ds_resp.factor)
+        ds_resp = _TimeBucketDownsampler(target_hz=config.downsample_hz, mode="mean")
+        ds_card = _TimeBucketDownsampler(target_hz=config.downsample_hz, mode="mean")
+        log.info(
+            "[DS] Timestamp downsample enabled: target %.1f Hz",
+            config.downsample_hz,
+        )
     if config.log_samples_csv:
         samples_handle = open(config.log_samples_csv, "a", newline="")
         samples_writer = csv.writer(samples_handle)
@@ -972,8 +1131,19 @@ def run_streamer(config: StreamerConfig):
 
 
     plotter = None if config.use_multiprocess else (
-        LivePlotter(config.plot_window_s, config.plot_update_hz) if config.live_plot else None
+        LivePlotter(plot_window_s, config.plot_update_hz) if config.live_plot else None
     )
+    plot_sample_hz = min(
+        config.downsample_hz if config.downsample_hz and config.downsample_hz > 0 else config.phys_fs,
+        100.0,
+    )
+    plot_resp_ds = None
+    plot_card_ds = None
+    plot_trigger_ds = None
+    if config.live_plot:
+        plot_resp_ds = _TimeBucketDownsampler(target_hz=plot_sample_hz, mode="mean")
+        plot_card_ds = _TimeBucketDownsampler(target_hz=plot_sample_hz, mode="mean")
+        plot_trigger_ds = _TimeBucketDownsampler(target_hz=plot_sample_hz, mode="max")
     last_status_t = 0.0
     last_handshake_wait_start = None
     fixed_tr_allowed = True  # will be controlled below
@@ -1043,11 +1213,12 @@ def run_streamer(config: StreamerConfig):
 
     try:
         sample_idx = 0  # raw sample counter (always raw-rate)
+        start_ts = None
         while True:
             if config.use_multiprocess:
                 assert sample_queue is not None
                 try:
-                    sample_idx, resp, card, trigger = sample_queue.get(timeout=0.1)
+                    sample_idx, ts, resp, card, trigger = sample_queue.get(timeout=0.1)
                 except queue_mod.Empty:
                     if stop_event is not None and stop_event.is_set():
                         break
@@ -1058,7 +1229,45 @@ def run_streamer(config: StreamerConfig):
                 except StopIteration:
                     break
                 sample_idx += 1
-            raw_time = sample_idx / config.phys_fs
+                if config.mode == "csv":
+                    ts = sample_idx / float(config.phys_fs)
+                else:
+                    ts = time.monotonic()
+            if start_ts is None:
+                start_ts = ts
+            raw_time = ts - start_ts
+
+            if control_queue is not None:
+                while True:
+                    try:
+                        msg = control_queue.get_nowait()
+                    except queue_mod.Empty:
+                        break
+                    kind = msg.get("kind")
+                    if kind == "handshake":
+                        try:
+                            config.tr = float(msg.get("tr", config.tr))
+                        except (TypeError, ValueError):
+                            config.tr = config.tr
+                        if retro._vol_idx == 0:
+                            retro.reset_start_time()
+                        handshake_done = True
+                        fixed_tr_allowed = True
+                        log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                    elif kind == "run_start":
+                        rt_control_seen = True
+                        info = RunInfo(
+                            str(msg.get("subject", "")),
+                            str(msg.get("day", "")),
+                            str(msg.get("run", "")),
+                        )
+                        if info.subject and info.day and info.run:
+                            _start_run(info, "rt")
+                    elif kind == "run_end":
+                        rt_control_seen = True
+                        _stop_run("rt")
+                    elif kind == "net_status":
+                        net_connected = bool(msg.get("connected", False))
 
             if control_queue is not None:
                 while True:
@@ -1093,16 +1302,18 @@ def run_streamer(config: StreamerConfig):
                         net_connected = bool(msg.get("connected", False))
 
             # Downsample resp/card if requested (trigger remains raw)
-            have_phys = True
+            downsampled_points: List[Tuple[float, float, float]] = []
             if ds_resp is not None and ds_card is not None:
-                resp_ds = ds_resp.step(resp)
-                card_ds = ds_card.step(card)
-                if resp_ds is None or card_ds is None:
-                    have_phys = False
-                else:
-                    resp_use, card_use = resp_ds, card_ds
+                resp_out = ds_resp.step(ts, resp)
+                card_out = ds_card.step(ts, card)
+                if resp_out and card_out:
+                    for idx in range(min(len(resp_out), len(card_out))):
+                        t_out, resp_use = resp_out[idx]
+                        _, card_use = card_out[idx]
+                        downsampled_points.append((t_out, resp_use, card_use))
             else:
-                resp_use, card_use = resp, card
+                downsampled_points.append((ts, resp, card))
+            have_phys = bool(downsampled_points)
 
             _maybe_connect()
             if sock is not None:
@@ -1131,19 +1342,20 @@ def run_streamer(config: StreamerConfig):
 
             # Ingest resp/card (possibly downsampled) into RetroTS buffers
             if have_phys:
-                if ds_resp is None:
-                    # old path (no DS): keep your original semantics
-                    if config.mode == "csv":
+                for _, resp_use, card_use in downsampled_points:
+                    if ds_resp is None:
+                        # old path (no DS): keep your original semantics
+                        if config.mode == "csv":
+                            retro._resp.append(resp_use)
+                            retro._card.append(card_use)
+                            retro._sample_idx += 1
+                        else:
+                            retro.add_sample(resp_use, card_use)
+                    else:
+                        # DS path: treat all modes the same on ingest (we are already controlling rate)
                         retro._resp.append(resp_use)
                         retro._card.append(card_use)
                         retro._sample_idx += 1
-                    else:
-                        retro.add_sample(resp_use, card_use)
-                else:
-                    # DS path: treat all modes the same on ingest (we are already controlling rate)
-                    retro._resp.append(resp_use)
-                    retro._card.append(card_use)
-                    retro._sample_idx += 1
 
             # -----------------------------
             # Offline heartbeat / warmup
@@ -1175,10 +1387,25 @@ def run_streamer(config: StreamerConfig):
                 data_logger.log_sample(resp, card, trigger)
             if samples_writer is not None:
                 samples_writer.writerow([time.time(), resp, card, trigger])
+            plot_points: List[Tuple[float, float, float, float]] = []
+            if plot_resp_ds is not None and plot_card_ds is not None and plot_trigger_ds is not None:
+                resp_plot = plot_resp_ds.step(ts, resp)
+                card_plot = plot_card_ds.step(ts, card)
+                trig_plot = plot_trigger_ds.step(ts, trigger)
+                if resp_plot and card_plot and trig_plot:
+                    for idx in range(
+                        min(len(resp_plot), len(card_plot), len(trig_plot))
+                    ):
+                        t_out, resp_p = resp_plot[idx]
+                        _, card_p = card_plot[idx]
+                        _, trig_p = trig_plot[idx]
+                        plot_points.append((t_out - start_ts, resp_p, card_p, trig_p))
             if plotter is not None:
-                plotter.add_sample(raw_time, resp, card, trigger)
+                for t_out, resp_p, card_p, trig_p in plot_points:
+                    plotter.add_sample(t_out, resp_p, card_p, trig_p)
             if plot_queue is not None:
-                _put_with_drop(plot_queue, (raw_time, resp, card, trigger))
+                for point in plot_points:
+                    _put_with_drop(plot_queue, point)
 
             # ---------------------------------------------------------
             # Handshake gating (only relevant if NO trigger channel)
@@ -1404,8 +1631,8 @@ def main():
     parser.add_argument(
         "--plot-window-s",
         type=float,
-        default=10.0,
-        help="Seconds of data to show in the live plot window.",
+        default=0.0,
+        help="Seconds of data to show in the live plot window (<=0 uses TR).",
     )
     parser.add_argument(
         "--plot-update-hz",
