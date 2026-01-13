@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import logging
+import multiprocessing as mp
+import queue as queue_mod
 import socket
 import time
 from collections import deque
@@ -241,6 +243,9 @@ class StreamerConfig:
     downsample_hz: float = 0.0
     data_dir: str = "biopac_rt/data"
     run_control: bool = True
+    use_multiprocess: bool = False
+    queue_max: int = 5000
+    plot_queue_max: int = 1000
     # --- Offline reporting / behavior ---
     offline_status_every_s: float = 1.0   # print "I'm alive" line every N seconds
     handshake_grace_s: float = 2.0        # how long to wait for handshake after connect
@@ -536,6 +541,77 @@ class LivePlotter:
         self._fig.canvas.flush_events()
 
 
+def _put_with_drop(target_queue: mp.Queue, item) -> None:
+    try:
+        target_queue.put_nowait(item)
+    except queue_mod.Full:
+        try:
+            target_queue.get_nowait()
+        except queue_mod.Empty:
+            return
+        try:
+            target_queue.put_nowait(item)
+        except queue_mod.Full:
+            return
+
+
+def _sample_source(config: StreamerConfig) -> Iterator[Tuple[float, float, float]]:
+    if config.mode == "sim":
+        return sim_samples(config.phys_fs, config.tr)
+    if config.mode == "csv":
+        if not config.csv_path:
+            raise ValueError("--csv-path is required for csv mode.")
+        return csv_samples(config.csv_path, config.phys_fs, card_source=config.card_source)
+    if config.mode == "biopac":
+        return biopac_samples(config)
+    raise ValueError(f"Unknown mode: {config.mode}")
+
+
+def _acquisition_worker(config: StreamerConfig, sample_queue: mp.Queue, stop_event: mp.Event):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("biopac_streamer.acq")
+    try:
+        source = _sample_source(config)
+    except Exception as exc:
+        log.error("[ACQ] Failed to start source: %s", exc)
+        return
+
+    sample_idx = 0
+    try:
+        for resp, card, trigger in source:
+            if stop_event.is_set():
+                break
+            sample_idx += 1
+            _put_with_drop(sample_queue, (sample_idx, resp, card, trigger))
+    except Exception as exc:
+        log.error("[ACQ] Acquisition stopped: %s", exc)
+
+
+def _plotter_worker(
+    plot_queue: mp.Queue,
+    stop_event: mp.Event,
+    window_s: float,
+    update_hz: float,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    plotter = LivePlotter(window_s, update_hz)
+    try:
+        while not stop_event.is_set():
+            try:
+                t, resp, card, trigger = plot_queue.get(timeout=0.1)
+            except queue_mod.Empty:
+                continue
+            plotter.add_sample(t, resp, card, trigger)
+    except Exception as exc:
+        log = logging.getLogger("biopac_streamer.plot")
+        log.warning("[PLOT] Plotter exited: %s", exc)
+
 
 
 def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
@@ -715,16 +791,34 @@ def run_streamer(config: StreamerConfig):
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
     )
-    if config.mode == "sim":
-        source = sim_samples(config.phys_fs, config.tr)
-    elif config.mode == "csv":
-        if not config.csv_path:
-            raise ValueError("--csv-path is required for csv mode.")
-        source = csv_samples(config.csv_path, config.phys_fs, card_source=config.card_source)
-    elif config.mode == "biopac":
-        source = biopac_samples(config)
+    source = None
+    mp_context = None
+    acq_process = None
+    plot_process = None
+    stop_event = None
+    sample_queue = None
+    plot_queue = None
+
+    if config.use_multiprocess:
+        mp_context = mp.get_context("spawn")
+        stop_event = mp_context.Event()
+        sample_queue = mp_context.Queue(maxsize=max(1, int(config.queue_max)))
+        acq_process = mp_context.Process(
+            target=_acquisition_worker,
+            args=(config, sample_queue, stop_event),
+            daemon=True,
+        )
+        acq_process.start()
+        if config.live_plot:
+            plot_queue = mp_context.Queue(maxsize=max(1, int(config.plot_queue_max)))
+            plot_process = mp_context.Process(
+                target=_plotter_worker,
+                args=(plot_queue, stop_event, config.plot_window_s, config.plot_update_hz),
+                daemon=True,
+            )
+            plot_process.start()
     else:
-        raise ValueError(f"Unknown mode: {config.mode}")
+        source = _sample_source(config)
 
     retro = RetroTSStreamer(config)
     prev_trigger = 0.0
@@ -766,7 +860,9 @@ def run_streamer(config: StreamerConfig):
             regressors_writer.writerow(["timestamp", "volume_idx", "tr", "sample_idx", "nsamp_total", "samples_per_tr", "regressors"])
 
 
-    plotter = LivePlotter(config.plot_window_s, config.plot_update_hz) if config.live_plot else None
+    plotter = None if config.use_multiprocess else (
+        LivePlotter(config.plot_window_s, config.plot_update_hz) if config.live_plot else None
+    )
     last_status_t = 0.0
     last_handshake_wait_start = None
     fixed_tr_allowed = True  # will be controlled below
@@ -820,8 +916,21 @@ def run_streamer(config: StreamerConfig):
 
     try:
         sample_idx = 0  # raw sample counter (always raw-rate)
-        for resp, card, trigger in source:
-            sample_idx += 1
+        while True:
+            if config.use_multiprocess:
+                assert sample_queue is not None
+                try:
+                    sample_idx, resp, card, trigger = sample_queue.get(timeout=0.1)
+                except queue_mod.Empty:
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    continue
+            else:
+                try:
+                    resp, card, trigger = next(source)
+                except StopIteration:
+                    break
+                sample_idx += 1
             raw_time = sample_idx / config.phys_fs
 
             # Downsample resp/card if requested (trigger remains raw)
@@ -906,6 +1015,8 @@ def run_streamer(config: StreamerConfig):
                 samples_writer.writerow([time.time(), resp, card, trigger])
             if plotter is not None:
                 plotter.add_sample(raw_time, resp, card, trigger)
+            if plot_queue is not None:
+                _put_with_drop(plot_queue, (raw_time, resp, card, trigger))
 
             # ---------------------------------------------------------
             # Handshake gating (only relevant if NO trigger channel)
@@ -1070,6 +1181,12 @@ def run_streamer(config: StreamerConfig):
                                     sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
 
     finally:
+        if stop_event is not None:
+            stop_event.set()
+        if acq_process is not None:
+            acq_process.join(timeout=2.0)
+        if plot_process is not None:
+            plot_process.join(timeout=2.0)
         data_logger.stop_run()
         if samples_handle is not None:
             samples_handle.close()
@@ -1173,6 +1290,23 @@ def main():
         default=0.0,
         help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
     )
+    parser.add_argument(
+        "--multiprocess",
+        action="store_true",
+        help="Run acquisition/plotting in separate processes to reduce lag.",
+    )
+    parser.add_argument(
+        "--queue-max",
+        type=int,
+        default=5000,
+        help="Max samples to buffer between acquisition and processing.",
+    )
+    parser.add_argument(
+        "--plot-queue-max",
+        type=int,
+        default=1000,
+        help="Max samples to buffer for plotting.",
+    )
 
     parser.add_argument("--offline-status-every-s", type=float, default=1.0,
                         help="Print local status every N seconds even if RT PC is down (0 disables).")
@@ -1216,6 +1350,9 @@ def main():
         print_every=args.print_every,
         card_source=args.card_source,
         downsample_hz=args.downsample_hz,
+        use_multiprocess=args.multiprocess,
+        queue_max=args.queue_max,
+        plot_queue_max=args.plot_queue_max,
         offline_status_every_s=args.offline_status_every_s,
         handshake_grace_s=args.handshake_grace_s,
         allow_offline_fixed_tr=(not args.no_offline_fixed_tr),
