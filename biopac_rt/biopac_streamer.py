@@ -243,9 +243,10 @@ class StreamerConfig:
     downsample_hz: float = 0.0
     data_dir: str = "biopac_rt/data"
     run_control: bool = True
-    use_multiprocess: bool = False
+    use_multiprocess: bool = True
     queue_max: int = 5000
     plot_queue_max: int = 1000
+    net_queue_max: int = 500
     # --- Offline reporting / behavior ---
     offline_status_every_s: float = 1.0   # print "I'm alive" line every N seconds
     handshake_grace_s: float = 2.0        # how long to wait for handshake after connect
@@ -555,6 +556,15 @@ def _put_with_drop(target_queue: mp.Queue, item) -> None:
             return
 
 
+def _drain_latest(source_queue: mp.Queue):
+    latest = None
+    try:
+        while True:
+            latest = source_queue.get_nowait()
+    except queue_mod.Empty:
+        return latest
+
+
 def _sample_source(config: StreamerConfig) -> Iterator[Tuple[float, float, float]]:
     if config.mode == "sim":
         return sim_samples(config.phys_fs, config.tr)
@@ -613,6 +623,89 @@ def _plotter_worker(
         log.warning("[PLOT] Plotter exited: %s", exc)
 
 
+def _net_worker(
+    host: str,
+    port: int,
+    connect_retry_s: float,
+    payload_queue: mp.Queue,
+    control_queue: mp.Queue,
+    stop_event: mp.Event,
+):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+    )
+    log = logging.getLogger("biopac_streamer.net")
+    sock = None
+    last_connect_attempt = 0.0
+    handshake_buffer = ""
+    net_connected = False
+
+    def _connect():
+        nonlocal sock, last_connect_attempt, handshake_buffer
+        now = time.monotonic()
+        if now - last_connect_attempt < connect_retry_s:
+            return
+        last_connect_attempt = now
+        try:
+            sock = socket.create_connection((host, port), timeout=2.0)
+            sock.settimeout(0.0)
+            log.info("[NET] Connected to RT PC %s:%s", host, port)
+            handshake_buffer = ""
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": True})
+        except OSError as exc:
+            if sock is not None:
+                sock.close()
+            sock = None
+            log.warning("[NET] Connection failed: %s", exc)
+            _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+
+    try:
+        while not stop_event.is_set():
+            if sock is None:
+                _connect()
+                time.sleep(0.05)
+                continue
+
+            tr_value, run_info, run_end, handshake_buffer = _poll_control(
+                sock, handshake_buffer, fallback_tr=0.0
+            )
+            if tr_value is not None:
+                _put_with_drop(control_queue, {"kind": "handshake", "tr": tr_value})
+            if run_info is not None:
+                _put_with_drop(
+                    control_queue,
+                    {
+                        "kind": "run_start",
+                        "subject": run_info.subject,
+                        "day": run_info.day,
+                        "run": run_info.run,
+                    },
+                )
+            if run_end:
+                _put_with_drop(control_queue, {"kind": "run_end"})
+
+            payload = _drain_latest(payload_queue)
+            if payload is None:
+                time.sleep(0.005)
+                continue
+
+            try:
+                sock.sendall((payload + "\n").encode("utf-8"))
+            except OSError as exc:
+                log.warning("[NET] Send failed: %s", exc)
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                sock = None
+                _put_with_drop(control_queue, {"kind": "net_status", "connected": False})
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 def sim_samples(sample_rate: float, tr: float) -> Iterator[Tuple[float, float, float]]:
     t0 = time.monotonic()
@@ -795,9 +888,12 @@ def run_streamer(config: StreamerConfig):
     mp_context = None
     acq_process = None
     plot_process = None
+    net_process = None
     stop_event = None
     sample_queue = None
     plot_queue = None
+    payload_queue = None
+    control_queue = None
 
     if config.use_multiprocess:
         mp_context = mp.get_context("spawn")
@@ -817,6 +913,21 @@ def run_streamer(config: StreamerConfig):
                 daemon=True,
             )
             plot_process.start()
+        payload_queue = mp_context.Queue(maxsize=max(1, int(config.net_queue_max)))
+        control_queue = mp_context.Queue(maxsize=max(1, int(config.queue_max)))
+        net_process = mp_context.Process(
+            target=_net_worker,
+            args=(
+                config.host,
+                config.port,
+                config.connect_retry_s,
+                payload_queue,
+                control_queue,
+                stop_event,
+            ),
+            daemon=True,
+        )
+        net_process.start()
     else:
         source = _sample_source(config)
 
@@ -894,6 +1005,8 @@ def run_streamer(config: StreamerConfig):
 
     def _maybe_connect():
         nonlocal sock, last_connect_attempt, handshake_done, handshake_buffer
+        if config.use_multiprocess:
+            return
         if sock is not None:
             return
         now = time.monotonic()
@@ -909,6 +1022,20 @@ def run_streamer(config: StreamerConfig):
                 log.info("[NET] Awaiting handshake (non-blocking).")
         except OSError as exc:
             log.warning("[NET] Connection failed: %s", exc)
+            sock = None
+
+    def _send_payload(payload: str):
+        nonlocal sock
+        if payload_queue is not None:
+            _put_with_drop(payload_queue, payload)
+            return
+        if sock is None:
+            return
+        try:
+            sock.sendall((payload + "\n").encode("utf-8"))
+        except OSError as exc:
+            log.warning("[NET] Send failed: %s", exc)
+            sock.close()
             sock = None
 
     if not run_control_enabled:
@@ -932,6 +1059,38 @@ def run_streamer(config: StreamerConfig):
                     break
                 sample_idx += 1
             raw_time = sample_idx / config.phys_fs
+
+            if control_queue is not None:
+                while True:
+                    try:
+                        msg = control_queue.get_nowait()
+                    except queue_mod.Empty:
+                        break
+                    kind = msg.get("kind")
+                    if kind == "handshake":
+                        try:
+                            config.tr = float(msg.get("tr", config.tr))
+                        except (TypeError, ValueError):
+                            config.tr = config.tr
+                        if retro._vol_idx == 0:
+                            retro.reset_start_time()
+                        handshake_done = True
+                        fixed_tr_allowed = True
+                        log.info("[NET] Handshake received (TR=%.3f).", config.tr)
+                    elif kind == "run_start":
+                        rt_control_seen = True
+                        info = RunInfo(
+                            str(msg.get("subject", "")),
+                            str(msg.get("day", "")),
+                            str(msg.get("run", "")),
+                        )
+                        if info.subject and info.day and info.run:
+                            _start_run(info, "rt")
+                    elif kind == "run_end":
+                        rt_control_seen = True
+                        _stop_run("rt")
+                    elif kind == "net_status":
+                        net_connected = bool(msg.get("connected", False))
 
             # Downsample resp/card if requested (trigger remains raw)
             have_phys = True
@@ -993,7 +1152,10 @@ def run_streamer(config: StreamerConfig):
             if config.offline_status_every_s and config.offline_status_every_s > 0:
                 if (now_m - last_status_t) >= config.offline_status_every_s:
                     last_status_t = now_m
-                    conn_state = "up" if sock is not None else "down"
+                    if control_queue is not None:
+                        conn_state = "up" if net_connected else "down"
+                    else:
+                        conn_state = "up" if sock is not None else "down"
                     # Show warmup progress for RetroTS
                     nsamp = len(retro._resp)
                     warm = f"warmup {nsamp}/{retro._min_samples}" if nsamp < retro._min_samples else "warm"
@@ -1022,7 +1184,7 @@ def run_streamer(config: StreamerConfig):
             # Handshake gating (only relevant if NO trigger channel)
             # ---------------------------------------------------------
             if config.trigger_channel is None and config.wait_for_handshake and not handshake_done:
-                if sock is not None:
+                if (net_connected if control_queue is not None else sock is not None):
                     # Start grace timer on first connect
                     if last_handshake_wait_start is None:
                         last_handshake_wait_start = time.monotonic()
@@ -1067,30 +1229,25 @@ def run_streamer(config: StreamerConfig):
                                 meta["samples_per_tr"],
                                 meta["nsamp_total"],
                                 regressors,
-                                "up" if sock is not None else "down",
+                                "up"
+                                if (net_connected if control_queue is not None else sock is not None)
+                                else "down",
                             )
-                        if sock is not None:
-                            payload = json.dumps({
-                                "kind": "retrots",
-                                "volume_idx": vol_idx,
-                                "n_regressors": len(regressors),
-                                "regressors": regressors,
-                                "timestamp": time.time(),
-                                "tr": meta["tr"],
-                                "phys_fs": meta["phys_fs"],
-                                "sample_idx": meta["sample_idx"],
-                                "nsamp_total": meta["nsamp_total"],
-                                "samples_per_tr": meta["samples_per_tr"],
-                            })
-                            try:
-                                sock.sendall((payload + "\n").encode("utf-8"))
-                            except OSError as exc:
-                                log.warning("[NET] Send failed: %s", exc)
-                                sock.close()
-                                sock = None
-                            else:
-                                if sent_writer is not None:
-                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        payload = json.dumps({
+                            "kind": "retrots",
+                            "volume_idx": vol_idx,
+                            "n_regressors": len(regressors),
+                            "regressors": regressors,
+                            "timestamp": time.time(),
+                            "tr": meta["tr"],
+                            "phys_fs": meta["phys_fs"],
+                            "sample_idx": meta["sample_idx"],
+                            "nsamp_total": meta["nsamp_total"],
+                            "samples_per_tr": meta["samples_per_tr"],
+                        })
+                        _send_payload(payload)
+                        if sent_writer is not None:
+                            sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
                 prev_trigger = trigger
             else:
                 if config.mode == "csv":
@@ -1111,31 +1268,25 @@ def run_streamer(config: StreamerConfig):
                                 meta["samples_per_tr"],
                                 meta["nsamp_total"],
                                 regressors,
-                                "up" if sock is not None else "down",
+                                "up"
+                                if (net_connected if control_queue is not None else sock is not None)
+                                else "down",
                             )
-                        if sock is not None:
-                            payload = json.dumps({
-                                "kind": "retrots",
-                                "volume_idx": vol_idx,
-                                "n_regressors": len(regressors),
-                                "regressors": regressors,
-                                "timestamp": time.time(),
-                                "tr": meta["tr"],
-                                "phys_fs": meta["phys_fs"],
-                                "sample_idx": meta["sample_idx"],
-                                "nsamp_total": meta["nsamp_total"],
-                                "samples_per_tr": meta["samples_per_tr"],
-                            })
-
-                            try:
-                                sock.sendall((payload + "\n").encode("utf-8"))
-                            except OSError as exc:
-                                log.warning("[NET] Send failed: %s", exc)
-                                sock.close()
-                                sock = None
-                            else:
-                                if sent_writer is not None:
-                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        payload = json.dumps({
+                            "kind": "retrots",
+                            "volume_idx": vol_idx,
+                            "n_regressors": len(regressors),
+                            "regressors": regressors,
+                            "timestamp": time.time(),
+                            "tr": meta["tr"],
+                            "phys_fs": meta["phys_fs"],
+                            "sample_idx": meta["sample_idx"],
+                            "nsamp_total": meta["nsamp_total"],
+                            "samples_per_tr": meta["samples_per_tr"],
+                        })
+                        _send_payload(payload)
+                        if sent_writer is not None:
+                            sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
 
                 else:
                     if not fixed_tr_allowed:
@@ -1154,31 +1305,25 @@ def run_streamer(config: StreamerConfig):
                                 meta["samples_per_tr"],
                                 meta["nsamp_total"],
                                 regressors,
-                                "up" if sock is not None else "down",
+                                "up"
+                                if (net_connected if control_queue is not None else sock is not None)
+                                else "down",
                             )
-                        if sock is not None:
-                            payload = json.dumps({
-                                "kind": "retrots",
-                                "volume_idx": vol_idx,
-                                "n_regressors": len(regressors),
-                                "regressors": regressors,
-                                "timestamp": time.time(),
-                                "tr": meta["tr"],
-                                "phys_fs": meta["phys_fs"],
-                                "sample_idx": meta["sample_idx"],
-                                "nsamp_total": meta["nsamp_total"],
-                                "samples_per_tr": meta["samples_per_tr"],
-                            })
-
-                            try:
-                                sock.sendall((payload + "\n").encode("utf-8"))
-                            except OSError as exc:
-                                log.warning("[NET] Send failed: %s", exc)
-                                sock.close()
-                                sock = None
-                            else:
-                                if sent_writer is not None:
-                                    sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        payload = json.dumps({
+                            "kind": "retrots",
+                            "volume_idx": vol_idx,
+                            "n_regressors": len(regressors),
+                            "regressors": regressors,
+                            "timestamp": time.time(),
+                            "tr": meta["tr"],
+                            "phys_fs": meta["phys_fs"],
+                            "sample_idx": meta["sample_idx"],
+                            "nsamp_total": meta["nsamp_total"],
+                            "samples_per_tr": meta["samples_per_tr"],
+                        })
+                        _send_payload(payload)
+                        if sent_writer is not None:
+                            sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
 
     finally:
         if stop_event is not None:
@@ -1187,6 +1332,8 @@ def run_streamer(config: StreamerConfig):
             acq_process.join(timeout=2.0)
         if plot_process is not None:
             plot_process.join(timeout=2.0)
+        if net_process is not None:
+            net_process.join(timeout=2.0)
         data_logger.stop_run()
         if samples_handle is not None:
             samples_handle.close()
@@ -1291,9 +1438,9 @@ def main():
         help="If >0, software-downsample resp/card to this Hz before RetroTS (trigger stays raw). Requires near-integer factor vs --phys-fs.",
     )
     parser.add_argument(
-        "--multiprocess",
+        "--no-multiprocess",
         action="store_true",
-        help="Run acquisition/plotting in separate processes to reduce lag.",
+        help="Disable multiprocessing (run acquisition/plotting in-process).",
     )
     parser.add_argument(
         "--queue-max",
@@ -1306,6 +1453,12 @@ def main():
         type=int,
         default=1000,
         help="Max samples to buffer for plotting.",
+    )
+    parser.add_argument(
+        "--net-queue-max",
+        type=int,
+        default=500,
+        help="Max messages to buffer for network sending.",
     )
 
     parser.add_argument("--offline-status-every-s", type=float, default=1.0,
@@ -1350,9 +1503,10 @@ def main():
         print_every=args.print_every,
         card_source=args.card_source,
         downsample_hz=args.downsample_hz,
-        use_multiprocess=args.multiprocess,
+        use_multiprocess=(not args.no_multiprocess),
         queue_max=args.queue_max,
         plot_queue_max=args.plot_queue_max,
+        net_queue_max=args.net_queue_max,
         offline_status_every_s=args.offline_status_every_s,
         handshake_grace_s=args.handshake_grace_s,
         allow_offline_fixed_tr=(not args.no_offline_fixed_tr),
