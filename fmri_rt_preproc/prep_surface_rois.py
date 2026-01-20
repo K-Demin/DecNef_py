@@ -64,6 +64,7 @@ def run_fastsurfer_full(
         f"--threads {threads} "
         f"--3T "
         f"--device {device}"
+        f"--seg_only"
     )
     log.info("Running FastSurfer in conda env '%s': %s", conda_env, cmd_str)
     run_in_conda(conda_env, cmd_str)

@@ -39,7 +39,7 @@ class RegressorSettings:
     enable_motion_regression: bool = True
     mot_reg: str = "mot6"
     max_poly_order: float = np.inf
-    TR: float = 1.4
+    TR: float = 1
     use_gs: bool = False
     use_wm: bool = True
     use_vent: bool = True
@@ -75,7 +75,7 @@ REGRESSOR_SETTINGS = RegressorSettings(
     enable_motion_regression=True,
     mot_reg="mot6",
     max_poly_order=np.inf,
-    TR=0.9,
+    TR=1,
     use_gs=False, # Probably it's better to avoid cause it correlates with global brain activity
     use_wm=True,
     use_vent=True,
@@ -136,7 +136,7 @@ class MotionRegressor:
         vent_mask: Optional[Path] = None,
         mot_reg: str = "mot6",
         max_poly_order: float = np.inf,
-        TR: float = 0.9,
+        TR: float = 1,
         max_scan_length: int = 1000,
         enable_fd_censor_reg: bool = False,
         enable_dvars_censor_reg: bool = False,
