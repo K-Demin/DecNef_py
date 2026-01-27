@@ -30,8 +30,9 @@ import logging
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
+from pathlib import Path
 
 import numpy as np
 
@@ -49,6 +50,7 @@ class BiopacReceiverConfig:
     subject: Optional[str] = None
     day: Optional[str] = None
     run: Optional[str] = None
+    output_path: Optional[Path] = None
 
 
 class BiopacRetroTSReceiver:
@@ -63,6 +65,8 @@ class BiopacRetroTSReceiver:
         self._missing_vols: set[int] = set()
         self._server_sock: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
+        self._output_ready = False
+        self._output_lock = threading.Lock()
 
     def start(self):
         if self._thread is not None:
@@ -226,6 +230,26 @@ class BiopacRetroTSReceiver:
                 self._n_reg = int(payload.get("n_regressors", reg.shape[0]))
             self._regressors_by_vol[vol_idx] = reg
             self._cond.notify_all()
+        self._append_received(vol_idx, reg, payload.get("timestamp"))
+        log.info("[BIOPAC] Received regressors for vol %s (%d values).", vol_idx, reg.shape[0])
+
+    def _append_received(self, vol_idx: int, reg: np.ndarray, timestamp: Optional[float]) -> None:
+        if self.config.output_path is None:
+            return
+        with self._output_lock:
+            path = Path(self.config.output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            exists = path.exists()
+            try:
+                with open(path, "a", newline="") as f:
+                    if not exists:
+                        header = ["volume_idx", "timestamp"] + [f"reg_{i+1:02d}" for i in range(reg.shape[0])]
+                        f.write(",".join(header) + "\n")
+                    ts = time.time() if timestamp is None else float(timestamp)
+                    row = [str(vol_idx), f"{ts:.6f}"] + [f"{v:.6f}" for v in reg.tolist()]
+                    f.write(",".join(row) + "\n")
+            except OSError as exc:
+                log.warning("[BIOPAC] Failed to write regressors CSV: %s", exc)
 
     def wait_for_volume(self, vol_idx: int, timeout: Optional[float] = None) -> bool:
         """
@@ -248,4 +272,3 @@ class BiopacRetroTSReceiver:
                     return False
                 self._cond.wait(timeout=min(0.5, remaining))
             return vol_idx in self._regressors_by_vol
-
