@@ -12,6 +12,12 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
 
     win = visual.Window(size=(1000, 700), color="black", units="pix")
     title = visual.TextStim(win, text="Real-time Scores", pos=(0, 300), color="white")
+    waiting_text = visual.TextStim(
+        win,
+        text="Waiting for scanner trigger ('s')...",
+        pos=(0, 0),
+        color="white",
+    )
 
     margins = {"left": 80, "right": 40, "bottom": 80, "top": 80}
     plot_width = win.size[0] - margins["left"] - margins["right"]
@@ -42,6 +48,18 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
 
     scores = deque(maxlen=max_points)
     needs_redraw = True
+
+    waiting = True
+    while waiting:
+        waiting_text.draw()
+        win.flip()
+        keys = event.getKeys()
+        if "s" in keys:
+            waiting = False
+        if "escape" in keys:
+            win.close()
+            return
+        core.wait(0.02)
 
     def update_plot() -> None:
         nonlocal needs_redraw

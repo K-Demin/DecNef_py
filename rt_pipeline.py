@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
+import queue
 
 import nibabel as nib
 import numpy as np
@@ -380,6 +381,11 @@ class DICOMHandler(FileSystemEventHandler):
         self.score_queue = score_queue
         self.biopac_receiver = None
         self._biopac_timeout = None
+        self._pending = queue.PriorityQueue()
+        self._pending_scans: set[int] = set()
+        self._processed_scans: set[int] = set()
+        self._retry_counts: dict[int, int] = {}
+        self._max_retries = 5
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -465,6 +471,7 @@ class DICOMHandler(FileSystemEventHandler):
                     subject=cfg.subject,
                     day=cfg.day,
                     run=cfg.run,
+                    output_path=self.cfg.rt_work_dir / "biopac_regressors_rx.csv",
                 )
                 self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
                 self._biopac_timeout = biopac_cfg.timeout
@@ -537,7 +544,34 @@ class DICOMHandler(FileSystemEventHandler):
 
         path = Path(event.src_path)
         log.info(f"[WATCHDOG] File detected: {path}")
-        self.process_file(path)
+        self.enqueue_path(path)
+
+    def enqueue_path(self, path: Path) -> None:
+        parsed = parse_dicom_name(path.name)
+        if parsed is None:
+            log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
+            return
+
+        _, run_id, scan = parsed
+        if run_id != self.current_run:
+            log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
+            return
+        if scan in self._processed_scans or scan in self._pending_scans:
+            return
+        self._pending.put((scan, path))
+        self._pending_scans.add(scan)
+
+    def next_pending(self, timeout: float = 0.1) -> Optional[tuple[int, Path]]:
+        try:
+            scan, path = self._pending.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        self._pending_scans.discard(scan)
+        return scan, path
+
+    def mark_processed(self, scan: int) -> None:
+        self._processed_scans.add(scan)
+        self._retry_counts.pop(scan, None)
 
     def process_file(self, path: Path):
         parsed = parse_dicom_name(path.name)
@@ -550,11 +584,32 @@ class DICOMHandler(FileSystemEventHandler):
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
 
+        if scan in self._processed_scans:
+            return
+
         volume_idx = self.next_volume_idx
-        self.next_volume_idx += 1
 
         log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={run_id}, scan={scan})")
-        process_volume(self.cfg, self, path, volume_idx)
+        ok = process_volume(self.cfg, self, path, volume_idx)
+        if ok:
+            self.next_volume_idx += 1
+            self.mark_processed(scan)
+        else:
+            retries = self._retry_counts.get(scan, 0) + 1
+            self._retry_counts[scan] = retries
+            if retries <= self._max_retries:
+                log.warning(
+                    "[WATCHDOG] Re-queueing scan %s (attempt %s/%s)",
+                    scan,
+                    retries,
+                    self._max_retries,
+                )
+                time.sleep(0.2)
+                self.enqueue_path(path)
+            else:
+                log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, retries)
+                self.next_volume_idx += 1
+                self.mark_processed(scan)
 
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC) ----------
@@ -575,22 +630,29 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
     if not raw_nii.exists():
-        run([
-            "dcm2niix",
-            "-z", "n",  # no gzip
-            "-s", "y",
-            "-b", "n",
-            "-f", f"vol_{volume_idx:05d}",
-            "-o", str(raw_dir),
-            str(dicom_path),
-        ])
+        if not wait_for_file_complete(dicom_path, timeout=5.0, interval=0.1):
+            log.error(f"[DICOM] vol {volume_idx:05d} FAILED (file not stable)")
+            return False
+        for attempt in range(3):
+            run([
+                "dcm2niix",
+                "-z", "n",  # no gzip
+                "-s", "y",
+                "-b", "n",
+                "-f", f"vol_{volume_idx:05d}",
+                "-o", str(raw_dir),
+                str(dicom_path),
+            ])
 
-        produced = sorted(raw_dir.glob(f"vol_{volume_idx:05d}*.nii*"))
-        if not produced:
+            produced = sorted(raw_dir.glob(f"vol_{volume_idx:05d}*.nii*"))
+            if produced:
+                raw_nii = produced[0]
+                break
+            log.warning("[DICOM] vol %05d conversion retry %d/3", volume_idx, attempt + 1)
+            time.sleep(0.2)
+        else:
             log.error(f"[DICOM] vol {volume_idx:05d} FAILED (no output)")
-            return
-
-        raw_nii = produced[0]
+            return False
 
     log_step("DICOM", volume_idx, start_t=t0)
 
@@ -603,7 +665,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         ok = unwarp_volume(raw_nii, unwarped_nii, cfg)
         if not ok:
             log.error(f"[FMAP] Failed unwarp for {raw_nii}")
-            return
+            return False
         log_step("FMAP", volume_idx, start_t=t0)
     else:
         log.info(f"[FMAP] Unwarp exists for vol {volume_idx}")
@@ -787,11 +849,11 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
     if not decoder_template.exists():
         log.error(f"Decoder template not found at {decoder_template}")
-        return
+        return False
 
     if not (warp_t1_mni.exists() and epi2t1.exists()):
         log.error(f"Missing transforms in {cfg.trans_dir}")
-        return
+        return False
 
     cmd = [
         "bash", "-lc",
@@ -846,6 +908,9 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
     except Exception as e:
         log.error(f"[SCORE] Failed scoring vol {volume_idx:05d}: {e}")
+        return False
+
+    return True
 
 
 
@@ -881,6 +946,29 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     return True
 
 
+def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0.1) -> bool:
+    """
+    Wait until file size is stable for two consecutive checks.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_size = -1
+    stable_hits = 0
+    while time.monotonic() < deadline:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            size = -1
+        if size > 0 and size == last_size:
+            stable_hits += 1
+            if stable_hits >= 2:
+                return True
+        else:
+            stable_hits = 0
+        last_size = size
+        time.sleep(interval)
+    return False
+
+
 
 
 # ---------- Main ----------
@@ -897,20 +985,29 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
+    observer.start()
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
-            event_handler.process_file(Path(f))
+            event_handler.enqueue_path(Path(f))
+
+        while True:
+            pending = event_handler.next_pending(timeout=0.2)
+            if pending is None:
+                break
+            _, path = pending
+            event_handler.process_file(path)
 
     if defer_biopac:
         event_handler.start_biopac()
 
     print("[RT] Switching to online mode.")
-    observer.start()
-    # observer.stop()
-    # event_handler.stop()
     try:
         while True:
+            pending = event_handler.next_pending(timeout=0.2)
+            if pending is not None:
+                _, path = pending
+                event_handler.process_file(path)
             time.sleep(0.2)
     except KeyboardInterrupt:
         observer.stop()
