@@ -1,17 +1,177 @@
 #!/usr/bin/env python
 import argparse
+import csv
+import json
+import random
 from collections import deque
-from multiprocessing import Process, Queue
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from multiprocessing import Queue
 from queue import Empty
 from pathlib import Path
 import multiprocessing as mp
 
 
-def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
+@dataclass(frozen=True)
+class Condition:
+    condition_id: str
+    roi: str
+    direction: str
+    symbol: str
+
+
+def _parse_csv_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _build_conditions(roi_labels: list[str], directions: list[str], symbols: list[str]) -> list[Condition]:
+    conditions: list[Condition] = []
+    for roi in roi_labels:
+        for direction in directions:
+            condition_id = f"{roi}_{direction}".lower().replace(" ", "_")
+            conditions.append(
+                Condition(
+                    condition_id=condition_id,
+                    roi=roi,
+                    direction=direction,
+                    symbol="",
+                )
+            )
+
+    if len(symbols) < len(conditions):
+        raise ValueError(
+            f"Need at least {len(conditions)} symbols, got {len(symbols)}"
+        )
+
+    enriched: list[Condition] = []
+    for cond, symbol in zip(conditions, symbols):
+        enriched.append(
+            Condition(
+                condition_id=cond.condition_id,
+                roi=cond.roi,
+                direction=cond.direction,
+                symbol=symbol,
+            )
+        )
+    return enriched
+
+
+def _load_or_create_schedule(
+    schedule_path: Path,
+    conditions: list[Condition],
+    seed: int | None = None,
+) -> dict:
+    if schedule_path.exists():
+        with open(schedule_path, "r", encoding="utf-8") as f:
+            schedule = json.load(f)
+        existing = {c["condition_id"] for c in schedule.get("conditions", [])}
+        expected = {cond.condition_id for cond in conditions}
+        if existing == expected and schedule.get("order"):
+            return schedule
+
+    rng = random.Random(seed)
+    condition_ids = [cond.condition_id for cond in conditions]
+    rng.shuffle(condition_ids)
+    schedule = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "order": condition_ids,
+        "conditions": [
+            {
+                "condition_id": cond.condition_id,
+                "roi": cond.roi,
+                "direction": cond.direction,
+                "symbol": cond.symbol,
+            }
+            for cond in conditions
+        ],
+    }
+    schedule_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(schedule_path, "w", encoding="utf-8") as f:
+        json.dump(schedule, f, indent=2)
+    return schedule
+
+
+def _condition_for_run(schedule: dict, run: str) -> Condition:
+    order = schedule["order"]
+    condition_lookup = {c["condition_id"]: c for c in schedule["conditions"]}
+    try:
+        run_idx = int(run) - 1
+    except ValueError:
+        run_idx = 0
+    if run_idx < 0:
+        run_idx = 0
+    if run_idx >= len(order):
+        run_idx = run_idx % len(order)
+    condition_id = order[run_idx]
+    cond = condition_lookup[condition_id]
+    return Condition(
+        condition_id=cond["condition_id"],
+        roi=cond["roi"],
+        direction=cond["direction"],
+        symbol=cond["symbol"],
+    )
+
+
+def _write_run_assignment(run_path: Path, condition: Condition, schedule_path: Path) -> None:
+    payload = {
+        "condition_id": condition.condition_id,
+        "roi": condition.roi,
+        "direction": condition.direction,
+        "symbol": condition.symbol,
+        "schedule_path": str(schedule_path),
+    }
+    run_path.mkdir(parents=True, exist_ok=True)
+    with open(run_path / "condition_assignment.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _append_condition_score(csv_path: Path, message: dict, condition: Condition) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(
+                [
+                    "volume_idx",
+                    "timestamp",
+                    "score_raw",
+                    "condition_id",
+                    "roi",
+                    "direction",
+                    "symbol",
+                ]
+            )
+        writer.writerow(
+            [
+                message.get("volume_idx"),
+                message.get("timestamp"),
+                message.get("score_raw"),
+                condition.condition_id,
+                condition.roi,
+                condition.direction,
+                condition.symbol,
+            ]
+        )
+
+
+def run_psychopy_presentation(
+    score_queue: Queue,
+    max_points: int,
+    condition: Condition,
+    condition_scores_path: Path,
+) -> None:
     from psychopy import core, event, visual
 
     win = visual.Window(size=(1000, 700), color="black", units="pix")
     title = visual.TextStim(win, text="Real-time Scores", pos=(0, 300), color="white")
+    condition_text = visual.TextStim(
+        win,
+        text=condition.symbol,
+        pos=(0, 200),
+        color="white",
+        height=80,
+    )
     waiting_text = visual.TextStim(
         win,
         text="Waiting for scanner trigger ('s')...",
@@ -100,6 +260,7 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
             while True:
                 message = score_queue.get_nowait()
                 scores.append(float(message["score_raw"]))
+                _append_condition_score(condition_scores_path, message, condition)
                 updated = True
         except Empty:
             pass
@@ -108,6 +269,7 @@ def run_psychopy_presentation(score_queue: Queue, max_points: int) -> None:
             update_plot()
             win.clearBuffer()
             title.draw()
+            condition_text.draw()
             x_axis.draw()
             y_axis.draw()
             score_line.draw()
@@ -156,6 +318,27 @@ def main() -> None:
         required=False,
         help="Optional decoder template path to override the default.",
     )
+    parser.add_argument(
+        "--roi-labels",
+        default="LPFC,Sensorimotor,EVC",
+        help="Comma-separated ROI labels for condition mapping.",
+    )
+    parser.add_argument(
+        "--direction-labels",
+        default="up,down",
+        help="Comma-separated regulation directions.",
+    )
+    parser.add_argument(
+        "--condition-symbols",
+        default="A,B,C,D,E,F",
+        help="Comma-separated symbols to display for each condition.",
+    )
+    parser.add_argument(
+        "--condition-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for condition order (per day).",
+    )
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, run_rt_pipeline
     cfg = RTSessionConfig(
@@ -167,13 +350,29 @@ def main() -> None:
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
     )
 
+    roi_labels = _parse_csv_list(args.roi_labels)
+    direction_labels = _parse_csv_list(args.direction_labels)
+    symbols = _parse_csv_list(args.condition_symbols)
+    conditions = _build_conditions(roi_labels, direction_labels, symbols)
+    schedule_path = cfg.day_root / "func" / "condition_schedule.json"
+    schedule = _load_or_create_schedule(schedule_path, conditions, seed=args.condition_seed)
+    condition = _condition_for_run(schedule, args.run)
+    run_dir = cfg.rt_work_dir
+    _write_run_assignment(run_dir, condition, schedule_path)
+    condition_scores_path = run_dir / "scores_with_conditions.csv"
+
     ctx = mp.get_context("spawn")
     score_queue = ctx.Queue(maxsize=100)
     pipeline_process = ctx.Process(target=run_rt_pipeline, args=(cfg, score_queue))
     pipeline_process.start()
 
     try:
-        run_psychopy_presentation(score_queue, args.max_points)
+        run_psychopy_presentation(
+            score_queue,
+            args.max_points,
+            condition,
+            condition_scores_path,
+        )
     finally:
         if pipeline_process.is_alive():
             pipeline_process.terminate()
