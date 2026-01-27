@@ -7,6 +7,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import nibabel as nib
 import numpy as np
@@ -64,6 +66,8 @@ class RegressorSettings:
     biopac_timeout: float = 0.3
     biopac_handshake: bool = True
     biopac_start_online_only: bool = False
+    max_workers: int = 6
+    max_retries: int = 3
 
 
 REGRESSOR_SETTINGS = RegressorSettings(
@@ -384,8 +388,9 @@ class DICOMHandler(FileSystemEventHandler):
         self._pending = queue.PriorityQueue()
         self._pending_scans: set[int] = set()
         self._processed_scans: set[int] = set()
-        self._retry_counts: dict[int, int] = {}
-        self._max_retries = 5
+        self._inflight_scans: set[int] = set()
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=REGRESSOR_SETTINGS.max_workers)
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -530,6 +535,7 @@ class DICOMHandler(FileSystemEventHandler):
     def stop(self):
         if self.biopac_receiver is not None:
             self.biopac_receiver.stop()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def start_biopac(self):
         if self.biopac_receiver is None:
@@ -571,7 +577,40 @@ class DICOMHandler(FileSystemEventHandler):
 
     def mark_processed(self, scan: int) -> None:
         self._processed_scans.add(scan)
-        self._retry_counts.pop(scan, None)
+
+    def submit_pending(self) -> bool:
+        pending = self.next_pending(timeout=0.0)
+        if pending is None:
+            return False
+        scan, path = pending
+        with self._lock:
+            if scan in self._processed_scans or scan in self._inflight_scans:
+                return True
+            volume_idx = self.next_volume_idx
+            self.next_volume_idx += 1
+            self._inflight_scans.add(scan)
+        self._executor.submit(self._process_scan, path, scan, volume_idx)
+        return True
+
+    def _process_scan(self, path: Path, scan: int, volume_idx: int) -> None:
+        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
+        ok = False
+        for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
+            ok = process_volume(self.cfg, self, path, volume_idx)
+            if ok:
+                break
+            log.warning(
+                "[WATCHDOG] Retry scan %s (attempt %s/%s)",
+                scan,
+                attempt,
+                REGRESSOR_SETTINGS.max_retries,
+            )
+            time.sleep(0.2)
+        if not ok:
+            log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
+        with self._lock:
+            self._inflight_scans.discard(scan)
+            self.mark_processed(scan)
 
     def process_file(self, path: Path):
         parsed = parse_dicom_name(path.name)
@@ -579,37 +618,14 @@ class DICOMHandler(FileSystemEventHandler):
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
             return
 
-        series_id, run_id, scan = parsed
+        _, run_id, scan = parsed
         if run_id != self.current_run:
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
 
         if scan in self._processed_scans:
             return
-
-        volume_idx = self.next_volume_idx
-
-        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={run_id}, scan={scan})")
-        ok = process_volume(self.cfg, self, path, volume_idx)
-        if ok:
-            self.next_volume_idx += 1
-            self.mark_processed(scan)
-        else:
-            retries = self._retry_counts.get(scan, 0) + 1
-            self._retry_counts[scan] = retries
-            if retries <= self._max_retries:
-                log.warning(
-                    "[WATCHDOG] Re-queueing scan %s (attempt %s/%s)",
-                    scan,
-                    retries,
-                    self._max_retries,
-                )
-                time.sleep(0.2)
-                self.enqueue_path(path)
-            else:
-                log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, retries)
-                self.next_volume_idx += 1
-                self.mark_processed(scan)
+        self.enqueue_path(path)
 
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC) ----------
@@ -990,13 +1006,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
             event_handler.enqueue_path(Path(f))
-
-        while True:
-            pending = event_handler.next_pending(timeout=0.2)
-            if pending is None:
-                break
-            _, path = pending
-            event_handler.process_file(path)
+        while event_handler.submit_pending():
+            continue
 
     if defer_biopac:
         event_handler.start_biopac()
@@ -1004,10 +1015,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     print("[RT] Switching to online mode.")
     try:
         while True:
-            pending = event_handler.next_pending(timeout=0.2)
-            if pending is not None:
-                _, path = pending
-                event_handler.process_file(path)
+            while event_handler.submit_pending():
+                continue
             time.sleep(0.2)
     except KeyboardInterrupt:
         observer.stop()
@@ -1145,6 +1154,18 @@ def main():
         default=REGRESSOR_SETTINGS.biopac_start_online_only,
         help="Defer BIOPAC receiver start until after offline DICOM processing.",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=REGRESSOR_SETTINGS.max_workers,
+        help="Maximum parallel processing workers for DICOM handling.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=REGRESSOR_SETTINGS.max_retries,
+        help="Maximum retries per DICOM if processing fails.",
+    )
     args = parser.parse_args()
 
     REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
@@ -1154,6 +1175,8 @@ def main():
     REGRESSOR_SETTINGS.biopac_phys_reg = args.biopac_phys_reg
     REGRESSOR_SETTINGS.biopac_handshake = args.biopac_handshake
     REGRESSOR_SETTINGS.biopac_start_online_only = args.biopac_start_online
+    REGRESSOR_SETTINGS.max_workers = args.max_workers
+    REGRESSOR_SETTINGS.max_retries = args.max_retries
 
     cfg = RTSessionConfig(
         subject=args.sub,
