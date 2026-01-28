@@ -3,6 +3,8 @@ import time
 import csv
 import logging
 import argparse
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -21,7 +23,11 @@ from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
-from biopac_rt.biopac_receiver import BiopacReceiverConfig, BiopacRetroTSReceiver
+from biopac_rt.biopac_receiver import (
+    BiopacReceiverConfig,
+    BiopacRetroTSReceiver,
+    BiopacRetroTSFileBuffer,
+)
 
 # ---------- Logging setup ----------
 logging.basicConfig(
@@ -66,6 +72,9 @@ class RegressorSettings:
     biopac_timeout: float = 0.3
     biopac_handshake: bool = True
     biopac_start_online_only: bool = False
+    biopac_mode: str = "tcp"
+    biopac_file: Optional[Path] = None
+    biopac_poll_interval: float = 0.05
     max_workers: int = 6
     max_retries: int = 3
 
@@ -342,6 +351,66 @@ class RTSessionConfig:
         return self.day_root / "func" / "trans" / "epi_mask_mean.nii"
 
 
+def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
+    return cfg.decoder_template or (
+        Path(cfg.base_data).parent
+        / "decoders"
+        / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
+    )
+
+
+def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None:
+    metadata_path = cfg.rt_work_dir / "session_metadata.json"
+    payload = {}
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    payload.update(
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "subject": cfg.subject,
+            "day": cfg.day,
+            "run": cfg.run,
+            "incoming_root": str(cfg.incoming_root),
+            "base_data": str(cfg.base_data),
+            "decoder_template": str(decoder_template),
+            "tr": REGRESSOR_SETTINGS.TR,
+            "regression": {
+                "enable_motion_regression": REGRESSOR_SETTINGS.enable_motion_regression,
+                "mot_reg": REGRESSOR_SETTINGS.mot_reg,
+                "max_poly_order": REGRESSOR_SETTINGS.max_poly_order,
+                "use_gs": REGRESSOR_SETTINGS.use_gs,
+                "use_wm": REGRESSOR_SETTINGS.use_wm,
+                "use_vent": REGRESSOR_SETTINGS.use_vent,
+                "enable_fd_censor_reg": REGRESSOR_SETTINGS.enable_fd_censor_reg,
+                "fd_thr": REGRESSOR_SETTINGS.fd_thr,
+                "enable_dvars_censor_reg": REGRESSOR_SETTINGS.enable_dvars_censor_reg,
+                "dvars_thr_robust_z": REGRESSOR_SETTINGS.dvars_thr_robust_z,
+                "censor_plus1": REGRESSOR_SETTINGS.censor_plus1,
+                "dvars_warmup": REGRESSOR_SETTINGS.dvars_warmup,
+                "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
+            },
+            "biopac": {
+                "enabled": REGRESSOR_SETTINGS.enable_biopac_physio,
+                "phys_reg": REGRESSOR_SETTINGS.biopac_phys_reg,
+                "mode": REGRESSOR_SETTINGS.biopac_mode,
+                "file": str(REGRESSOR_SETTINGS.biopac_file) if REGRESSOR_SETTINGS.biopac_file else None,
+                "host": REGRESSOR_SETTINGS.biopac_host,
+                "port": REGRESSOR_SETTINGS.biopac_port,
+                "timeout": REGRESSOR_SETTINGS.biopac_timeout,
+                "handshake": REGRESSOR_SETTINGS.biopac_handshake,
+                "start_online_only": REGRESSOR_SETTINGS.biopac_start_online_only,
+                "poll_interval": REGRESSOR_SETTINGS.biopac_poll_interval,
+            },
+        }
+    )
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 # ---------- Filename parsing ----------
 
 def parse_dicom_name(name: str):
@@ -478,21 +547,37 @@ class DICOMHandler(FileSystemEventHandler):
                     run=cfg.run,
                     output_path=self.cfg.rt_work_dir / "biopac_regressors_rx.csv",
                 )
-                self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
-                self._biopac_timeout = biopac_cfg.timeout
-                if start_biopac:
-                    self.biopac_receiver.start()
+                if REGRESSOR_SETTINGS.biopac_mode == "file":
+                    if REGRESSOR_SETTINGS.biopac_file is None:
+                        raise ValueError("[BIOPAC] biopac_mode=file requires biopac_file to be set.")
+                    rtp_physio = BiopacRetroTSFileBuffer(
+                        REGRESSOR_SETTINGS.biopac_file,
+                        timeout=biopac_cfg.timeout,
+                        expected_regressors=expected_regressors,
+                        poll_interval=REGRESSOR_SETTINGS.biopac_poll_interval,
+                    )
+                    phys_reg = REGRESSOR_SETTINGS.biopac_phys_reg
+                    log.info(
+                        "[BIOPAC] Using file-backed physio regressors (%s) from %s",
+                        phys_reg,
+                        REGRESSOR_SETTINGS.biopac_file,
+                    )
                 else:
-                    biopac_cfg.timeout = 0.0
-                    log.info("[BIOPAC] Deferring receiver start until online mode.")
-                phys_reg = REGRESSOR_SETTINGS.biopac_phys_reg
-                rtp_physio = self.biopac_receiver
-                log.info(
-                    "[BIOPAC] Enabled physio regressors (%s) on %s:%s",
-                    phys_reg,
-                    biopac_cfg.host,
-                    biopac_cfg.port,
-                )
+                    self.biopac_receiver = BiopacRetroTSReceiver(biopac_cfg)
+                    self._biopac_timeout = biopac_cfg.timeout
+                    if start_biopac:
+                        self.biopac_receiver.start()
+                    else:
+                        biopac_cfg.timeout = 0.0
+                        log.info("[BIOPAC] Deferring receiver start until online mode.")
+                    phys_reg = REGRESSOR_SETTINGS.biopac_phys_reg
+                    rtp_physio = self.biopac_receiver
+                    log.info(
+                        "[BIOPAC] Enabled physio regressors (%s) on %s:%s",
+                        phys_reg,
+                        biopac_cfg.host,
+                        biopac_cfg.port,
+                    )
 
         if REGRESSOR_SETTINGS.enable_motion_regression:
             self.motion_regressor = MotionRegressor(
@@ -519,11 +604,7 @@ class DICOMHandler(FileSystemEventHandler):
             self.motion_regressor._regress.mask_src_proc = self.proc_src
 
         # --- Decoder / scorer ---
-        decoder_path = cfg.decoder_template or (
-            Path(cfg.base_data).parent
-            / "decoders"
-            / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
-        )
+        decoder_path = resolve_decoder_template(cfg)
         roi_txt = cfg.trans_dir / "ROI_DECODER.txt"
 
         self.scorer = DecoderScorer(
@@ -857,11 +938,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
     warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
     epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-    decoder_template = cfg.decoder_template or (
-        Path(cfg.base_data).parent
-        / "decoders"
-        / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
-    )
+    decoder_template = resolve_decoder_template(cfg)
 
     if not decoder_template.exists():
         log.error(f"Decoder template not found at {decoder_template}")
@@ -990,6 +1067,8 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 # ---------- Main ----------
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
+    decoder_template = resolve_decoder_template(cfg)
+    write_session_metadata(cfg, decoder_template)
     # Process existing DICOMs first (offline-style), but only for this run
     existing = sorted(cfg.incoming_dir.glob("*.dcm"))
     defer_biopac = REGRESSOR_SETTINGS.biopac_start_online_only and bool(existing)
@@ -1143,6 +1222,23 @@ def main():
         help="Physio regressor family to expect from BIOPAC stream.",
     )
     parser.add_argument(
+        "--biopac-mode",
+        default=REGRESSOR_SETTINGS.biopac_mode,
+        choices=["tcp", "file"],
+        help="BIOPAC input mode: tcp (listen on socket) or file (tail CSV).",
+    )
+    parser.add_argument(
+        "--biopac-file",
+        default=None,
+        help="Path to BIOPAC regressors CSV when using --biopac-mode=file.",
+    )
+    parser.add_argument(
+        "--biopac-poll",
+        type=float,
+        default=REGRESSOR_SETTINGS.biopac_poll_interval,
+        help="Polling interval (seconds) for file-backed BIOPAC buffer.",
+    )
+    parser.add_argument(
         "--biopac-handshake",
         action="store_true",
         default=REGRESSOR_SETTINGS.biopac_handshake,
@@ -1175,6 +1271,9 @@ def main():
     REGRESSOR_SETTINGS.biopac_phys_reg = args.biopac_phys_reg
     REGRESSOR_SETTINGS.biopac_handshake = args.biopac_handshake
     REGRESSOR_SETTINGS.biopac_start_online_only = args.biopac_start_online
+    REGRESSOR_SETTINGS.biopac_mode = args.biopac_mode
+    REGRESSOR_SETTINGS.biopac_file = Path(args.biopac_file) if args.biopac_file else None
+    REGRESSOR_SETTINGS.biopac_poll_interval = args.biopac_poll
     REGRESSOR_SETTINGS.max_workers = args.max_workers
     REGRESSOR_SETTINGS.max_retries = args.max_retries
 

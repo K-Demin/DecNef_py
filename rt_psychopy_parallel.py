@@ -10,6 +10,7 @@ from multiprocessing import Queue
 from queue import Empty
 from pathlib import Path
 import multiprocessing as mp
+import time
 
 
 @dataclass(frozen=True)
@@ -56,10 +57,18 @@ def _build_conditions(roi_labels: list[str], directions: list[str], symbols: lis
     return enriched
 
 
+def _shuffle_symbols(symbols: list[str], seed: int | None) -> list[str]:
+    rng = random.Random(seed)
+    shuffled = symbols[:]
+    rng.shuffle(shuffled)
+    return shuffled
+
+
 def _load_or_create_schedule(
     schedule_path: Path,
     conditions: list[Condition],
     seed: int | None = None,
+    symbol_seed: int | None = None,
 ) -> dict:
     if schedule_path.exists():
         with open(schedule_path, "r", encoding="utf-8") as f:
@@ -74,6 +83,7 @@ def _load_or_create_schedule(
     rng.shuffle(condition_ids)
     schedule = {
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "symbol_seed": symbol_seed,
         "order": condition_ids,
         "conditions": [
             {
@@ -153,6 +163,41 @@ def _append_condition_score(csv_path: Path, message: dict, condition: Condition)
                 condition.symbol,
             ]
         )
+
+
+def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
+    metadata_path = run_dir / "session_metadata.json"
+    data = {}
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data.update(payload)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -> None:
+    from biopac_rt.biopac_receiver import BiopacRetroTSReceiver
+
+    receiver = BiopacRetroTSReceiver(config)
+    receiver.start()
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.1)
+    finally:
+        receiver.stop()
+
+
+def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
+    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+
+    for key, value in settings.items():
+        if hasattr(REGRESSOR_SETTINGS, key):
+            setattr(REGRESSOR_SETTINGS, key, value)
+    run_rt_pipeline(cfg, score_queue)
 
 
 def run_psychopy_presentation(
@@ -339,8 +384,77 @@ def main() -> None:
         default=None,
         help="Optional random seed for condition order (per day).",
     )
+    parser.add_argument(
+        "--symbol-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for symbol assignment (per subject).",
+    )
+    parser.add_argument(
+        "--biopac-enable",
+        action="store_true",
+        help="Enable BIOPAC RetroTS regressors via TCP/file input.",
+    )
+    parser.add_argument(
+        "--biopac-host",
+        default="0.0.0.0",
+        help="Host to bind BIOPAC receiver.",
+    )
+    parser.add_argument(
+        "--biopac-port",
+        type=int,
+        default=15000,
+        help="Port to bind BIOPAC receiver.",
+    )
+    parser.add_argument(
+        "--biopac-timeout",
+        type=float,
+        default=0.3,
+        help="Seconds to wait for physio regressors before zero-fill.",
+    )
+    parser.add_argument(
+        "--biopac-phys-reg",
+        default="RICOR8",
+        choices=["RICOR8", "RVT5", "RVT+RICOR13"],
+        help="Physio regressor family to expect from BIOPAC stream.",
+    )
+    parser.add_argument(
+        "--biopac-handshake",
+        action="store_true",
+        default=True,
+        help="Send a handshake with TR to the BIOPAC streamer.",
+    )
+    parser.add_argument(
+        "--biopac-start-online",
+        action="store_true",
+        default=False,
+        help="Defer BIOPAC receiver start until after offline DICOM processing.",
+    )
+    parser.add_argument(
+        "--biopac-mode",
+        default="tcp",
+        choices=["tcp", "file"],
+        help="BIOPAC input mode: tcp (listen on socket) or file (tail CSV).",
+    )
+    parser.add_argument(
+        "--biopac-file",
+        default=None,
+        help="Path to BIOPAC regressors CSV when using --biopac-mode=file.",
+    )
+    parser.add_argument(
+        "--biopac-poll",
+        type=float,
+        default=0.05,
+        help="Polling interval (seconds) for file-backed BIOPAC buffer.",
+    )
+    parser.add_argument(
+        "--biopac-listener",
+        action="store_true",
+        help="Spawn a dedicated BIOPAC listener process that writes regressors to CSV.",
+    )
     args = parser.parse_args()
-    from rt_pipeline import RTSessionConfig, run_rt_pipeline
+    from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
+    from biopac_rt.biopac_receiver import BiopacReceiverConfig
     cfg = RTSessionConfig(
         subject=args.sub,
         day=args.day,
@@ -350,20 +464,108 @@ def main() -> None:
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
     )
 
+    pca_root = cfg.day_root / "PCA"
+    if args.decoder_template is None and not pca_root.exists():
+        raise FileNotFoundError(
+            f"PCA folder not found at {pca_root}. "
+            "Provide --decoder-template or run PCA preparation first."
+        )
+
+    settings_payload = {
+        "enable_biopac_physio": args.biopac_enable,
+        "biopac_host": args.biopac_host,
+        "biopac_port": args.biopac_port,
+        "biopac_timeout": args.biopac_timeout,
+        "biopac_phys_reg": args.biopac_phys_reg,
+        "biopac_handshake": args.biopac_handshake,
+        "biopac_start_online_only": args.biopac_start_online,
+        "biopac_mode": args.biopac_mode,
+        "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
+        "biopac_poll_interval": args.biopac_poll,
+    }
+
     roi_labels = _parse_csv_list(args.roi_labels)
     direction_labels = _parse_csv_list(args.direction_labels)
     symbols = _parse_csv_list(args.condition_symbols)
+    symbol_seed = args.symbol_seed
+    if symbol_seed is None:
+        try:
+            symbol_seed = int(args.sub)
+        except ValueError:
+            symbol_seed = None
+    symbols = _shuffle_symbols(symbols, symbol_seed)
     conditions = _build_conditions(roi_labels, direction_labels, symbols)
-    schedule_path = cfg.day_root / "func" / "condition_schedule.json"
-    schedule = _load_or_create_schedule(schedule_path, conditions, seed=args.condition_seed)
+    schedule_path = cfg.subject_root / "condition_schedule.json"
+    schedule = _load_or_create_schedule(
+        schedule_path,
+        conditions,
+        seed=args.condition_seed,
+        symbol_seed=symbol_seed,
+    )
     condition = _condition_for_run(schedule, args.run)
     run_dir = cfg.rt_work_dir
     _write_run_assignment(run_dir, condition, schedule_path)
     condition_scores_path = run_dir / "scores_with_conditions.csv"
 
+    _merge_session_metadata(
+        run_dir,
+        {
+            "psychopy": {
+                "max_points": args.max_points,
+                "roi_labels": roi_labels,
+                "direction_labels": direction_labels,
+                "condition_symbols": symbols,
+                "condition_seed": args.condition_seed,
+                "symbol_seed": symbol_seed,
+                "condition_schedule": str(schedule_path),
+                "condition_assignment": {
+                    "condition_id": condition.condition_id,
+                    "roi": condition.roi,
+                    "direction": condition.direction,
+                    "symbol": condition.symbol,
+                },
+            }
+        },
+    )
+
     ctx = mp.get_context("spawn")
     score_queue = ctx.Queue(maxsize=100)
-    pipeline_process = ctx.Process(target=run_rt_pipeline, args=(cfg, score_queue))
+    biopac_process = None
+    biopac_stop = None
+    if args.biopac_listener:
+        if not args.biopac_enable:
+            raise ValueError("--biopac-listener requires --biopac-enable")
+        if args.biopac_mode != "file":
+            raise ValueError("--biopac-listener requires --biopac-mode=file")
+        biopac_output = settings_payload["biopac_file"] or (run_dir / "biopac_regressors_rx.csv")
+        settings_payload["biopac_file"] = biopac_output
+        biopac_stop = ctx.Event()
+        expected_regressors = {
+            "RICOR8": 8,
+            "RVT5": 5,
+            "RVT+RICOR13": 13,
+        }.get(args.biopac_phys_reg, 8)
+        biopac_cfg = BiopacReceiverConfig(
+            host=args.biopac_host,
+            port=args.biopac_port,
+            timeout=args.biopac_timeout,
+            expected_regressors=expected_regressors,
+            handshake_tr=REGRESSOR_SETTINGS.TR if args.biopac_handshake else None,
+            subject=args.sub,
+            day=args.day,
+            run=args.run,
+            output_path=biopac_output,
+        )
+        biopac_process = ctx.Process(
+            target=_run_biopac_listener,
+            args=(biopac_cfg, biopac_stop),
+        )
+        biopac_process.start()
+
+    pipeline_process = ctx.Process(
+        target=_run_pipeline_with_settings,
+        args=(cfg, score_queue, settings_payload),
+    )
     pipeline_process.start()
 
     try:
@@ -377,6 +579,10 @@ def main() -> None:
         if pipeline_process.is_alive():
             pipeline_process.terminate()
         pipeline_process.join(timeout=5)
+        if biopac_stop is not None:
+            biopac_stop.set()
+        if biopac_process is not None:
+            biopac_process.join(timeout=5)
 
 
 if __name__ == "__main__":

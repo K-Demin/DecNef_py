@@ -272,3 +272,108 @@ class BiopacRetroTSReceiver:
                     return False
                 self._cond.wait(timeout=min(0.5, remaining))
             return vol_idx in self._regressors_by_vol
+
+
+class BiopacRetroTSFileBuffer:
+    """Read RetroTS regressors from a continuously written CSV file."""
+
+    def __init__(
+        self,
+        path: Path,
+        timeout: float = 0.3,
+        expected_regressors: Optional[int] = None,
+        poll_interval: float = 0.05,
+    ) -> None:
+        self.path = Path(path)
+        self.timeout = timeout
+        self.expected_regressors = expected_regressors
+        self.poll_interval = poll_interval
+        self._lock = threading.Lock()
+        self._regressors_by_vol: dict[int, np.ndarray] = {}
+        self._missing_vols: set[int] = set()
+        self._n_reg: Optional[int] = None
+        self._file_pos = 0
+        self._header_skipped = False
+        self._remainder = ""
+
+    def _ensure_regressor_count(self) -> int:
+        if self._n_reg is not None:
+            return self._n_reg
+        if self.expected_regressors is not None:
+            self._n_reg = self.expected_regressors
+            return self._n_reg
+        self._n_reg = 8
+        return self._n_reg
+
+    def _update_from_file(self) -> None:
+        if not self.path.exists():
+            return
+        with self._lock:
+            with open(self.path, "r", encoding="utf-8") as f:
+                f.seek(self._file_pos)
+                chunk = f.read()
+                self._file_pos = f.tell()
+        if not chunk:
+            return
+        chunk = f"{self._remainder}{chunk}"
+        if chunk and not chunk.endswith("\n"):
+            chunk, self._remainder = chunk.rsplit("\n", 1)
+        else:
+            self._remainder = ""
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if not self._header_skipped:
+                if line.lower().startswith("volume_idx"):
+                    self._header_skipped = True
+                    continue
+                self._header_skipped = True
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if len(parts) < 3:
+                continue
+            try:
+                vol_idx = int(parts[0])
+            except ValueError:
+                continue
+            try:
+                reg_vals = [float(v) for v in parts[2:]]
+            except ValueError:
+                continue
+            reg = np.asarray(reg_vals, dtype=np.float32)
+            if reg.ndim != 1:
+                continue
+            if self._n_reg is None:
+                self._n_reg = reg.shape[0]
+            self._regressors_by_vol[vol_idx] = reg
+
+    def wait_for_volume(self, vol_idx: int, timeout: Optional[float] = None) -> bool:
+        wait_time = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + max(0.0, wait_time)
+        while time.monotonic() < deadline:
+            self._update_from_file()
+            if vol_idx in self._regressors_by_vol:
+                return True
+            time.sleep(self.poll_interval)
+        return vol_idx in self._regressors_by_vol
+
+    def get_retrots(self, TR: float, vol_idx: int, tshift: float, timeout: Optional[float] = None):
+        self.wait_for_volume(vol_idx, timeout=timeout)
+        self._update_from_file()
+        n_reg = self._ensure_regressor_count()
+        retro = np.zeros((vol_idx, n_reg), dtype=np.float32)
+        for idx, reg in self._regressors_by_vol.items():
+            if 1 <= idx <= vol_idx:
+                retro[idx - 1, : reg.shape[0]] = reg
+        if vol_idx not in self._regressors_by_vol:
+            if vol_idx not in self._missing_vols:
+                log.warning(
+                    "[BIOPAC] Missing physio regressors for vol %s in file; using zeros.",
+                    vol_idx,
+                )
+            self._missing_vols.add(vol_idx)
+        return retro
+
+    def was_missing(self, vol_idx: int) -> bool:
+        with self._lock:
+            return vol_idx in self._missing_vols
