@@ -116,6 +116,46 @@ def append_score(csv_path: Path, volume_idx: int, raw_score: float) -> float:
         writer.writerow([volume_idx, timestamp, raw_score])
     return timestamp
 
+
+def append_score_z(
+    csv_path: Path,
+    volume_idx: int,
+    timestamp: float,
+    raw_score: float,
+    z_score: float,
+    ref_stats: dict,
+) -> None:
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(
+                [
+                    "volume_idx",
+                    "timestamp",
+                    "score_raw",
+                    "score_z",
+                    "ref_run",
+                    "ref_mean",
+                    "ref_std",
+                    "ref_n",
+                    "ref_used_reg_ready",
+                ]
+            )
+        writer.writerow(
+            [
+                volume_idx,
+                timestamp,
+                raw_score,
+                z_score,
+                ref_stats["run"],
+                ref_stats["mean"],
+                ref_stats["std"],
+                ref_stats["n"],
+                int(ref_stats.get("used_reg_ready", False)),
+            ]
+        )
+
 def append_motion(motion_path: Path, motion_vec: np.ndarray):
     """
     Append a single 6-parameter motion vector to a text file (AFNI-style 1D).
@@ -266,6 +306,8 @@ class RTSessionConfig:
     incoming_root: Path
     base_data: Path
     decoder_template: Optional[Path] = None
+    reference_score_run: Optional[str] = None
+    reference_score_stats: Optional[dict] = None
 
     @property
     def subject_root(self) -> Path:
@@ -359,6 +401,77 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     )
 
 
+def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> Optional[dict]:
+    if not run_id:
+        return None
+    run_dir = cfg.day_root / "func" / str(run_id)
+    scores_path = run_dir / "scores.csv"
+    if not scores_path.exists():
+        log.warning("[SCORE] Reference scores.csv not found at %s", scores_path)
+        return None
+
+    reg_ready_map = None
+    reg_status_path = run_dir / "regression_status_rt.csv"
+    if reg_status_path.exists():
+        reg_ready_map = {}
+        with open(reg_status_path, newline="") as f:
+            reader = csv.DictReader(f)
+            if "volume_idx" in reader.fieldnames and "reg_ready" in reader.fieldnames:
+                for row in reader:
+                    try:
+                        vol = int(row["volume_idx"])
+                        reg_ready_map[vol] = bool(int(row["reg_ready"]))
+                    except (TypeError, ValueError):
+                        continue
+            else:
+                log.warning("[SCORE] reg_ready column missing in %s", reg_status_path)
+                reg_ready_map = None
+
+    scores = []
+    scores_all = []
+    with open(scores_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                raw = float(row["score_raw"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if np.isnan(raw):
+                continue
+            scores_all.append(raw)
+            if reg_ready_map is None or reg_ready_map.get(vol - 1, False):
+                scores.append(raw)
+
+    used_reg_ready = reg_ready_map is not None
+    if used_reg_ready and not scores:
+        log.warning(
+            "[SCORE] No reg_ready scores found in %s; falling back to all scores.",
+            scores_path,
+        )
+        scores = scores_all
+        used_reg_ready = False
+
+    if len(scores) < 2:
+        log.warning("[SCORE] Not enough reference scores in %s to compute z-score.", scores_path)
+        return None
+
+    values = np.asarray(scores, dtype=float)
+    mean = float(np.nanmean(values))
+    std = float(np.nanstd(values))
+    if not np.isfinite(std) or std <= 0:
+        log.warning("[SCORE] Reference score std invalid (%s) in %s.", std, scores_path)
+        return None
+
+    return {
+        "run": str(run_id),
+        "mean": mean,
+        "std": std,
+        "n": int(len(scores)),
+        "used_reg_ready": used_reg_ready,
+    }
+
+
 def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None:
     metadata_path = cfg.rt_work_dir / "session_metadata.json"
     payload = {}
@@ -377,6 +490,8 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "incoming_root": str(cfg.incoming_root),
             "base_data": str(cfg.base_data),
             "decoder_template": str(decoder_template),
+            "reference_score_run": cfg.reference_score_run,
+            "reference_score_stats": cfg.reference_score_stats,
             "tr": REGRESSOR_SETTINGS.TR,
             "regression": {
                 "enable_motion_regression": REGRESSOR_SETTINGS.enable_motion_regression,
@@ -463,6 +578,16 @@ class DICOMHandler(FileSystemEventHandler):
         self._online_mode = False
         self._biopac_started = start_biopac
         self._biopac_run_started = False
+        self.reference_score_stats = cfg.reference_score_stats
+        if self.reference_score_stats is not None:
+            log.info(
+                "[SCORE] Using reference run %s (mean=%.4f, std=%.4f, n=%s, reg_ready=%s)",
+                self.reference_score_stats["run"],
+                self.reference_score_stats["mean"],
+                self.reference_score_stats["std"],
+                self.reference_score_stats["n"],
+                self.reference_score_stats.get("used_reg_ready", False),
+            )
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -999,19 +1124,35 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(mni_data)
         timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
+        z_score = None
+        if handler.reference_score_stats is not None:
+            stats = handler.reference_score_stats
+            z_score = (raw_score - stats["mean"]) / stats["std"]
+            append_score_z(
+                cfg.rt_work_dir / "scores_z.csv",
+                volume_idx,
+                timestamp,
+                raw_score,
+                z_score,
+                stats,
+            )
         if handler.score_queue is not None:
             try:
-                handler.score_queue.put_nowait(
-                    {
-                        "volume_idx": volume_idx,
-                        "timestamp": timestamp,
-                        "score_raw": raw_score,
-                    }
-                )
+                payload = {
+                    "volume_idx": volume_idx,
+                    "timestamp": timestamp,
+                    "score_raw": raw_score,
+                }
+                if z_score is not None:
+                    payload["score_z"] = z_score
+                handler.score_queue.put_nowait(payload)
             except Exception as exc:
                 log.error(f"[SCORE] Failed to enqueue score for vol {volume_idx:05d}: {exc}")
 
-        extra = f"raw={raw_score:.4f}"
+        if z_score is None:
+            extra = f"raw={raw_score:.4f}"
+        else:
+            extra = f"raw={raw_score:.4f} z={z_score:.4f}"
 
         log_step("SCORE", volume_idx, extra, start_t=t0)
 
@@ -1084,6 +1225,7 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
+    cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
     # Process existing DICOMs first (offline-style), but only for this run
     existing = []
@@ -1201,6 +1343,11 @@ def main():
     parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
     parser.add_argument("--run", required=True, help="Run number, e.g. 4 (matches 000004 in DICOM name)")
     parser.add_argument(
+        "--rs",
+        dest="reference_score_run",
+        help="Reference run ID for z-scoring (uses scores.csv from that run).",
+    )
+    parser.add_argument(
         "--incoming-root",
         required=False,
         default="/home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya",
@@ -1308,6 +1455,7 @@ def main():
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        reference_score_run=args.reference_score_run,
     )
 
     if not cfg.incoming_dir.exists():
