@@ -382,7 +382,7 @@ def main() -> None:
         "--condition-seed",
         type=int,
         default=None,
-        help="Optional random seed for condition order (per day).",
+        help="Optional random seed for condition order (per day)."
     )
     parser.add_argument(
         "--symbol-seed",

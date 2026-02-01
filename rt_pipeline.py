@@ -65,7 +65,7 @@ class RegressorSettings:
     dvars_mask_source: str = "ref_mask"  # "ref_mask" uses cfg.rt_ref_mask
 
     # --- BIOPAC physio regressors (RETROTS) ---
-    enable_biopac_physio: bool = False
+    enable_biopac_physio: bool = True
     biopac_phys_reg: str = "RICOR8"
     biopac_host: str = "0.0.0.0"
     biopac_port: int = 15000
