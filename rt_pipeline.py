@@ -460,6 +460,9 @@ class DICOMHandler(FileSystemEventHandler):
         self._inflight_scans: set[int] = set()
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=REGRESSOR_SETTINGS.max_workers)
+        self._online_mode = False
+        self._biopac_started = start_biopac
+        self._biopac_run_started = False
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -624,6 +627,13 @@ class DICOMHandler(FileSystemEventHandler):
         if self._biopac_timeout is not None:
             self.biopac_receiver.config.timeout = self._biopac_timeout
         self.biopac_receiver.start()
+        self._biopac_started = True
+        if self._online_mode and not self._biopac_run_started:
+            self.biopac_receiver.send_run_start()
+            self._biopac_run_started = True
+
+    def enable_online_mode(self) -> None:
+        self._online_mode = True
 
     def on_created(self, event):
         if event.is_directory:
@@ -643,6 +653,12 @@ class DICOMHandler(FileSystemEventHandler):
         if run_id != self.current_run:
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
+        if self._online_mode and not self._biopac_run_started:
+            if not self._biopac_started:
+                self.start_biopac()
+            elif self.biopac_receiver is not None:
+                self.biopac_receiver.send_run_start()
+                self._biopac_run_started = True
         if scan in self._processed_scans or scan in self._pending_scans:
             return
         self._pending.put((scan, path))
@@ -1070,8 +1086,15 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
     write_session_metadata(cfg, decoder_template)
     # Process existing DICOMs first (offline-style), but only for this run
-    existing = sorted(cfg.incoming_dir.glob("*.dcm"))
-    defer_biopac = REGRESSOR_SETTINGS.biopac_start_online_only and bool(existing)
+    existing = []
+    for path in sorted(cfg.incoming_dir.glob("*.dcm")):
+        parsed = parse_dicom_name(path.name)
+        if parsed is None:
+            continue
+        _, run_id, _ = parsed
+        if run_id == int(cfg.run):
+            existing.append(path)
+    defer_biopac = bool(existing) or REGRESSOR_SETTINGS.biopac_start_online_only
     event_handler = DICOMHandler(
         cfg,
         score_queue=score_queue,
@@ -1089,10 +1112,11 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
             continue
 
     if defer_biopac:
-        event_handler.start_biopac()
+        event_handler.enable_online_mode()
 
     print("[RT] Switching to online mode.")
     try:
+        event_handler.enable_online_mode()
         while True:
             while event_handler.submit_pending():
                 continue

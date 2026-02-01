@@ -1335,10 +1335,7 @@ def run_streamer(config: StreamerConfig):
                     _stop_run("rt")
 
             if run_control_enabled and not run_active:
-                if sock is None and not data_logger.active and not rt_control_seen:
-                    _start_run(None, "offline")
-                else:
-                    continue
+                continue
 
             # Ingest resp/card (possibly downsampled) into RetroTS buffers
             if have_phys:

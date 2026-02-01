@@ -157,7 +157,6 @@ class BiopacRetroTSReceiver:
                         conn.sendall((payload + "\n").encode("utf-8"))
                     except OSError:
                         log.warning("[BIOPAC] Failed to send handshake.")
-                self._send_run_start()
                 with conn:
                     conn.settimeout(0.5)
                     buffer = ""
@@ -192,6 +191,9 @@ class BiopacRetroTSReceiver:
             "timestamp": time.time(),
         }
         self._send_control(payload)
+
+    def send_run_start(self):
+        self._send_run_start()
 
     def _send_run_end(self):
         payload = {
