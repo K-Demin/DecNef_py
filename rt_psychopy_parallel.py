@@ -253,6 +253,7 @@ def run_psychopy_presentation(
 
     scores = deque(maxlen=max_points)
     needs_redraw = True
+    reg_ready_seen = False
 
     waiting = True
     while waiting:
@@ -270,7 +271,10 @@ def run_psychopy_presentation(
         nonlocal needs_redraw
         if not scores:
             score_line.vertices = [(origin_x, origin_y), (origin_x, origin_y)]
-            last_score_text.text = "Waiting for scores…"
+            if reg_ready_seen:
+                last_score_text.text = "Waiting for scores…"
+            else:
+                last_score_text.text = "Waiting for regression…"
             needs_redraw = True
             return
 
@@ -304,9 +308,13 @@ def run_psychopy_presentation(
         try:
             while True:
                 message = score_queue.get_nowait()
-                scores.append(float(message["score_raw"]))
-                _append_condition_score(condition_scores_path, message, condition)
-                updated = True
+                if message.get("reg_ready", True):
+                    reg_ready_seen = True
+                    scores.append(float(message["score_raw"]))
+                    _append_condition_score(condition_scores_path, message, condition)
+                    updated = True
+                else:
+                    updated = True
         except Empty:
             pass
 
