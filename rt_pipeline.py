@@ -574,7 +574,17 @@ class DICOMHandler(FileSystemEventHandler):
         self._processed_scans: set[int] = set()
         self._inflight_scans: set[int] = set()
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=REGRESSOR_SETTINGS.max_workers)
+        max_workers = int(REGRESSOR_SETTINGS.max_workers)
+        if max_workers > 10:
+            log.warning(
+                "[WATCHDOG] max_workers=%d is high for realtime offline mode; capping to 10.",
+                max_workers,
+            )
+            max_workers = 10
+        if max_workers < 1:
+            log.warning("[WATCHDOG] max_workers=%d is invalid; using 1.", max_workers)
+            max_workers = 1
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._online_mode = False
         self._biopac_started = start_biopac
         self._biopac_run_started = False
@@ -1142,6 +1152,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                     "volume_idx": volume_idx,
                     "timestamp": timestamp,
                     "score_raw": raw_score,
+                    "reg_ready": reg_ready,
                 }
                 if z_score is not None:
                     payload["score_z"] = z_score

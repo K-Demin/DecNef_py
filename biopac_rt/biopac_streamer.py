@@ -1334,9 +1334,6 @@ def run_streamer(config: StreamerConfig):
                     rt_control_seen = True
                     _stop_run("rt")
 
-            if run_control_enabled and not run_active:
-                continue
-
             # Ingest resp/card (possibly downsampled) into RetroTS buffers
             if have_phys:
                 for _, resp_use, card_use in downsampled_points:
@@ -1379,11 +1376,7 @@ def run_streamer(config: StreamerConfig):
                         retro._vol_idx,
                     )
 
-            # Logging/plot stays RAW (so you can inspect real signals)
-            if run_active:
-                data_logger.log_sample(resp, card, trigger)
-            if samples_writer is not None:
-                samples_writer.writerow([time.time(), resp, card, trigger])
+            # Plot should stay live even before run control starts
             plot_points: List[Tuple[float, float, float, float]] = []
             if plot_resp_ds is not None and plot_card_ds is not None and plot_trigger_ds is not None:
                 resp_plot = plot_resp_ds.step(ts, resp)
@@ -1403,6 +1396,15 @@ def run_streamer(config: StreamerConfig):
             if plot_queue is not None:
                 for point in plot_points:
                     _put_with_drop(plot_queue, point)
+
+            if run_control_enabled and not run_active:
+                continue
+
+            # Logging stays RAW (so you can inspect real signals)
+            if run_active:
+                data_logger.log_sample(resp, card, trigger)
+            if samples_writer is not None:
+                samples_writer.writerow([time.time(), resp, card, trigger])
 
             # ---------------------------------------------------------
             # Handshake gating (only relevant if NO trigger channel)
