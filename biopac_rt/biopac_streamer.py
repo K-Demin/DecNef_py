@@ -230,6 +230,7 @@ class StreamerConfig:
     trigger_channel: Optional[int] = None
     trigger_threshold: float = 1.0
     trigger_min_interval: float = 0.0
+    use_trigger_for_volumes: bool = True
     log_samples_csv: Optional[str] = None
     log_sent_csv: Optional[str] = None
     log_regressors_csv: Optional[str] = None
@@ -1424,9 +1425,10 @@ def run_streamer(config: StreamerConfig):
                 samples_writer.writerow([time.time(), resp, card, trigger])
 
             # ---------------------------------------------------------
-            # Handshake gating (only relevant if NO trigger channel)
+            # Handshake gating (only relevant if we are not using trigger gating)
             # ---------------------------------------------------------
-            if config.trigger_channel is None and config.wait_for_handshake and not handshake_done:
+            use_trigger = bool(config.trigger_channel is not None and config.use_trigger_for_volumes)
+            if not use_trigger and config.wait_for_handshake and not handshake_done:
                 if (net_connected if control_queue is not None else sock is not None):
                     # Start grace timer on first connect
                     if last_handshake_wait_start is None:
@@ -1444,7 +1446,7 @@ def run_streamer(config: StreamerConfig):
                 fixed_tr_allowed = True
 
 
-            if config.trigger_channel is not None:
+            if use_trigger:
                 trigger_now = trigger >= config.trigger_threshold
                 trigger_prev = prev_trigger >= config.trigger_threshold
                 if trigger_now and not trigger_prev:
@@ -1606,6 +1608,11 @@ def main():
     parser.add_argument("--card-channel", type=int, default=14, help="BIOPAC card channel (1-16).")
     parser.add_argument("--trigger-channel", type=int, default = None, help="BIOPAC trigger channel (1-16).")
     parser.add_argument(
+        "--trigger-plot-only",
+        action="store_true",
+        help="Acquire/plot trigger channel but do not use it for volume timing.",
+    )
+    parser.add_argument(
         "--trigger-threshold",
         type=float,
         default=1.0,
@@ -1740,6 +1747,7 @@ def main():
         trigger_channel=args.trigger_channel, 
         trigger_threshold=args.trigger_threshold,
         trigger_min_interval=(args.trigger_min_interval if args.trigger_min_interval is not None else args.tr * 0.9),
+        use_trigger_for_volumes=not args.trigger_plot_only,
         log_samples_csv=args.log_samples_csv,
         log_sent_csv=args.log_sent_csv,
         log_regressors_csv=args.log_regressors_csv,

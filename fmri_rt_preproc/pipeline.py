@@ -207,13 +207,20 @@ class FMRIRealtimePreprocessor:
         ensure_dir(self.fmap_dir)
         ap = self.cfg.ap_file
         pa = self.cfg.pa_file
+        ap_mc_gz = self.fmap_dir / "AP_mc.nii.gz"
+        pa_mc_gz = self.fmap_dir / "PA_mc.nii.gz"
         ap_mean_gz = self.fmap_dir / "AP_mean.nii.gz"
         pa_mean_gz = self.fmap_dir / "PA_mean.nii.gz"
 
+        if not ap_mc_gz.exists():
+            run(["mcflirt", "-in", str(ap), "-out", str(ap_mc_gz), "-refvol", "0"])
+        if not pa_mc_gz.exists():
+            run(["mcflirt", "-in", str(pa), "-out", str(pa_mc_gz), "-refvol", "0"])
+
         if not ap_mean_gz.exists():
-            run(["fslmaths", str(ap), "-Tmean", str(ap_mean_gz)])
+            run(["fslmaths", str(ap_mc_gz), "-Tmean", str(ap_mean_gz)])
         if not pa_mean_gz.exists():
-            run(["fslmaths", str(pa), "-Tmean", str(pa_mean_gz)])
+            run(["fslmaths", str(pa_mc_gz), "-Tmean", str(pa_mean_gz)])
 
         gunzip_python(ap_mean_gz)
         gunzip_python(pa_mean_gz)
