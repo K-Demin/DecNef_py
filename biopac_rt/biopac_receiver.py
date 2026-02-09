@@ -61,6 +61,7 @@ class BiopacRetroTSReceiver:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._regressors_by_vol: dict[int, np.ndarray] = {}
+        self._timestamps_by_vol: dict[int, float] = {}
         self._n_reg: Optional[int] = None
         self._missing_vols: set[int] = set()
         self._server_sock: Optional[socket.socket] = None
@@ -117,6 +118,10 @@ class BiopacRetroTSReceiver:
     def was_missing(self, vol_idx: int) -> bool:
         with self._lock:
             return vol_idx in self._missing_vols
+
+    def get_trigger_timestamp(self, vol_idx: int) -> Optional[float]:
+        with self._lock:
+            return self._timestamps_by_vol.get(vol_idx)
 
     def _ensure_regressor_count(self) -> int:
         if self._n_reg is not None:
@@ -234,6 +239,12 @@ class BiopacRetroTSReceiver:
             if self._n_reg is None:
                 self._n_reg = int(payload.get("n_regressors", reg.shape[0]))
             self._regressors_by_vol[vol_idx] = reg
+            ts = payload.get("timestamp")
+            if ts is not None:
+                try:
+                    self._timestamps_by_vol[vol_idx] = float(ts)
+                except (TypeError, ValueError):
+                    pass
             self._cond.notify_all()
         self._append_received(vol_idx, reg, payload.get("timestamp"))
         log.info("[BIOPAC] Received regressors for vol %s (%d values).", vol_idx, reg.shape[0])

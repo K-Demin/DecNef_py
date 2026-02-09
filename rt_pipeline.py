@@ -75,6 +75,7 @@ class RegressorSettings:
     biopac_mode: str = "tcp"
     biopac_file: Optional[Path] = None
     biopac_poll_interval: float = 0.05
+    biopac_timelag: bool = False
     max_workers: int = 6
     max_retries: int = 3
 
@@ -589,6 +590,9 @@ class DICOMHandler(FileSystemEventHandler):
         self._online_mode = False
         self._biopac_started = start_biopac
         self._biopac_run_started = False
+        self._biopac_timelag_sum = 0.0
+        self._biopac_timelag_count = 0
+        self._biopac_timelag_path = self.cfg.rt_work_dir / "biopac_timelag.csv"
         self.reference_score_stats = cfg.reference_score_stats
         if self.reference_score_stats is not None:
             log.info(
@@ -879,7 +883,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     """
 
     # ---------- 1) DICOM -> raw NIfTI ----------
-    t0 = time.time()
+    volume_timestamp = time.time()
+    t0 = volume_timestamp
 
     raw_dir = cfg.rt_raw_dir
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
@@ -1088,6 +1093,21 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         reg_ready,
         biopac_missing,
     )
+    if REGRESSOR_SETTINGS.biopac_timelag and handler.biopac_receiver is not None:
+        trigger_ts = handler.biopac_receiver.get_trigger_timestamp(volume_idx)
+        if trigger_ts is not None:
+            timelag = volume_timestamp - trigger_ts
+            handler._biopac_timelag_sum += timelag
+            handler._biopac_timelag_count += 1
+            avg_timelag = handler._biopac_timelag_sum / handler._biopac_timelag_count
+            append_biopac_timelag(
+                handler._biopac_timelag_path,
+                volume_idx,
+                trigger_ts,
+                volume_timestamp,
+                timelag,
+                avg_timelag,
+            )
 
     # ---------- 3) Apply ANTs transforms to MNI ----------
     t0 = time.time()
@@ -1363,6 +1383,39 @@ def append_regression_status(
         w.writerow([volume_idx, fd, dvars, dvars_z, fd_censor, dvars_censor, int(reg_ready), int(biopac_missing)])
 
 
+def append_biopac_timelag(
+    path: Path,
+    volume_idx: int,
+    trigger_timestamp: float,
+    volume_timestamp: float,
+    timelag_s: float,
+    avg_timelag_s: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if not exists:
+            w.writerow(
+                [
+                    "volume_idx",
+                    "trigger_timestamp",
+                    "volume_timestamp",
+                    "timelag_s",
+                    "avg_timelag_s",
+                ]
+            )
+        w.writerow(
+            [
+                volume_idx,
+                f"{trigger_timestamp:.6f}",
+                f"{volume_timestamp:.6f}",
+                f"{timelag_s:.6f}",
+                f"{avg_timelag_s:.6f}",
+            ]
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Real-time fMRI watcher pipeline")
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
@@ -1453,6 +1506,12 @@ def main():
         help="Defer BIOPAC receiver start until after offline DICOM processing.",
     )
     parser.add_argument(
+        "--biopac-timelag",
+        action="store_true",
+        default=REGRESSOR_SETTINGS.biopac_timelag,
+        help="Log per-volume trigger-to-volume timelag and running average.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=REGRESSOR_SETTINGS.max_workers,
@@ -1476,6 +1535,7 @@ def main():
     REGRESSOR_SETTINGS.biopac_mode = args.biopac_mode
     REGRESSOR_SETTINGS.biopac_file = Path(args.biopac_file) if args.biopac_file else None
     REGRESSOR_SETTINGS.biopac_poll_interval = args.biopac_poll
+    REGRESSOR_SETTINGS.biopac_timelag = args.biopac_timelag
     REGRESSOR_SETTINGS.max_workers = args.max_workers
     REGRESSOR_SETTINGS.max_retries = args.max_retries
 
