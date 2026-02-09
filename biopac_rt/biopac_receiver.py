@@ -195,6 +195,9 @@ class BiopacRetroTSReceiver:
     def send_run_start(self):
         self._send_run_start()
 
+    def send_run_end(self):
+        self._send_run_end()
+
     def _send_run_end(self):
         payload = {
             "kind": "run_end",

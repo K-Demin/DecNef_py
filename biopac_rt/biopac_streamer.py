@@ -251,6 +251,7 @@ class StreamerConfig:
     offline_status_every_s: float = 1.0   # print "I'm alive" line every N seconds
     handshake_grace_s: float = 2.0        # how long to wait for handshake after connect
     allow_offline_fixed_tr: bool = True   # if wait_for_handshake but no RT PC, still emit locally
+    idle_stop_after_s: float = 20.0       # stop run if no regressors emitted for this long
 
 class _IntFactorDownsampler:
     """
@@ -1151,20 +1152,22 @@ def run_streamer(config: StreamerConfig):
     last_connect_attempt = 0.0
     handshake_buffer = ""
     run_log_dir = None
+    last_regressor_t = None
 
     def _start_run(info: Optional[RunInfo], reason: str):
-        nonlocal run_active, run_info, prev_trigger, last_trigger_time, run_log_dir
+        nonlocal run_active, run_info, prev_trigger, last_trigger_time, run_log_dir, last_regressor_t
         retro.reset_for_run()
         prev_trigger = 0.0
         last_trigger_time = None
         run_info = info
         run_log_dir = data_logger.start_run(info)
+        last_regressor_t = time.monotonic()
         run_active = True
         label = "offline" if info is None else f"{info.subject}/{info.day}/run{info.run}"
         log.info("[RUN] Started (%s) for %s in %s", reason, label, run_log_dir)
 
     def _stop_run(reason: str):
-        nonlocal run_active, run_info, run_log_dir
+        nonlocal run_active, run_info, run_log_dir, last_regressor_t
         if not run_active and not data_logger.active:
             return
         data_logger.stop_run()
@@ -1172,6 +1175,7 @@ def run_streamer(config: StreamerConfig):
         log.info("[RUN] Stopped (%s).", reason)
         run_info = None
         run_log_dir = None
+        last_regressor_t = None
 
     def _maybe_connect():
         nonlocal sock, last_connect_attempt, handshake_done, handshake_buffer
@@ -1351,6 +1355,19 @@ def run_streamer(config: StreamerConfig):
                         retro._card.append(card_use)
                         retro._sample_idx += 1
 
+            if (
+                run_active
+                and config.idle_stop_after_s
+                and last_regressor_t is not None
+                and (time.monotonic() - last_regressor_t) >= config.idle_stop_after_s
+            ):
+                log.warning(
+                    "[RUN] No regressors emitted for %.1fs; stopping run.",
+                    config.idle_stop_after_s,
+                )
+                _stop_run("idle-timeout")
+                continue
+
             # -----------------------------
             # Offline heartbeat / warmup
             # -----------------------------
@@ -1474,6 +1491,7 @@ def run_streamer(config: StreamerConfig):
                         _send_payload(payload)
                         if sent_writer is not None:
                             sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        last_regressor_t = time.monotonic()
                 prev_trigger = trigger
             else:
                 if config.mode == "csv":
@@ -1513,6 +1531,7 @@ def run_streamer(config: StreamerConfig):
                         _send_payload(payload)
                         if sent_writer is not None:
                             sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        last_regressor_t = time.monotonic()
 
                 else:
                     if not fixed_tr_allowed:
@@ -1550,6 +1569,7 @@ def run_streamer(config: StreamerConfig):
                         _send_payload(payload)
                         if sent_writer is not None:
                             sent_writer.writerow([time.time(), vol_idx, meta["tr"], meta["sample_idx"], meta["nsamp_total"], meta["samples_per_tr"], regressors])
+                        last_regressor_t = time.monotonic()
 
     finally:
         if stop_event is not None:
@@ -1695,6 +1715,8 @@ def main():
                         help="If set, and --wait-for-handshake is enabled (no trigger), do not emit fixed-TR volumes until handshake arrives.")
     parser.add_argument("--data-dir", default="biopac_rt/data",
                         help="Base directory for run data logs.")
+    parser.add_argument("--idle-stop-after-s", type=float, default=20.0,
+                        help="Stop run if no regressors are emitted for this long (0 disables).")
     parser.add_argument("--no-run-control", action="store_true",
                         help="Disable run start/stop control messages from the RT PC.")
 
@@ -1737,6 +1759,7 @@ def main():
         handshake_grace_s=args.handshake_grace_s,
         allow_offline_fixed_tr=(not args.no_offline_fixed_tr),
         data_dir=args.data_dir,
+        idle_stop_after_s=args.idle_stop_after_s,
         run_control=(not args.no_run_control),
 
     )

@@ -753,6 +753,8 @@ class DICOMHandler(FileSystemEventHandler):
 
     def stop(self):
         if self.biopac_receiver is not None:
+            if self._biopac_run_started:
+                self.biopac_receiver.send_run_end()
             self.biopac_receiver.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
 
