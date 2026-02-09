@@ -11,6 +11,9 @@ from queue import Empty
 from pathlib import Path
 import multiprocessing as mp
 import time
+from typing import Optional
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -179,6 +182,77 @@ def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
+    reg_path = run_dir / "regression_status_rt.csv"
+    if not reg_path.exists():
+        return None
+    with open(reg_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+            return None
+        reg_ready_map: dict[int, bool] = {}
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                reg_ready_map[vol] = bool(int(row["reg_ready"]))
+            except (TypeError, ValueError):
+                continue
+    return reg_ready_map
+
+
+def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    scores_path = run_dir / "scores.csv"
+    motion_path = run_dir / "motion_rt.1D"
+    if not scores_path.exists() or not motion_path.exists():
+        return
+
+    reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+
+    vols = []
+    scores = []
+    with open(scores_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                score = float(row["score_raw"])
+            except (TypeError, ValueError):
+                continue
+            if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            vols.append(vol)
+            scores.append(score)
+
+    if not scores:
+        return
+
+    motion = np.loadtxt(motion_path)
+    if motion.ndim == 1:
+        motion = motion[None, :]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    axes[0].plot(vols, scores, label="Decoder score (regressed)")
+    axes[0].set_xlabel("Volume")
+    axes[0].set_ylabel("Score")
+    axes[0].legend(loc="upper right")
+
+    for idx in range(min(motion.shape[1], 6)):
+        axes[1].plot(motion[:, idx], label=f"Motion {idx + 1}")
+    axes[1].set_xlabel("Volume")
+    axes[1].set_ylabel("Motion")
+    axes[1].legend(loc="upper right", ncol=3, fontsize=8)
+
+    fig.tight_layout()
+    out_png = run_dir / "qc_scores_motion.png"
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
 def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -> None:
     from biopac_rt.biopac_receiver import BiopacRetroTSReceiver
 
@@ -205,6 +279,7 @@ def run_psychopy_presentation(
     max_points: int,
     condition: Condition,
     condition_scores_path: Path,
+    max_trs: Optional[int],
 ) -> None:
     from psychopy import core, event, visual
 
@@ -254,6 +329,7 @@ def run_psychopy_presentation(
     scores = deque(maxlen=max_points)
     needs_redraw = True
     reg_ready_seen = False
+    seen_vols: set[int] = set()
 
     waiting = True
     while waiting:
@@ -308,6 +384,9 @@ def run_psychopy_presentation(
         try:
             while True:
                 message = score_queue.get_nowait()
+                vol_idx = int(message.get("volume_idx", 0))
+                if vol_idx:
+                    seen_vols.add(vol_idx)
                 if message.get("reg_ready", True):
                     reg_ready_seen = True
                     scores.append(float(message["score_raw"]))
@@ -317,6 +396,9 @@ def run_psychopy_presentation(
                     updated = True
         except Empty:
             pass
+
+        if max_trs is not None and len(seen_vols) >= max_trs:
+            break
 
         if updated or needs_redraw:
             update_plot()
@@ -460,6 +542,12 @@ def main() -> None:
         action="store_true",
         help="Spawn a dedicated BIOPAC listener process that writes regressors to CSV.",
     )
+    parser.add_argument(
+        "--max-trs",
+        type=int,
+        default=None,
+        help="Stop the run after this many TRs (or press ESC).",
+    )
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
@@ -582,6 +670,7 @@ def main() -> None:
             args.max_points,
             condition,
             condition_scores_path,
+            args.max_trs,
         )
     finally:
         if pipeline_process.is_alive():
@@ -591,6 +680,7 @@ def main() -> None:
             biopac_stop.set()
         if biopac_process is not None:
             biopac_process.join(timeout=5)
+        _plot_qc(run_dir)
 
 
 if __name__ == "__main__":
