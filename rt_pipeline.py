@@ -308,6 +308,7 @@ class RTSessionConfig:
     decoder_template: Optional[Path] = None
     reference_score_run: Optional[str] = None
     reference_score_stats: Optional[dict] = None
+    enable_scoring: bool = True
 
     @property
     def subject_root(self) -> Path:
@@ -742,14 +743,18 @@ class DICOMHandler(FileSystemEventHandler):
             self.motion_regressor._regress.mask_src_proc = self.proc_src
 
         # --- Decoder / scorer ---
-        decoder_path = resolve_decoder_template(cfg)
-        roi_txt = cfg.trans_dir / "ROI_DECODER.txt"
+        if cfg.enable_scoring:
+            decoder_path = resolve_decoder_template(cfg)
+            roi_txt = cfg.trans_dir / "ROI_DECODER.txt"
 
-        self.scorer = DecoderScorer(
-            decoder_path,
-            roi_txt=roi_txt,
-            n_baseline=20,   # keep your current baseline length
-        )
+            self.scorer = DecoderScorer(
+                decoder_path,
+                roi_txt=roi_txt,
+                n_baseline=20,   # keep your current baseline length
+            )
+        else:
+            log.info("[SCORE] Scoring disabled; skipping decoder initialization.")
+            self.scorer = None
 
     def stop(self):
         if self.biopac_receiver is not None:
@@ -1120,6 +1125,14 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     run(cmd)
     log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
 
+    if not cfg.enable_scoring:
+        if handler.score_queue is not None:
+            try:
+                handler.score_queue.put_nowait({"volume_idx": volume_idx})
+            except Exception as exc:
+                log.error(f"[SCORE] Failed to enqueue volume {volume_idx:05d}: {exc}")
+        return True
+
     # ---------- 4) Decoder scoring ----------
     t0 = time.time()
     try:
@@ -1378,6 +1391,11 @@ def main():
         help="Optional decoder template path to override the default.",
     )
     parser.add_argument(
+        "--no-score",
+        action="store_true",
+        help="Disable decoder scoring (still runs motion correction + warps).",
+    )
+    parser.add_argument(
         "--biopac-enable",
         action="store_true",
         help="Enable BIOPAC RetroTS regressors via TCP.",
@@ -1469,6 +1487,7 @@ def main():
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
         reference_score_run=args.reference_score_run,
+        enable_scoring=not args.no_score,
     )
 
     if not cfg.incoming_dir.exists():

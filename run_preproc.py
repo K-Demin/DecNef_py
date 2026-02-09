@@ -254,6 +254,12 @@ def main():
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 0001")
     parser.add_argument("--day", required=True, help="Session/day label, e.g. 3")
     parser.add_argument(
+        "--base-data",
+        type=Path,
+        default=BASE_DATA,
+        help="Root data directory (default: ./data).",
+    )
+    parser.add_argument(
         "--epi-pattern",
         default="*.nii*",
         help="Glob pattern for raw EPI files inside the run dir (default: '*.nii*').",
@@ -291,7 +297,7 @@ def main():
     args = parser.parse_args()
 
     # data/sub-0001/3
-    day_root = BASE_DATA / f"sub-{args.sub}" / args.day
+    day_root = args.base_data / f"sub-{args.sub}" / args.day
     func_root = day_root / "func"
     run_dir = func_root / "trans"   # we treat 'trans' as the single run folder
 
