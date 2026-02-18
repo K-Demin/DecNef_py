@@ -549,6 +549,17 @@ def main() -> None:
         type=int,
         default=None,
         help="Stop the run after this many TRs (or press ESC).",
+
+    )
+    parser.add_argument(
+        "--rs",
+        dest="reference_score_run",
+        help="Reference run ID for z-scoring (uses scores.csv from that run).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        help="Maximum parallel processing workers for DICOM handling.",
     )
     parser.add_argument(
         "--settings-file",

@@ -1425,7 +1425,7 @@ def append_biopac_timelag(
         w.writerow(
             [
                 volume_idx,
-                f"{trigger_timestamp:.6f}",
+                f"{trigger_timestxp:.6f}",
                 f"{volume_timestamp:.6f}",
                 f"{timelag_s:.6f}",
                 f"{avg_timelag_s:.6f}",

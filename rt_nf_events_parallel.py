@@ -13,6 +13,21 @@ import numpy as np
 
 from rt_global_settings import load_regressor_settings
 
+# python rt_nf_events_parallel.py \
+#   --sub 00086 \
+#   --day 3 \
+#   --run 4 \
+#   --incoming-root /path/to/incoming \
+#   --base-data /SSD2/DecNef \
+#   --n-trials 20 \
+#   --baseline-trs 20 \
+#   --iti-trs 3 \
+#   --cue-trs 4 \
+#   --scans-trs 3 \
+#   --delay-trs 3 \
+#   --feedback-trs 3 \
+#   --score-delay 3 \
+#   --settings-file /path/to/rt_settings.json \
 
 def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
     metadata_path = run_dir / "session_metadata.json"
@@ -302,7 +317,7 @@ def main() -> None:
     parser.add_argument(
         "--score-delay",
         type=int,
-        default=0,
+        default=3,
         help="TRs to wait after cue onset before score-window accumulation starts.",
     )
     parser.add_argument(
