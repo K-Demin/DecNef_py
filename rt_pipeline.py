@@ -131,6 +131,42 @@ class ProcSrc:
     def __init__(self):
         self.proc_data = None
 
+
+class RTPStyleVoxelNormalizer:
+    """
+    Lightweight voxel-wise intensity scaling that matches RTPSpy's Y_mean scaling.
+
+    When motion regression is disabled we still output volumes in percent-signal
+    style units by dividing each voxel by a fixed reference mean and multiplying
+    by 100 (with RTPSpy's clipping/zero-mask behavior).
+    """
+
+    def __init__(self, ref_volumes: int = 1):
+        self.ref_volumes = max(1, int(ref_volumes))
+        self._sum: Optional[np.ndarray] = None
+        self._count = 0
+        self._y_mean: Optional[np.ndarray] = None
+        self._y_mean_mask: Optional[np.ndarray] = None
+
+    def apply(self, vol_data: np.ndarray) -> np.ndarray:
+        data = np.asarray(vol_data, dtype=np.float32)
+
+        if self._count < self.ref_volumes:
+            if self._sum is None:
+                self._sum = np.zeros_like(data, dtype=np.float64)
+            self._sum += data
+            self._count += 1
+            self._y_mean = (self._sum / float(self._count)).astype(np.float32)
+            self._y_mean_mask = np.abs(self._y_mean) > 1e-6
+            if self._count >= self.ref_volumes:
+                self._sum = None
+
+        out = np.zeros_like(data, dtype=np.float32)
+        mask = self._y_mean_mask
+        out[mask] = data[mask] / self._y_mean[mask] * 100.0
+        out[out > 200.0] = 200.0
+        return out
+
 class MotionRegressor:
     def __init__(
         self,
@@ -142,16 +178,18 @@ class MotionRegressor:
         max_poly_order: float = np.inf,
         TR: float = 1,
         max_scan_length: int = 1000,
+        norm_ref_volumes: int = 1,
         enable_fd_censor_reg: bool = False,
         enable_dvars_censor_reg: bool = False,
         phys_reg: str = "None",
         rtp_physio: Optional[object] = None,
     ):
+        wait_num = max(0, int(norm_ref_volumes) - 1)
         kwargs = dict(
             mot_reg=mot_reg,
             volreg=volreg,
             TR=TR,
-            wait_num=0,
+            wait_num=wait_num,
             max_poly_order=max_poly_order,
             save_proc=False,
             online_saving=False,
@@ -459,6 +497,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
                 "dvars_warmup": REGRESSOR_SETTINGS.dvars_warmup,
                 "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
                 "analysis_space": REGRESSOR_SETTINGS.analysis_space,
+                "voxel_norm_ref_volumes": REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
             },
             "biopac": {
                 "enabled": REGRESSOR_SETTINGS.enable_biopac_physio,
@@ -682,6 +721,7 @@ class DICOMHandler(FileSystemEventHandler):
                 max_poly_order=REGRESSOR_SETTINGS.max_poly_order,
                 TR=REGRESSOR_SETTINGS.TR,
                 max_scan_length=1000,  # or your typical max TR count for a run
+                norm_ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
                 enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
                 enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
                 phys_reg=phys_reg,
@@ -690,6 +730,10 @@ class DICOMHandler(FileSystemEventHandler):
         else:
             log.info("[REG] Motion regression disabled by config.")
             self.motion_regressor = None
+
+        self.voxel_normalizer = RTPStyleVoxelNormalizer(
+            ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+        )
 
         # --- Source container for GS/WM/Vent regressors (RTPSpy expects mask_src_proc.proc_data) ---
         self.proc_src = ProcSrc()
@@ -1020,9 +1064,13 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         mc_for_warp = reg_nii
         log_step("REG", volume_idx, "motion", start_t=reg_t0)
     else:
-        cleaned = np.asanyarray(mc_img.dataobj)
+        cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_img.dataobj))
         reg_ready = True
-        log_step("REG", volume_idx, "skipped", start_t=reg_t0)
+        reg_dir = cfg.rt_reg_dir
+        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        mc_for_warp = reg_nii
+        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0)
 
     if handler.motion_regressor is not None:
         reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
@@ -1487,6 +1535,12 @@ def main():
         help="Space for scoring/output volumes: mni (default) or subject (skip EPI->T1->MNI normalization).",
     )
     parser.add_argument(
+        "--voxel-norm-ref-volumes",
+        type=int,
+        default=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+        help="When motion regression is disabled, number of initial volumes used to estimate voxel-wise reference mean.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=REGRESSOR_SETTINGS.max_workers,
@@ -1521,6 +1575,7 @@ def main():
     REGRESSOR_SETTINGS.biopac_poll_interval = args.biopac_poll
     REGRESSOR_SETTINGS.biopac_timelag = args.biopac_timelag
     REGRESSOR_SETTINGS.analysis_space = args.analysis_space
+    REGRESSOR_SETTINGS.voxel_norm_ref_volumes = max(1, int(args.voxel_norm_ref_volumes))
     REGRESSOR_SETTINGS.max_workers = args.max_workers
     REGRESSOR_SETTINGS.max_retries = args.max_retries
 

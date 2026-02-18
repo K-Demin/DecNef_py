@@ -253,10 +253,11 @@ Those keys are ignored by the loader and are safe to keep in place.
 What each settings block controls
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`):
+- Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`, `voxel_norm_ref_volumes`):
   controls temporal assumptions and nuisance model complexity.
   - `analysis_space = "mni"` (default): apply EPI→T1→MNI normalization before scoring.
   - `analysis_space = "subject"`: skip normalization and score the cleaned MC volume in subject space.
+  - `voxel_norm_ref_volumes` (default `1`): shared normalization-window setting used in both modes. With regression ON, it sets RTPSpy `wait_num = voxel_norm_ref_volumes - 1`, so scaling mean is built from that many initial volumes; with regression OFF, it averages the first `voxel_norm_ref_volumes` volumes for the same voxel-wise percent-signal scaling (`Y / Y_mean * 100`).
 - Tissue regressors (`use_gs`, `use_wm`, `use_vent`):
   toggles global/WM/ventricle nuisance regressors.
 - Censoring (`fd_thr`, `dvars_thr_robust_z`, `censor_plus1`, etc.):
