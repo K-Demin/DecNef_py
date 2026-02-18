@@ -16,6 +16,8 @@ from typing import Optional
 
 import numpy as np
 
+from rt_global_settings import load_regressor_settings
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("rs_realtime_parallel")
 
@@ -428,8 +430,17 @@ def main() -> None:
         default=None,
         help="Stop the run after this many TRs (or press ESC).",
     )
+    parser.add_argument(
+        "--settings-file",
+        default=None,
+        help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
+    )
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
+
+    if args.settings_file:
+        loaded = load_regressor_settings(args.settings_file)
+        REGRESSOR_SETTINGS.update(vars(loaded))
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
 
     if args.epi_block is not None:
@@ -516,18 +527,21 @@ def main() -> None:
                 "Provide --decoder-template or run PCA preparation first."
             )
 
-        settings_payload = {
-            "enable_biopac_physio": args.biopac_enable,
-            "biopac_host": args.biopac_host,
-            "biopac_port": args.biopac_port,
-            "biopac_timeout": args.biopac_timeout,
-            "biopac_phys_reg": args.biopac_phys_reg,
-            "biopac_handshake": args.biopac_handshake,
-            "biopac_start_online_only": args.biopac_start_online,
-            "biopac_mode": args.biopac_mode,
-            "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
-            "biopac_poll_interval": args.biopac_poll,
-        }
+        settings_payload = vars(REGRESSOR_SETTINGS).copy()
+        settings_payload.update(
+            {
+                "enable_biopac_physio": args.biopac_enable,
+                "biopac_host": args.biopac_host,
+                "biopac_port": args.biopac_port,
+                "biopac_timeout": args.biopac_timeout,
+                "biopac_phys_reg": args.biopac_phys_reg,
+                "biopac_handshake": args.biopac_handshake,
+                "biopac_start_online_only": args.biopac_start_online,
+                "biopac_mode": args.biopac_mode,
+                "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
+                "biopac_poll_interval": args.biopac_poll,
+            }
+        )
 
         _merge_session_metadata(
             cfg.rt_work_dir,

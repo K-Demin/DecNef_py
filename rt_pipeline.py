@@ -28,6 +28,7 @@ from biopac_rt.biopac_receiver import (
     BiopacRetroTSReceiver,
     BiopacRetroTSFileBuffer,
 )
+from rt_global_settings import load_regressor_settings
 
 # ---------- Logging setup ----------
 logging.basicConfig(
@@ -41,60 +42,8 @@ logging.getLogger("fmri_rt_preproc").setLevel(logging.WARNING)
 logging.getLogger("RtpVolreg").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
-# ---------- Regressor config (edit to control usage) ----------
-
-@dataclass
-class RegressorSettings:
-    enable_motion_regression: bool = True
-    mot_reg: str = "mot6"
-    max_poly_order: float = np.inf
-    TR: float = 1
-    use_gs: bool = False
-    use_wm: bool = True
-    use_vent: bool = True
-
-    # --- censor regressors ---
-    enable_fd_censor_reg: bool = True
-    fd_thr: float = 0.3            #  (units = mm)
-
-    enable_dvars_censor_reg: bool = True
-    dvars_thr_robust_z: float = 3.0  # robust z threshold
-
-    censor_plus1: bool = True        # add +1 TR neighbor
-    dvars_warmup: int = 20           # don’t compute robust stats until you have some history
-    dvars_mask_source: str = "ref_mask"  # "ref_mask" uses cfg.rt_ref_mask
-
-    # --- BIOPAC physio regressors (RETROTS) ---
-    enable_biopac_physio: bool = True
-    biopac_phys_reg: str = "RICOR8"
-    biopac_host: str = "0.0.0.0"
-    biopac_port: int = 15000
-    biopac_timeout: float = 0.3
-    biopac_handshake: bool = True
-    biopac_start_online_only: bool = False
-    biopac_mode: str = "tcp"
-    biopac_file: Optional[Path] = None
-    biopac_poll_interval: float = 0.05
-    biopac_timelag: bool = False
-    max_workers: int = 6
-    max_retries: int = 3
-
-
-REGRESSOR_SETTINGS = RegressorSettings(
-    # How to use:
-    # - enable_motion_regression: True/False to toggle RtpRegress entirely.
-    # - mot_reg: one of {"None", "mot6", "mot12", "dmot6"} (RTPSpy-supported).
-    # - max_poly_order: int >= 0 or np.inf (higher allows more polynomial terms).
-    # - TR: float > 0 (seconds, used for polynomial regressor timing).
-    # - use_gs/use_wm/use_vent: True/False to include each mask regressor when file exists.
-    enable_motion_regression=True,
-    mot_reg="mot6",
-    max_poly_order=np.inf,
-    TR=1,
-    use_gs=False, # Probably it's better to avoid cause it correlates with global brain activity
-    use_wm=True,
-    use_vent=True,
-)
+# ---------- Regressor config ----------
+REGRESSOR_SETTINGS = load_regressor_settings()
 
 def log_step(step: str, vol: int, extra: str = "", start_t=None):
     """Compact colored/clean log."""
@@ -509,6 +458,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
                 "censor_plus1": REGRESSOR_SETTINGS.censor_plus1,
                 "dvars_warmup": REGRESSOR_SETTINGS.dvars_warmup,
                 "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
+                "analysis_space": REGRESSOR_SETTINGS.analysis_space,
             },
             "biopac": {
                 "enabled": REGRESSOR_SETTINGS.enable_biopac_physio,
@@ -1109,41 +1059,49 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                 avg_timelag,
             )
 
-    # ---------- 3) Apply ANTs transforms to MNI ----------
+    # ---------- 3) Space handling (MNI transform or subject-space passthrough) ----------
     t0 = time.time()
-    mni_dir = cfg.rt_mni_dir
-    mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+    analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    score_input_nii = mc_for_warp
 
-    warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
-    epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-    decoder_template = resolve_decoder_template(cfg)
+    if analysis_space == "mni":
+        mni_dir = cfg.rt_mni_dir
+        mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
 
-    if not decoder_template.exists():
-        log.error(f"Decoder template not found at {decoder_template}")
+        warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
+        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+        decoder_template = resolve_decoder_template(cfg)
+
+        if not decoder_template.exists():
+            log.error(f"Decoder template not found at {decoder_template}")
+            return False
+
+        if not (warp_t1_mni.exists() and epi2t1.exists()):
+            log.error(f"Missing transforms in {cfg.trans_dir}")
+            return False
+
+        cmd = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(mc_for_warp),
+            "-r", str(decoder_template),
+            "-o", str(mni_nii),
+            "-t", str(warp_t1_mni),
+            "-t", str(epi2t1),
+            "-n", "Linear",
+            "--float", "1",
+        ]
+        run(cmd)
+        score_input_nii = mni_nii
+        log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
+    elif analysis_space == "subject":
+        log_step("ANTS", volume_idx, "skipped (subject space)", start_t=t0)
+    else:
+        log.error(
+            "Unsupported analysis_space=%r. Expected 'mni' or 'subject'.",
+            REGRESSOR_SETTINGS.analysis_space,
+        )
         return False
-
-    if not (warp_t1_mni.exists() and epi2t1.exists()):
-        log.error(f"Missing transforms in {cfg.trans_dir}")
-        return False
-
-    cmd = [
-        "bash", "-lc",
-        f"""
-          export ANTS_USE_GPU=1
-          export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-          export OMP_NUM_THREADS=$(nproc)
-          antsApplyTransforms \
-            -d 3 \
-            -i {mc_for_warp} \
-            -r {decoder_template} \
-            -o {mni_nii} \
-            -t {warp_t1_mni} \
-            -t {epi2t1} \
-            -n Linear --float 1
-        """
-    ]
-    run(cmd)
-    log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
 
     if not cfg.enable_scoring:
         if handler.score_queue is not None:
@@ -1157,17 +1115,17 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     t0 = time.time()
     try:
         # Load the warped volume (decoder/ROI space)
-        mni_img = nib.load(str(mni_nii))
-        mni_data = np.asanyarray(mni_img.dataobj)
+        score_img = nib.load(str(score_input_nii))
+        score_data = np.asanyarray(score_img.dataobj)
 
         # Only accumulate baseline from *denoised* volumes
         if reg_ready and handler.scorer.baseline_count < handler.scorer.n_baseline:
-            handler.scorer.accumulate_baseline(mni_data)
+            handler.scorer.accumulate_baseline(score_data)
             if handler.scorer.baseline_count == handler.scorer.n_baseline:
                 handler.scorer.finalize_baseline()
 
         # Always compute raw; z will be NaN until baseline_ready
-        raw_score = handler.scorer.score_from_array(mni_data)
+        raw_score = handler.scorer.score_from_array(score_data)
         timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
         z_score = None
         if handler.reference_score_stats is not None:
@@ -1271,6 +1229,17 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
+    analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if analysis_space not in {"mni", "subject"}:
+        raise ValueError(
+            f"Unsupported analysis_space={REGRESSOR_SETTINGS.analysis_space!r}. "
+            "Use 'mni' or 'subject'."
+        )
+    if cfg.enable_scoring and analysis_space == "subject" and cfg.decoder_template is None:
+        raise ValueError(
+            "Subject-space scoring requires --decoder-template pointing to a decoder in subject space."
+        )
+
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
     # Process existing DICOMs first (offline-style), but only for this run
@@ -1512,6 +1481,12 @@ def main():
         help="Log per-volume trigger-to-volume timelag and running average.",
     )
     parser.add_argument(
+        "--analysis-space",
+        choices=["mni", "subject"],
+        default=REGRESSOR_SETTINGS.analysis_space,
+        help="Space for scoring/output volumes: mni (default) or subject (skip EPI->T1->MNI normalization).",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=REGRESSOR_SETTINGS.max_workers,
@@ -1523,7 +1498,16 @@ def main():
         default=REGRESSOR_SETTINGS.max_retries,
         help="Maximum retries per DICOM if processing fails.",
     )
+    parser.add_argument(
+        "--settings-file",
+        default=None,
+        help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
+    )
     args = parser.parse_args()
+
+    if args.settings_file:
+        loaded = load_regressor_settings(args.settings_file)
+        REGRESSOR_SETTINGS.update(vars(loaded))
 
     REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
     REGRESSOR_SETTINGS.biopac_host = args.biopac_host
@@ -1536,6 +1520,7 @@ def main():
     REGRESSOR_SETTINGS.biopac_file = Path(args.biopac_file) if args.biopac_file else None
     REGRESSOR_SETTINGS.biopac_poll_interval = args.biopac_poll
     REGRESSOR_SETTINGS.biopac_timelag = args.biopac_timelag
+    REGRESSOR_SETTINGS.analysis_space = args.analysis_space
     REGRESSOR_SETTINGS.max_workers = args.max_workers
     REGRESSOR_SETTINGS.max_retries = args.max_retries
 

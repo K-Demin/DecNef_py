@@ -226,3 +226,47 @@ Contact / Notes
 - The AP/PA naming in your current folders is flipped ("AP" == down, "PA" == up),
   but the pipeline just treats them as AP.nii.gz and PA.nii.gz, so future
   renaming will not break the logic.
+
+Global runtime settings (new)
+-----------------------------
+
+You can now keep shared realtime parameters in one JSON file and reuse it across:
+- rt_pipeline.py
+- rt_psychopy_parallel.py
+- rs_realtime_parallel.py
+
+A ready-to-edit template is included at the repo root:
+
+    rt_settings.json
+
+Use it like this:
+
+    python rt_pipeline.py ... --settings-file ./rt_settings.json
+
+Commenting convention in JSON
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+JSON does not support native comments, so the template uses `_comment*` keys
+(e.g., `_comment_timing`, `_comment_biopac`) to explain each settings block.
+Those keys are ignored by the loader and are safe to keep in place.
+
+What each settings block controls
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`):
+  controls temporal assumptions and nuisance model complexity.
+  - `analysis_space = "mni"` (default): apply EPI→T1→MNI normalization before scoring.
+  - `analysis_space = "subject"`: skip normalization and score the cleaned MC volume in subject space.
+- Tissue regressors (`use_gs`, `use_wm`, `use_vent`):
+  toggles global/WM/ventricle nuisance regressors.
+- Censoring (`fd_thr`, `dvars_thr_robust_z`, `censor_plus1`, etc.):
+  controls motion/outlier censor regressors.
+- BIOPAC (`biopac_*`):
+  defaults for receiving/using physio regressors and handshake behavior.
+- Runtime (`max_workers`, `max_retries`):
+  parallelism and retry policy for realtime processing.
+
+If you use `analysis_space = "subject"` with scoring enabled, pass a subject-space decoder via
+`--decoder-template` so decoder dimensions/space match the processed volume.
+
+CLI flags still work and can override values for a single run.
