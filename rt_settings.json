@@ -2,12 +2,13 @@
   "_comment": "Global realtime defaults shared by rt_pipeline.py, rt_psychopy_parallel.py, and rs_realtime_parallel.py.",
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
 
-  "_comment_timing": "Acquisition timing/model settings. analysis_space: mni (normalize) or subject (skip normalization).",
+  "_comment_timing": "Acquisition timing/model settings. analysis_space: mni (normalize) or subject (skip normalization). voxel_norm_ref_volumes controls normalization reference length in both regression and no-regression modes.",
   "TR": 1.0,
   "analysis_space": "mni",
   "mot_reg": "mot6",
   "max_poly_order": "inf",
   "enable_motion_regression": true,
+  "voxel_norm_ref_volumes": 1,
 
   "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
   "use_gs": false,

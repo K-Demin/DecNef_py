@@ -19,6 +19,10 @@ class RegressorSettings:
     use_wm: bool = True
     use_vent: bool = True
 
+    # Shared normalization window (N>=1) for both processing paths:
+    # - regression ON: mapped to RTPSpy wait_num=N-1 for Y_mean scaling
+    # - regression OFF: average first N MC volumes for the same scaling
+    voxel_norm_ref_volumes: int = 1
     enable_fd_censor_reg: bool = True
     fd_thr: float = 0.3
 
@@ -49,6 +53,8 @@ class RegressorSettings:
                 continue
             if key == "biopac_file" and value is not None:
                 setattr(self, key, Path(value))
+            elif key == "voxel_norm_ref_volumes":
+                setattr(self, key, max(1, int(value)))
             else:
                 setattr(self, key, value)
 
