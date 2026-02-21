@@ -14,7 +14,7 @@ class RegressorSettings:
     mot_reg: str = "mot6"
     max_poly_order: float = np.inf
     TR: float = 1.0
-    analysis_space: str = "mni"  # "mni" (default) or "subject"
+    analysis_space: str = "mni"  # "epi", "t1", or "mni" (default)
     use_gs: bool = False
     use_wm: bool = True
     use_vent: bool = True
