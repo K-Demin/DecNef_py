@@ -873,7 +873,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     For each incoming DICOM:
       1) DICOM -> raw NIfTI (single volume)
       2) Motion correction with RTPSpy -> mc NIfTI
-      3) Apply ANTs transforms (EPI->T1->MNI) -> mni NIfTI
+      3) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
     """
 
     # ---------- 1) DICOM -> raw NIfTI ----------
@@ -1107,12 +1107,43 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                 avg_timelag,
             )
 
-    # ---------- 3) Space handling (MNI transform or subject-space passthrough) ----------
+    # ---------- 3) Space handling (EPI passthrough, EPI→T1, or EPI→T1→MNI) ----------
     t0 = time.time()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
 
-    if analysis_space == "mni":
+    if analysis_space == "epi":
+        log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
+    elif analysis_space == "t1":
+        t1_dir = cfg.rt_work_dir / "t1"
+        t1_dir.mkdir(parents=True, exist_ok=True)
+        t1_nii = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+
+        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+        decoder_template = resolve_decoder_template(cfg)
+
+        if not decoder_template.exists():
+            log.error(f"Decoder template not found at {decoder_template}")
+            return False
+
+        if not epi2t1.exists():
+            log.error(f"Missing EPI→T1 transform in {cfg.trans_dir}")
+            return False
+
+        cmd = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(mc_for_warp),
+            "-r", str(decoder_template),
+            "-o", str(t1_nii),
+            "-t", str(epi2t1),
+            "-n", "Linear",
+            "--float", "1",
+        ]
+        run(cmd)
+        score_input_nii = t1_nii
+        log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
+    elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
         mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
 
@@ -1142,11 +1173,9 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         run(cmd)
         score_input_nii = mni_nii
         log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
-    elif analysis_space == "subject":
-        log_step("ANTS", volume_idx, "skipped (subject space)", start_t=t0)
     else:
         log.error(
-            "Unsupported analysis_space=%r. Expected 'mni' or 'subject'.",
+            "Unsupported analysis_space=%r. Expected 'epi', 't1', or 'mni'.",
             REGRESSOR_SETTINGS.analysis_space,
         )
         return False
@@ -1278,14 +1307,14 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
-    if analysis_space not in {"mni", "subject"}:
+    if analysis_space not in {"epi", "t1", "mni"}:
         raise ValueError(
             f"Unsupported analysis_space={REGRESSOR_SETTINGS.analysis_space!r}. "
-            "Use 'mni' or 'subject'."
+            "Use 'epi', 't1', or 'mni'."
         )
-    if cfg.enable_scoring and analysis_space == "subject" and cfg.decoder_template is None:
+    if cfg.enable_scoring and analysis_space in {"epi", "t1"} and cfg.decoder_template is None:
         raise ValueError(
-            "Subject-space scoring requires --decoder-template pointing to a decoder in subject space."
+            "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
         )
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
@@ -1530,9 +1559,9 @@ def main():
     )
     parser.add_argument(
         "--analysis-space",
-        choices=["mni", "subject"],
+        choices=["epi", "t1", "mni"],
         default=REGRESSOR_SETTINGS.analysis_space,
-        help="Space for scoring/output volumes: mni (default) or subject (skip EPI->T1->MNI normalization).",
+        help="Space for scoring/output volumes: epi (native EPI), t1 (apply EPI->T1), or mni (apply EPI->T1->MNI).",
     )
     parser.add_argument(
         "--voxel-norm-ref-volumes",
