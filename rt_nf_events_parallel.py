@@ -27,7 +27,11 @@ from rt_global_settings import load_regressor_settings
 #   --delay-trs 3 \
 #   --feedback-trs 3 \
 #   --score-delay 3 \
-#   --settings-file /path/to/rt_settings.json \
+#   --settings-file jane_settings.json
+#   --rs XXX\
+
+
+#
 
 def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
     metadata_path = run_dir / "session_metadata.json"
@@ -314,6 +318,11 @@ def main() -> None:
     parser.add_argument("--scans-trs", type=int, default=3, help="Scans-collection duration (TRs).")
     parser.add_argument("--delay-trs", type=int, default=3, help="Delay duration (TRs).")
     parser.add_argument("--feedback-trs", type=int, default=3, help="Feedback duration (TRs).")
+    parser.add_argument(
+        "--rs",
+        dest="reference_score_run",
+        help="Reference run ID for z-scoring (uses scores.csv from that run).",
+    )
     parser.add_argument(
         "--score-delay",
         type=int,
