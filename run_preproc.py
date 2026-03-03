@@ -87,6 +87,55 @@ def _dicoms_for_block(incoming_dir: Path, block_id: int) -> list[Path]:
     return dicoms
 
 
+def _count_epi_dicoms(
+    incoming_dir: Path,
+    block_id: int,
+    keep_start: int = 11,
+    keep_end: int = 30,
+) -> int:
+    """Count EPI DICOM-like files available for a block in the target scan range."""
+    count = 0
+    for f in incoming_dir.iterdir():
+        if not _is_dicom_like(f):
+            continue
+        parsed = _parse_dicom_name(f.name)
+        if parsed is None:
+            continue
+        _, run_id, scan = parsed
+        if run_id == block_id and keep_start <= scan <= keep_end:
+            count += 1
+    return count
+
+
+def _wait_for_epi_dicoms(
+    incoming_dir: Path,
+    block_id: int,
+    expected: int,
+    keep_start: int = 11,
+    keep_end: int = 30,
+    poll_interval: float = 1.0,
+) -> None:
+    """Block until the expected number of EPI DICOMs are present."""
+    log.info(
+        "Waiting for %d EPI DICOMs (block %s, scans %d-%d) in %s",
+        expected,
+        block_id,
+        keep_start,
+        keep_end,
+        incoming_dir,
+    )
+    while True:
+        count = _count_epi_dicoms(incoming_dir, block_id, keep_start, keep_end)
+        if count >= expected:
+            log.info(
+                "Detected %d EPI DICOMs for block %s; continuing.",
+                count,
+                block_id,
+            )
+            return
+        time.sleep(poll_interval)
+
+
 
 def _stage_convert_to_target(
     incoming_dir: Path, block_id: int, dest_path: Path
@@ -169,6 +218,9 @@ def _stage_epi_block(
             "--epi-block is required to stage incoming EPI DICOMs when --incoming-root is used."
         )
 
+    expected = keep_end - keep_start + 1
+    _wait_for_epi_dicoms(incoming_dir, block_id, expected, keep_start, keep_end)
+
     selected_dicoms: list[Path] = []
     for f in sorted(incoming_dir.iterdir()):
         if not _is_dicom_like(f):
@@ -179,13 +231,6 @@ def _stage_epi_block(
         _, run_id, scan = parsed
         if run_id == block_id and keep_start <= scan <= keep_end:
             selected_dicoms.append(f)
-
-    expected = keep_end - keep_start + 1
-    if len(selected_dicoms) != expected:
-        raise FileNotFoundError(
-            f"Expected {expected} DICOMs for block/run {block_id} in scans {keep_start}-{keep_end}, "
-            f"but found {len(selected_dicoms)} in {incoming_dir}."
-        )
 
     log.info(
         "Staging %d EPI DICOM(s) for block %s into %s (keeping scans %d-%d)",
