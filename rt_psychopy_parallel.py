@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import logging
 import random
 from collections import deque
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ from typing import Optional
 import numpy as np
 
 from rt_global_settings import load_regressor_settings
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -276,6 +280,34 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     run_rt_pipeline(cfg, score_queue)
 
 
+
+def _build_presentation_window(visual, color):
+    default_size = (1000, 700)
+    window_kwargs = {
+        "size": default_size,
+        "color": color,
+        "units": "pix",
+        "screen": 0,
+        "fullscr": False,
+    }
+    try:
+        import pyglet
+
+        screens = pyglet.canvas.get_display().get_screens()
+        if len(screens) > 1:
+            second_screen = screens[1]
+            window_kwargs.update(
+                {
+                    "size": (second_screen.width, second_screen.height),
+                    "screen": 1,
+                    "fullscr": True,
+                }
+            )
+    except Exception as exc:
+        log.warning("Could not detect external monitor; using default window size: %s", exc)
+    return visual.Window(**window_kwargs)
+
+
 def run_psychopy_presentation(
     score_queue: Queue,
     max_points: int,
@@ -285,7 +317,7 @@ def run_psychopy_presentation(
 ) -> None:
     from psychopy import core, event, visual
 
-    win = visual.Window(size=(1000, 700), color="black", units="pix")
+    win = _build_presentation_window(visual, color="black")
     title = visual.TextStim(win, text="Real-time Scores", pos=(0, 300), color="white")
     condition_text = visual.TextStim(
         win,
