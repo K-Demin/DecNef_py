@@ -273,7 +273,7 @@ def run_fixation_presentation(
 ) -> None:
     from psychopy import core, event, visual
 
-    win = visual.Window(size=(1000, 700), color=[0.5, 0.5, 0.5], units="pix")
+    win = _build_presentation_window(visual, color=[0.5, 0.5, 0.5])
     fixation = visual.TextStim(win, text="+", color="black", height=60)
     seen_vols: set[int] = set()
 

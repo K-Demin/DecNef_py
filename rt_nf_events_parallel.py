@@ -2,6 +2,7 @@
 import argparse
 import csv
 import json
+import logging
 from multiprocessing import Queue
 from queue import Empty
 from pathlib import Path
@@ -12,6 +13,9 @@ from typing import Optional
 import numpy as np
 
 from rt_global_settings import load_regressor_settings
+
+
+log = logging.getLogger(__name__)
 
 # python rt_nf_events_parallel.py \
 #   --sub 00086 \
@@ -68,6 +72,34 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     run_rt_pipeline(cfg, score_queue)
 
 
+
+def _build_presentation_window(visual, color):
+    default_size = (1000, 700)
+    window_kwargs = {
+        "size": default_size,
+        "color": color,
+        "units": "pix",
+        "screen": 0,
+        "fullscr": False,
+    }
+    try:
+        import pyglet
+
+        screens = pyglet.canvas.get_display().get_screens()
+        if len(screens) > 1:
+            second_screen = screens[1]
+            window_kwargs.update(
+                {
+                    "size": (second_screen.width, second_screen.height),
+                    "screen": 1,
+                    "fullscr": True,
+                }
+            )
+    except Exception as exc:
+        log.warning("Could not detect external monitor; using default window size: %s", exc)
+    return visual.Window(**window_kwargs)
+
+
 def _append_trial_score(csv_path: Path, row: dict) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
@@ -105,7 +137,7 @@ def run_nf_events_presentation(
     if stage_sum <= 0:
         raise ValueError("At least one per-trial stage duration must be > 0")
 
-    win = visual.Window(size=(1000, 700), color=[0.0, 0.0, 0.0], units="pix")
+    win = _build_presentation_window(visual, color=[0.0, 0.0, 0.0])
     waiting_text = visual.TextStim(
         win,
         text="Waiting for scanner trigger ('s')...",
