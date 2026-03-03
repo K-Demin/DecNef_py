@@ -55,15 +55,20 @@ def log_step(step: str, vol: int, extra: str = "", start_t=None):
         log.info(f"[{step:<5}] vol {v}  {extra}")
 
 
-def append_score(csv_path: Path, volume_idx: int, raw_score: float) -> float:
+def append_score(
+    csv_path: Path,
+    volume_idx: int,
+    raw_score: float,
+    original_score: Optional[float] = None,
+) -> float:
     timestamp = time.time()
     exists = csv_path.exists()
 
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not exists:
-            writer.writerow(["volume_idx", "timestamp", "score_raw"])
-        writer.writerow([volume_idx, timestamp, raw_score])
+            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_original"])
+        writer.writerow([volume_idx, timestamp, raw_score, original_score])
     return timestamp
 
 
@@ -1144,6 +1149,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     t0 = time.time()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
+    score_input_orig_nii = mc_nii
 
     if analysis_space == "epi":
         log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
@@ -1175,6 +1181,21 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         ]
         run(cmd)
         score_input_nii = t1_nii
+
+        # Save pre-denoise / pre-normalization score source in the same space.
+        t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+        cmd_orig = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(mc_nii),
+            "-r", str(decoder_template),
+            "-o", str(t1_orig_nii),
+            "-t", str(epi2t1),
+            "-n", "Linear",
+            "--float", "1",
+        ]
+        run(cmd_orig)
+        score_input_orig_nii = t1_orig_nii
         log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
@@ -1205,6 +1226,22 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         ]
         run(cmd)
         score_input_nii = mni_nii
+
+        # Save pre-denoise / pre-normalization score source in the same space.
+        mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+        cmd_orig = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(mc_nii),
+            "-r", str(decoder_template),
+            "-o", str(mni_orig_nii),
+            "-t", str(warp_t1_mni),
+            "-t", str(epi2t1),
+            "-n", "Linear",
+            "--float", "1",
+        ]
+        run(cmd_orig)
+        score_input_orig_nii = mni_orig_nii
         log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
     else:
         log.error(
@@ -1227,6 +1264,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         # Load the warped volume (decoder/ROI space)
         score_img = nib.load(str(score_input_nii))
         score_data = np.asanyarray(score_img.dataobj)
+        score_orig_img = nib.load(str(score_input_orig_nii))
+        score_orig_data = np.asanyarray(score_orig_img.dataobj)
 
         # Only accumulate baseline from *denoised* volumes
         if reg_ready and handler.scorer.baseline_count < handler.scorer.n_baseline:
@@ -1236,7 +1275,13 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
 
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(score_data)
-        timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score)
+        original_score = handler.scorer.score_from_array(score_orig_data)
+        timestamp = append_score(
+            cfg.rt_work_dir / "scores.csv",
+            volume_idx,
+            raw_score,
+            original_score=original_score,
+        )
         z_score = None
         if handler.reference_score_stats is not None:
             stats = handler.reference_score_stats
@@ -1255,6 +1300,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                     "volume_idx": volume_idx,
                     "timestamp": timestamp,
                     "score_raw": raw_score,
+                    "score_original": original_score,
                     "reg_ready": reg_ready,
                 }
                 if z_score is not None:
