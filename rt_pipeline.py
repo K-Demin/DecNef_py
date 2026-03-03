@@ -141,12 +141,13 @@ class RTPStyleVoxelNormalizer:
     by 100 (with RTPSpy's clipping/zero-mask behavior).
     """
 
-    def __init__(self, ref_volumes: int = 1):
+    def __init__(self, ref_volumes: int = 1, brain_mask: Optional[np.ndarray] = None):
         self.ref_volumes = max(1, int(ref_volumes))
         self._sum: Optional[np.ndarray] = None
         self._count = 0
         self._y_mean: Optional[np.ndarray] = None
         self._y_mean_mask: Optional[np.ndarray] = None
+        self._brain_mask = brain_mask.astype(bool, copy=False) if brain_mask is not None else None
 
     def apply(self, vol_data: np.ndarray) -> np.ndarray:
         data = np.asarray(vol_data, dtype=np.float32)
@@ -158,6 +159,8 @@ class RTPStyleVoxelNormalizer:
             self._count += 1
             self._y_mean = (self._sum / float(self._count)).astype(np.float32)
             self._y_mean_mask = np.abs(self._y_mean) > 1e-6
+            if self._brain_mask is not None:
+                self._y_mean_mask &= self._brain_mask
             if self._count >= self.ref_volumes:
                 self._sum = None
 
@@ -171,6 +174,7 @@ class MotionRegressor:
     def __init__(
         self,
         volreg: RtpVolreg,
+        reg_mask: Optional[Path] = None,
         gs_mask: Optional[Path] = None,
         wm_mask: Optional[Path] = None,
         vent_mask: Optional[Path] = None,
@@ -188,6 +192,7 @@ class MotionRegressor:
         kwargs = dict(
             mot_reg=mot_reg,
             volreg=volreg,
+            mask_file=str(reg_mask) if reg_mask is not None else 0,
             TR=TR,
             wait_num=wait_num,
             max_poly_order=max_poly_order,
@@ -294,6 +299,7 @@ class RTSessionConfig:
     incoming_root: Path
     base_data: Path
     decoder_template: Optional[Path] = None
+    decoder_roi_txt: Optional[Path] = None
     reference_score_run: Optional[str] = None
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
@@ -390,6 +396,15 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     )
 
 
+def resolve_decoder_roi_txt(cfg: RTSessionConfig) -> Optional[Path]:
+    if cfg.decoder_roi_txt is None:
+        return None
+    if not cfg.decoder_roi_txt.exists():
+        log.warning("[SCORE] Decoder ROI txt not found at %s; falling back to decoder NIfTI mask.", cfg.decoder_roi_txt)
+        return None
+    return cfg.decoder_roi_txt
+
+
 def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> Optional[dict]:
     if not run_id:
         return None
@@ -479,6 +494,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "incoming_root": str(cfg.incoming_root),
             "base_data": str(cfg.base_data),
             "decoder_template": str(decoder_template),
+            "decoder_roi_txt": str(cfg.decoder_roi_txt) if cfg.decoder_roi_txt else None,
             "reference_score_run": cfg.reference_score_run,
             "reference_score_stats": cfg.reference_score_stats,
             "tr": REGRESSOR_SETTINGS.TR,
@@ -712,8 +728,12 @@ class DICOMHandler(FileSystemEventHandler):
                     )
 
         if REGRESSOR_SETTINGS.enable_motion_regression:
+            reg_mask = cfg.rt_ref_mask if cfg.rt_ref_mask.exists() else None
+            if reg_mask is None:
+                log.warning("[REG] Regression mask missing at %s; using non-zero voxels from first volume.", cfg.rt_ref_mask)
             self.motion_regressor = MotionRegressor(
                 self.volreg,
+                reg_mask=reg_mask,
                 gs_mask=gs,
                 wm_mask=wm,
                 vent_mask=vent,
@@ -731,8 +751,17 @@ class DICOMHandler(FileSystemEventHandler):
             log.info("[REG] Motion regression disabled by config.")
             self.motion_regressor = None
 
+        norm_mask = None
+        if cfg.rt_ref_mask.exists():
+            norm_mask = np.asanyarray(nib.load(str(cfg.rt_ref_mask)).dataobj) > 0.5
+        else:
+            log.warning(
+                "[REG] Voxel normalization mask missing at %s; using Y-mean nonzero mask only.",
+                cfg.rt_ref_mask,
+            )
         self.voxel_normalizer = RTPStyleVoxelNormalizer(
             ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+            brain_mask=norm_mask,
         )
 
         # --- Source container for GS/WM/Vent regressors (RTPSpy expects mask_src_proc.proc_data) ---
@@ -743,7 +772,11 @@ class DICOMHandler(FileSystemEventHandler):
         # --- Decoder / scorer ---
         if cfg.enable_scoring:
             decoder_path = resolve_decoder_template(cfg)
-            roi_txt = cfg.trans_dir / "ROI_DECODER.txt"
+            roi_txt = resolve_decoder_roi_txt(cfg)
+            if roi_txt is None:
+                log.info("[SCORE] Decoder ROI txt not provided; using decoder NIfTI nonzero mask.")
+            else:
+                log.info("[SCORE] Using decoder ROI txt: %s", roi_txt)
 
             self.scorer = DecoderScorer(
                 decoder_path,
@@ -1490,6 +1523,11 @@ def main():
         help="Optional decoder template path to override the default.",
     )
     parser.add_argument(
+        "--decoder-roi-txt",
+        required=False,
+        help="Optional ROI_DECODER-style text file used for scoring mask/weights. If omitted, scoring uses decoder NIfTI nonzero voxels.",
+    )
+    parser.add_argument(
         "--no-score",
         action="store_true",
         help="Disable decoder scoring (still runs motion correction + warps).",
@@ -1615,6 +1653,7 @@ def main():
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        decoder_roi_txt=Path(args.decoder_roi_txt) if args.decoder_roi_txt else None,
         reference_score_run=args.reference_score_run,
         enable_scoring=not args.no_score,
     )
