@@ -418,13 +418,6 @@ def main() -> None:
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
     )
 
-    pca_root = cfg.day_root / "PCA"
-    if args.decoder_template is None and not pca_root.exists():
-        raise FileNotFoundError(
-            f"PCA folder not found at {pca_root}. "
-            "Provide --decoder-template or run PCA preparation first."
-        )
-
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
         {
@@ -457,6 +450,7 @@ def main() -> None:
                 "feedback_trs": args.feedback_trs,
                 "score_delay": args.score_delay,
                 "trial_scores_csv": str(trial_scores_path),
+                "decoder_template": str(args.decoder_template) if args.decoder_template else None,
             }
         },
     )

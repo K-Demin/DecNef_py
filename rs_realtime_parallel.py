@@ -266,7 +266,11 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     run_rt_pipeline(cfg, score_queue)
 
 
-def run_fixation_presentation(score_queue: Queue, max_trs: Optional[int]) -> None:
+def run_fixation_presentation(
+    score_queue: Queue,
+    max_trs: Optional[int],
+    stop_event: mp.Event,
+) -> None:
     from psychopy import core, event, visual
 
     win = visual.Window(size=(1000, 700), color=[0.5, 0.5, 0.5], units="pix")
@@ -286,6 +290,8 @@ def run_fixation_presentation(score_queue: Queue, max_trs: Optional[int]) -> Non
             pass
 
         if max_trs is not None and len(seen_vols) >= max_trs:
+            break
+        if stop_event.is_set():
             break
         if "escape" in event.getKeys():
             break
@@ -460,6 +466,25 @@ def main() -> None:
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    ctx = mp.get_context("spawn")
+    score_queue = ctx.Queue(maxsize=100)
+    fixation_stop = ctx.Event()
+    fixation_process = ctx.Process(
+        target=run_fixation_presentation,
+        args=(score_queue, args.max_trs, fixation_stop),
+    )
+    fixation_process.start()
+
+    _merge_session_metadata(
+        run_dir,
+        {
+            "fixation_display": {
+                "description": "Grey screen with fixation cross only.",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
     biopac_process = None
     biopac_stop = None
     if args.biopac_listener:
@@ -544,18 +569,6 @@ def main() -> None:
             }
         )
 
-        _merge_session_metadata(
-            cfg.rt_work_dir,
-            {
-                "fixation_display": {
-                    "description": "Grey screen with fixation cross only.",
-                    "started_at": datetime.now(timezone.utc).isoformat(),
-                }
-            },
-        )
-
-        ctx = mp.get_context("spawn")
-        score_queue = ctx.Queue(maxsize=100)
         pipeline_process = ctx.Process(
             target=_run_pipeline_with_settings,
             args=(cfg, score_queue, settings_payload),
@@ -563,7 +576,7 @@ def main() -> None:
         pipeline_process.start()
 
         try:
-            run_fixation_presentation(score_queue, args.max_trs)
+            pipeline_process.join()
         finally:
             if pipeline_process.is_alive():
                 pipeline_process.terminate()
@@ -573,6 +586,8 @@ def main() -> None:
         if args.pca_prep:
             _run_pca_prep(base_data, args.sub, args.day, args.run)
     finally:
+        fixation_stop.set()
+        fixation_process.join(timeout=5)
         if biopac_stop is not None:
             biopac_stop.set()
         if biopac_process is not None:
