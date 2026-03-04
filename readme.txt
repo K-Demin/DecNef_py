@@ -256,7 +256,7 @@ What each settings block controls
 - Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`, `voxel_norm_ref_volumes`):
   controls temporal assumptions and nuisance model complexity.
   - `analysis_space = "mni"` (default): apply EPI→T1→MNI normalization before scoring.
-  - `analysis_space = "subject"`: skip normalization and score the cleaned MC volume in subject space.
+  - `analysis_space = "epi"`: skip normalization and score the cleaned MC volume in native EPI space.
   - `voxel_norm_ref_volumes` (default `1`): shared normalization-window setting used in both modes. With regression ON, it sets RTPSpy `wait_num = voxel_norm_ref_volumes - 1`, so scaling mean is built from that many initial volumes; with regression OFF, it averages the first `voxel_norm_ref_volumes` volumes for the same voxel-wise percent-signal scaling (`Y / Y_mean * 100`).
 - Tissue regressors (`use_gs`, `use_wm`, `use_vent`):
   toggles global/WM/ventricle nuisance regressors.
@@ -267,7 +267,18 @@ What each settings block controls
 - Runtime (`max_workers`, `max_retries`):
   parallelism and retry policy for realtime processing.
 
-If you use `analysis_space = "subject"` with scoring enabled, pass a subject-space decoder via
+If you use `analysis_space = "epi"` with scoring enabled, pass an EPI-space decoder via
 `--decoder-template` so decoder dimensions/space match the processed volume.
+
+Per-volume output folders (under `func/<run_id>/`)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- `raw/`: raw incoming NIfTI volumes before RT motion correction.
+- `mc/`: motion-corrected volumes in native EPI space.
+- `reg/`: nuisance-cleaned (and voxel-normalized) volumes in native EPI space; this is the source volume that is later warped when `analysis_space` is `t1` or `mni`.
+- `t1/` (only when `analysis_space = "t1"`):
+  - `vol_XXXXX_t1.nii`: the `reg/` volume warped to T1/decoder space (used for denoised scoring).
+  - `vol_XXXXX_t1_orig.nii`: the `mc/` volume warped to T1/decoder space (used as the non-denoised comparison score).
+- `mni/` (only when `analysis_space = "mni"`): equivalent pair (`*_mni.nii` and `*_mni_orig.nii`) in MNI/decoder space.
 
 CLI flags still work and can override values for a single run.
