@@ -174,6 +174,27 @@ def _append_condition_score(csv_path: Path, message: dict, condition: Condition)
         )
 
 
+
+
+def _append_acquisition_speed(csv_path: Path, row: dict) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "volume_idx",
+                "estimated_trigger_timestamp",
+                "watchdog_timestamp",
+                "analysis_timestamp",
+                "trigger_to_watchdog_s",
+                "watchdog_to_analysis_s",
+            ],
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
 def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
     metadata_path = run_dir / "session_metadata.json"
     data = {}
@@ -364,13 +385,16 @@ def run_psychopy_presentation(
     needs_redraw = True
     reg_ready_seen = False
     seen_vols: set[int] = set()
+    acquisition_speed_path = condition_scores_path.parent / "acquisition_speed_rt.csv"
 
+    first_trigger_timestamp: Optional[float] = None
     waiting = True
     while waiting:
         waiting_text.draw()
         win.flip()
         keys = event.getKeys()
         if "s" in keys:
+            first_trigger_timestamp = time.time()
             waiting = False
         if "escape" in keys:
             win.close()
@@ -421,6 +445,23 @@ def run_psychopy_presentation(
                 vol_idx = int(message.get("volume_idx", 0))
                 if vol_idx:
                     seen_vols.add(vol_idx)
+                if first_trigger_timestamp is not None and vol_idx > 0:
+                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * 1.4)
+                    watchdog_timestamp = message.get("watchdog_timestamp")
+                    analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
+                    if watchdog_timestamp is not None and analysis_timestamp is not None:
+                        _append_acquisition_speed(
+                            acquisition_speed_path,
+                            {
+                                "volume_idx": vol_idx,
+                                "estimated_trigger_timestamp": f"{estimated_trigger_timestamp:.6f}",
+                                "watchdog_timestamp": f"{float(watchdog_timestamp):.6f}",
+                                "analysis_timestamp": f"{float(analysis_timestamp):.6f}",
+                                "trigger_to_watchdog_s": f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}",
+                                "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
+                            },
+                        )
+
                 if message.get("reg_ready", True):
                     reg_ready_seen = True
                     scores.append(float(message["score_raw"]))

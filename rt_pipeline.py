@@ -60,8 +60,10 @@ def append_score(
     volume_idx: int,
     raw_score: float,
     original_score: Optional[float] = None,
+    timestamp: Optional[float] = None,
 ) -> float:
-    timestamp = time.time()
+    if timestamp is None:
+        timestamp = time.time()
     exists = csv_path.exists()
 
     with open(csv_path, "a", newline="") as f:
@@ -1253,7 +1255,12 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
     if not cfg.enable_scoring:
         if handler.score_queue is not None:
             try:
-                handler.score_queue.put_nowait({"volume_idx": volume_idx})
+                handler.score_queue.put_nowait(
+                    {
+                        "volume_idx": volume_idx,
+                        "watchdog_timestamp": volume_timestamp,
+                    }
+                )
             except Exception as exc:
                 log.error(f"[SCORE] Failed to enqueue volume {volume_idx:05d}: {exc}")
         return True
@@ -1276,11 +1283,13 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(score_data)
         original_score = handler.scorer.score_from_array(score_orig_data)
+        analysis_timestamp = time.time()
         timestamp = append_score(
             cfg.rt_work_dir / "scores.csv",
             volume_idx,
             raw_score,
             original_score=original_score,
+            timestamp=analysis_timestamp,
         )
         z_score = None
         if handler.reference_score_stats is not None:
@@ -1299,6 +1308,8 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
                 payload = {
                     "volume_idx": volume_idx,
                     "timestamp": timestamp,
+                    "analysis_timestamp": analysis_timestamp,
+                    "watchdog_timestamp": volume_timestamp,
                     "score_raw": raw_score,
                     "score_original": original_score,
                     "reg_ready": reg_ready,

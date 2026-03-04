@@ -51,6 +51,99 @@ def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+
+
+def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
+    reg_path = run_dir / "regression_status_rt.csv"
+    if not reg_path.exists():
+        return None
+    with open(reg_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+            return None
+        reg_ready_map: dict[int, bool] = {}
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                reg_ready_map[vol] = bool(int(row["reg_ready"]))
+            except (TypeError, ValueError):
+                continue
+    return reg_ready_map
+
+
+def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    scores_path = run_dir / "scores.csv"
+    motion_path = run_dir / "motion_rt.1D"
+    if not scores_path.exists() or not motion_path.exists():
+        return
+
+    reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+
+    vols = []
+    scores = []
+    with open(scores_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                score = float(row["score_raw"])
+            except (TypeError, ValueError):
+                continue
+            if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            vols.append(vol)
+            scores.append(score)
+
+    if not scores:
+        return
+
+    motion = np.loadtxt(motion_path)
+    if motion.ndim == 1:
+        motion = motion[None, :]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    axes[0].plot(vols, scores, label="Decoder score (regressed)")
+    axes[0].set_xlabel("Volume")
+    axes[0].set_ylabel("Score")
+    axes[0].legend(loc="upper right")
+
+    for idx in range(min(motion.shape[1], 6)):
+        axes[1].plot(motion[:, idx], label=f"Motion {idx + 1}")
+    axes[1].set_xlabel("Volume")
+    axes[1].set_ylabel("Motion")
+    axes[1].legend(loc="upper right", ncol=3, fontsize=8)
+
+    fig.tight_layout()
+    out_png = run_dir / "qc_scores_motion.png"
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def _append_acquisition_speed(csv_path: Path, row: dict) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "volume_idx",
+                "estimated_trigger_timestamp",
+                "watchdog_timestamp",
+                "analysis_timestamp",
+                "trigger_to_watchdog_s",
+                "watchdog_to_analysis_s",
+            ],
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -> None:
     from biopac_rt.biopac_receiver import BiopacRetroTSReceiver
 
@@ -159,6 +252,8 @@ def run_nf_events_presentation(
     max_seen_vol = 0
     score_by_exp_tr: dict[int, float] = {}
     start_vol = None
+    first_trigger_timestamp: Optional[float] = None
+    acquisition_speed_path = trial_scores_path.parent / "acquisition_speed_rt.csv"
 
     def drain_queue() -> None:
         nonlocal max_seen_vol
@@ -168,6 +263,22 @@ def run_nf_events_presentation(
                 vol_idx = int(message.get("volume_idx", 0) or 0)
                 if vol_idx > 0:
                     max_seen_vol = max(max_seen_vol, vol_idx)
+                if first_trigger_timestamp is not None and vol_idx > 0:
+                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * 1.4)
+                    watchdog_timestamp = message.get("watchdog_timestamp")
+                    analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
+                    if watchdog_timestamp is not None and analysis_timestamp is not None:
+                        _append_acquisition_speed(
+                            acquisition_speed_path,
+                            {
+                                "volume_idx": vol_idx,
+                                "estimated_trigger_timestamp": f"{estimated_trigger_timestamp:.6f}",
+                                "watchdog_timestamp": f"{float(watchdog_timestamp):.6f}",
+                                "analysis_timestamp": f"{float(analysis_timestamp):.6f}",
+                                "trigger_to_watchdog_s": f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}",
+                                "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
+                            },
+                        )
                 if start_vol is None:
                     continue
                 if vol_idx <= start_vol:
@@ -188,6 +299,7 @@ def run_nf_events_presentation(
         win.flip()
         keys = event.getKeys()
         if "s" in keys:
+            first_trigger_timestamp = time.time()
             start_vol = max_seen_vol
             break
         if "escape" in keys:
@@ -539,6 +651,7 @@ def main() -> None:
             biopac_stop.set()
         if biopac_process is not None:
             biopac_process.join(timeout=5)
+        _plot_qc(run_dir)
 
 
 if __name__ == "__main__":
