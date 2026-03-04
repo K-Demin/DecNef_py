@@ -266,6 +266,33 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     run_rt_pipeline(cfg, score_queue)
 
 
+def _build_presentation_window(visual, color):
+    default_size = (1000, 700)
+    window_kwargs = {
+        "size": default_size,
+        "color": color,
+        "units": "pix",
+        "screen": 0,
+        "fullscr": False,
+    }
+    try:
+        import pyglet
+
+        screens = pyglet.canvas.get_display().get_screens()
+        if len(screens) > 1:
+            second_screen = screens[1]
+            window_kwargs.update(
+                {
+                    "size": (second_screen.width, second_screen.height),
+                    "screen": 1,
+                    "fullscr": True,
+                }
+            )
+    except Exception as exc:
+        log.warning("Could not detect external monitor; using default window size: %s", exc)
+    return visual.Window(**window_kwargs)
+
+
 def run_fixation_presentation(
     score_queue: Queue,
     max_trs: Optional[int],
