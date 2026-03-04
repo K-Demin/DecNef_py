@@ -301,11 +301,9 @@ def run_fixation_presentation(
     from psychopy import core, event, visual
 
     win = _build_presentation_window(visual, color=[0.5, 0.5, 0.5])
-    fixation = visual.TextStim(win, text="+", color="black", height=60)
     seen_vols: set[int] = set()
 
     while True:
-        fixation.draw()
         win.flip()
         try:
             while True:
@@ -506,7 +504,7 @@ def main() -> None:
         run_dir,
         {
             "fixation_display": {
-                "description": "Grey screen with fixation cross only.",
+                "description": "Grey screen only.",
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }
         },
