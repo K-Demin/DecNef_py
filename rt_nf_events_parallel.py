@@ -237,10 +237,7 @@ def run_nf_events_presentation(
         color="black",
         height=36,
     )
-    stage_text = visual.TextStim(win, text="", pos=(0, 280), color="black", height=34)
-    trial_text = visual.TextStim(win, text="", pos=(0, 220), color="black", height=28)
     fixation = visual.TextStim(win, text="+", color="black", height=80)
-    score_text = visual.TextStim(win, text="", pos=(0, -280), color="black", height=28)
     feedback_circle = visual.Circle(
         win,
         radius=80,
@@ -252,11 +249,18 @@ def run_nf_events_presentation(
     max_seen_vol = 0
     score_by_exp_tr: dict[int, float] = {}
     start_vol = None
+    tr_count_start_vol: Optional[int] = None
     first_trigger_timestamp: Optional[float] = None
     acquisition_speed_path = trial_scores_path.parent / "acquisition_speed_rt.csv"
 
+    def _exp_tr_for_volume(vol_idx: int) -> Optional[int]:
+        if tr_count_start_vol is None:
+            return None
+        return max(0, vol_idx - tr_count_start_vol)
+
     def drain_queue() -> None:
         nonlocal max_seen_vol
+        nonlocal tr_count_start_vol
         try:
             while True:
                 message = score_queue.get_nowait()
@@ -283,7 +287,15 @@ def run_nf_events_presentation(
                     continue
                 if vol_idx <= start_vol:
                     continue
-                exp_tr = vol_idx - start_vol
+                if message.get("reg_ready", True) and tr_count_start_vol is None:
+                    # Do not start the experiment/TR clock until regression/background
+                    # warm-up scans are complete.
+                    tr_count_start_vol = vol_idx - 1
+
+                exp_tr = _exp_tr_for_volume(vol_idx)
+                if exp_tr is None:
+                    continue
+
                 if message.get("reg_ready", True) and message.get("score_raw") is not None:
                     try:
                         score_by_exp_tr[exp_tr] = float(message["score_raw"])
@@ -358,16 +370,11 @@ def run_nf_events_presentation(
 
         while True:
             drain_queue()
-            current_exp_tr = max(0, max_seen_vol - (start_vol or 0))
+            current_exp_tr = _exp_tr_for_volume(max_seen_vol)
+            if current_exp_tr is None:
+                current_exp_tr = 0
 
             win.color = [0.0, 0.0, 0.0]  # gray background
-            if trial == 0:
-                stage_text.text = f"BASELINE ({baseline_trs} TRs)"
-                trial_text.text = ""
-            else:
-                stage_text.text = f"Trial {trial}/{n_trials} — {stage_name.upper()}"
-                trial_text.text = ""
-
             if stage_name == "cue":
                 fixation.draw()
             elif stage_name == "feedback" and trial > 0:
@@ -393,25 +400,15 @@ def run_nf_events_presentation(
 
                 t_score = trial_scores[trial]
                 if np.isnan(t_score):
-                    feedback_circle.radius = 70
-                    feedback_circle.fillColor = [0.2, 0.2, 0.2]
-                    feedback_circle.lineColor = [0.2, 0.2, 0.2]
-                    score_text.text = "Score: NaN"
+                    radius = 0.0
                 else:
-                    clipped = float(np.clip(t_score, -2.0, 2.0))
-                    feedback_circle.radius = 70 + 60 * (abs(clipped) / 2.0)
-                    if clipped >= 0:
-                        feedback_circle.fillColor = [-0.5, 0.7, -0.5]
-                        feedback_circle.lineColor = [-0.5, 0.7, -0.5]
-                    else:
-                        feedback_circle.fillColor = [0.8, -0.5, -0.5]
-                        feedback_circle.lineColor = [0.8, -0.5, -0.5]
-                    score_text.text = f"Score: {t_score:.3f}"
+                    rating = float(np.clip(t_score, 0.0, 100.0))
+                    radius = 150.0 * (rating / 100.0)
+                feedback_circle.radius = radius
+                feedback_circle.fillColor = [-0.5, 0.7, -0.5]
+                feedback_circle.lineColor = [-0.5, 0.7, -0.5]
                 feedback_circle.draw()
-                score_text.draw()
 
-            stage_text.draw()
-            trial_text.draw()
             win.flip()
 
             if "escape" in event.getKeys():
