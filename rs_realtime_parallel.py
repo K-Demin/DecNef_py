@@ -271,7 +271,7 @@ def _build_presentation_window(visual, color):
     window_kwargs = {
         "size": default_size,
         "color": color,
-        "units": "pix",
+        "units": "height",
         "screen": 0,
         "fullscr": False,
     }
@@ -288,6 +288,14 @@ def _build_presentation_window(visual, color):
                     "fullscr": True,
                 }
             )
+        else:
+            window_kwargs.update(
+                {
+                "screen": 0,
+                "fullscr": True,
+                }
+            )
+
     except Exception as exc:
         log.warning("Could not detect external monitor; using default window size: %s", exc)
     return visual.Window(**window_kwargs)
@@ -300,7 +308,7 @@ def run_fixation_presentation(
 ) -> None:
     from psychopy import core, event, visual
 
-    win = _build_presentation_window(visual, color=[0.5, 0.5, 0.5])
+    win = _build_presentation_window(visual, color=[-0.004, -0.004, -0.004])
     seen_vols: set[int] = set()
 
     while True:
@@ -466,6 +474,12 @@ def main() -> None:
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Maximum parallel processing workers for DICOM handling.",
+    )
 
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
@@ -571,12 +585,12 @@ def main() -> None:
             enable_scoring=not args.no_score,
         )
 
-        pca_root = cfg.day_root / "PCA"
-        if args.decoder_template is None and not pca_root.exists():
-            raise FileNotFoundError(
-                f"PCA folder not found at {pca_root}. "
-                "Provide --decoder-template or run PCA preparation first."
-            )
+        # pca_root = cfg.day_root / "PCA"
+        # if args.decoder_template is None and not pca_root.exists():
+        #     raise FileNotFoundError(
+        #         f"PCA folder not found at {pca_root}. "
+        #         "Provide --decoder-template or run PCA preparation first."
+        #     )
 
         settings_payload = vars(REGRESSOR_SETTINGS).copy()
         settings_payload.update(

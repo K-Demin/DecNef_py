@@ -1,0 +1,43 @@
+{
+  "_comment": "Global realtime defaults shared by rt_pipeline.py, rt_psychopy_parallel.py, and rs_realtime_parallel.py.",
+  "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
+
+  "_comment_timing": "Acquisition timing/model settings. analysis_space: epi (native EPI), t1 (EPI->T1), or mni (EPI->T1->MNI). voxel_norm_ref_volumes controls normalization reference length in both regression and no-regression modes.",
+  "TR": 1.4,
+  "analysis_space": "t1",
+  "mot_reg": "mot6",
+  "max_poly_order": "inf",
+  "enable_motion_regression": true,
+  "voxel_norm_ref_volumes": 30,
+
+  "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
+  "use_gs": false,
+  "use_wm": true,
+  "use_vent": true,
+
+  "_comment_censor": "Motion/outlier censoring thresholds.",
+  "enable_fd_censor_reg": true,
+  "fd_thr": 0.3,
+  "enable_dvars_censor_reg": true,
+  "dvars_thr_robust_z": 3.0,
+  "censor_plus1": true,
+  "dvars_warmup": 20,
+  "dvars_mask_source": "ref_mask",
+
+  "_comment_biopac": "BIOPAC/RETROTS receiver defaults. Override per run with CLI if needed.",
+  "enable_biopac_physio": false,
+  "biopac_phys_reg": "RICOR8",
+  "biopac_host": "0.0.0.0",
+  "biopac_port": 15000,
+  "biopac_timeout": 0.3,
+  "biopac_handshake": true,
+  "biopac_start_online_only": false,
+  "biopac_mode": "tcp",
+  "biopac_file": null,
+  "biopac_poll_interval": 0.05,
+  "biopac_timelag": false,
+
+  "_comment_runtime": "Pipeline robustness/performance settings.",
+  "max_workers": 1,
+  "max_retries": 3
+}

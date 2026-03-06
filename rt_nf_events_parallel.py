@@ -165,13 +165,12 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     run_rt_pipeline(cfg, score_queue)
 
 
-
 def _build_presentation_window(visual, color):
     default_size = (1000, 700)
     window_kwargs = {
         "size": default_size,
         "color": color,
-        "units": "pix",
+        "units": "height",
         "screen": 0,
         "fullscr": False,
     }
@@ -179,6 +178,7 @@ def _build_presentation_window(visual, color):
         import pyglet
 
         screens = pyglet.canvas.get_display().get_screens()
+
         if len(screens) > 1:
             second_screen = screens[1]
             window_kwargs.update(
@@ -188,6 +188,14 @@ def _build_presentation_window(visual, color):
                     "fullscr": True,
                 }
             )
+        else:
+            window_kwargs.update(
+                {
+                    "screen": 0,
+                    "fullscr": True,
+                }
+            )
+
     except Exception as exc:
         log.warning("Could not detect external monitor; using default window size: %s", exc)
     return visual.Window(**window_kwargs)
@@ -230,14 +238,22 @@ def run_nf_events_presentation(
     if stage_sum <= 0:
         raise ValueError("At least one per-trial stage duration must be > 0")
 
-    win = _build_presentation_window(visual, color=[0.0, 0.0, 0.0])
+    win = _build_presentation_window(visual, color=[-0.004, -0.004, -0.004])
     waiting_text = visual.TextStim(
         win,
         text="Waiting for scanner trigger ('s')...",
         color="black",
         height=36,
     )
-    fixation = visual.TextStim(win, text="+", color="black", height=80)
+    fixation = visual.ShapeStim(
+        win,
+        vertices="cross",
+        size=(0.05, 0.05),
+        lineWidth=1.0,
+        fillColor=[0.0, 0.0, 0.0],
+        lineColor=[0.0, 0.0, 0.0],
+        pos=(0, 0),
+    )
     feedback_circle = visual.Circle(
         win,
         radius=80,
@@ -374,7 +390,7 @@ def run_nf_events_presentation(
             if current_exp_tr is None:
                 current_exp_tr = 0
 
-            win.color = [0.0, 0.0, 0.0]  # gray background
+            win.color = [-0.004,-0.004,-0.004]  # gray background
             if stage_name == "cue":
                 fixation.draw()
             elif stage_name == "feedback" and trial > 0:
