@@ -588,6 +588,8 @@ class DICOMHandler(FileSystemEventHandler):
         self._processed_scans: set[int] = set()
         self._inflight_scans: set[int] = set()
         self._lock = threading.Lock()
+        self._order_cv = threading.Condition(self._lock)
+        self._next_scan_to_process: Optional[int] = None
         max_workers = int(REGRESSOR_SETTINGS.max_workers)
         if max_workers > 10:
             log.warning(
@@ -866,28 +868,65 @@ class DICOMHandler(FileSystemEventHandler):
             volume_idx = self.next_volume_idx
             self.next_volume_idx += 1
             self._inflight_scans.add(scan)
+            if self._next_scan_to_process is None:
+                self._next_scan_to_process = scan
+                self._order_cv.notify_all()
         self._executor.submit(self._process_scan, path, scan, volume_idx)
         return True
 
+    def _advance_expected_scan_locked(self, finished_scan: int) -> None:
+        candidates = [s for s in self._inflight_scans.union(self._pending_scans) if s > finished_scan]
+        self._next_scan_to_process = min(candidates) if candidates else None
+        self._order_cv.notify_all()
+
     def _process_scan(self, path: Path, scan: int, volume_idx: int) -> None:
-        log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
-        ok = False
+        log.info(f"[WATCHDOG] Preparing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
+
+        prepared_unwarped: Optional[Path] = None
+        volume_timestamp: Optional[float] = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-            ok = process_volume(self.cfg, self, path, volume_idx)
-            if ok:
+            prepared_unwarped, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
+            if prepared_unwarped is not None:
                 break
             log.warning(
-                "[WATCHDOG] Retry scan %s (attempt %s/%s)",
+                "[WATCHDOG] Retry scan %s prep (attempt %s/%s)",
                 scan,
                 attempt,
                 REGRESSOR_SETTINGS.max_retries,
             )
             time.sleep(0.2)
+
+        ok = False
+        if prepared_unwarped is not None and volume_timestamp is not None:
+            with self._order_cv:
+                while self._next_scan_to_process is not None and scan != self._next_scan_to_process:
+                    self._order_cv.wait(timeout=0.1)
+            log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
+            for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
+                ok = process_volume(
+                    self.cfg,
+                    self,
+                    path,
+                    volume_idx,
+                    unwarped_nii=prepared_unwarped,
+                    volume_timestamp=volume_timestamp,
+                )
+                if ok:
+                    break
+                log.warning(
+                    "[WATCHDOG] Retry scan %s post-prep (attempt %s/%s)",
+                    scan,
+                    attempt,
+                    REGRESSOR_SETTINGS.max_retries,
+                )
+                time.sleep(0.2)
+
         if not ok:
             log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
         with self._lock:
             self._inflight_scans.discard(scan)
             self.mark_processed(scan)
+            self._advance_expected_scan_locked(scan)
 
     def process_file(self, path: Path):
         parsed = parse_dicom_name(path.name)
@@ -907,26 +946,22 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC) ----------
 
-def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
-                   dicom_path: Path, volume_idx: int):
+def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
     """
-    For each incoming DICOM:
-      1) DICOM -> raw NIfTI (single volume)
-      2) Motion correction with RTPSpy -> mc NIfTI
-      3) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
+    Convert DICOM to NIfTI and run fieldmap unwarp.
+    This stage is safe to run ahead of ordered/stateful realtime steps.
     """
+    volume_timestamp = time.time()
 
     # ---------- 1) DICOM -> raw NIfTI ----------
-    volume_timestamp = time.time()
     t0 = volume_timestamp
-
     raw_dir = cfg.rt_raw_dir
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
     if not raw_nii.exists():
         if not wait_for_file_complete(dicom_path, timeout=5.0, interval=0.1):
             log.error(f"[DICOM] vol {volume_idx:05d} FAILED (file not stable)")
-            return False
+            return None, None
         for attempt in range(3):
             run([
                 "dcm2niix",
@@ -946,7 +981,7 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
             time.sleep(0.2)
         else:
             log.error(f"[DICOM] vol {volume_idx:05d} FAILED (no output)")
-            return False
+            return None, None
 
     log_step("DICOM", volume_idx, start_t=t0)
 
@@ -959,11 +994,36 @@ def process_volume(cfg: RTSessionConfig, handler: "DICOMHandler",
         ok = unwarp_volume(raw_nii, unwarped_nii, cfg)
         if not ok:
             log.error(f"[FMAP] Failed unwarp for {raw_nii}")
-            return False
+            return None, None
         log_step("FMAP", volume_idx, start_t=t0)
     else:
         log.info(f"[FMAP] Unwarp exists for vol {volume_idx}")
 
+    return unwarped_nii, volume_timestamp
+
+
+def process_volume(
+    cfg: RTSessionConfig,
+    handler: "DICOMHandler",
+    dicom_path: Path,
+    volume_idx: int,
+    unwarped_nii: Optional[Path] = None,
+    volume_timestamp: Optional[float] = None,
+):
+    """
+    For each incoming DICOM:
+      1) DICOM -> raw NIfTI (single volume)
+      2) Motion correction with RTPSpy -> mc NIfTI
+      3) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
+    """
+
+    if unwarped_nii is None:
+        unwarped_nii, prepared_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+        if unwarped_nii is None or prepared_timestamp is None:
+            return False
+        volume_timestamp = prepared_timestamp
+    elif volume_timestamp is None:
+        volume_timestamp = time.time()
 
     # ---------- 2) Motion correction (RtpVolreg) ----------
     t0 = time.time()
