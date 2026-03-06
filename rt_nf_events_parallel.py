@@ -170,7 +170,7 @@ def _build_presentation_window(visual, color):
     window_kwargs = {
         "size": default_size,
         "color": color,
-        "units": "height",
+        "units": "pix",
         "screen": 0,
         "fullscr": False,
     }
@@ -198,7 +198,21 @@ def _build_presentation_window(visual, color):
 
     except Exception as exc:
         log.warning("Could not detect external monitor; using default window size: %s", exc)
-    return visual.Window(**window_kwargs)
+
+    try:
+        return visual.Window(**window_kwargs)
+    except Exception as exc:
+        # PsychoPy can fail on fullscreen/monitor-size combinations depending on
+        # backend and local monitor settings. Retry with a conservative setup so
+        # the presentation can still run.
+        log.warning("Primary PsychoPy window config failed; retrying with safe defaults: %s", exc)
+        return visual.Window(
+            size=default_size,
+            color=color,
+            units="pix",
+            screen=0,
+            fullscr=False,
+        )
 
 
 def _append_trial_score(csv_path: Path, row: dict) -> None:
