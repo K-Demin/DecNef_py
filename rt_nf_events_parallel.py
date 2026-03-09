@@ -262,8 +262,10 @@ def run_nf_events_presentation(
     fixation = visual.ShapeStim(
         win,
         vertices="cross",
-        size=(0.05, 0.05),
-        lineWidth=1.0,
+        # Window units are pixels, so the fixation cross must be sized in px.
+        # A tiny fractional size can make the cue effectively invisible.
+        size=(56, 56),
+        lineWidth=5.0,
         fillColor=[0.0, 0.0, 0.0],
         lineColor=[0.0, 0.0, 0.0],
         pos=(0, 0),
