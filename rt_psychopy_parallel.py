@@ -630,6 +630,14 @@ def main() -> None:
         help="Reference run ID for z-scoring (uses scores.csv from that run).",
     )
     parser.add_argument(
+        "--pca-mode",
+        action="store_true",
+        help=(
+            "PCA workflow mode: disable decoder scoring and ignore --rs "
+            "(analysis is driven by PCA outputs rather than decoder scores)."
+        ),
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         help="Maximum parallel processing workers for DICOM handling.",
@@ -653,14 +661,12 @@ def main() -> None:
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        reference_score_run=None if args.pca_mode else args.reference_score_run,
+        enable_scoring=not args.pca_mode,
     )
 
-    pca_root = cfg.day_root / "PCA"
-    if args.decoder_template is None and not pca_root.exists():
-        raise FileNotFoundError(
-            f"PCA folder not found at {pca_root}. "
-            "Provide --decoder-template or run PCA preparation first."
-        )
+    if args.pca_mode and args.reference_score_run:
+        log.info("PCA mode enabled: ignoring --rs=%s", args.reference_score_run)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
@@ -718,6 +724,7 @@ def main() -> None:
                     "direction": condition.direction,
                     "symbol": condition.symbol,
                 },
+                "pca_mode": args.pca_mode,
             }
         },
     )
