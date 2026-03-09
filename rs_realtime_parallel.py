@@ -271,7 +271,7 @@ def _build_presentation_window(visual, color):
     window_kwargs = {
         "size": default_size,
         "color": color,
-        "units": "height",
+        "units": "pix",
         "screen": 0,
         "fullscr": False,
     }
@@ -286,13 +286,6 @@ def _build_presentation_window(visual, color):
                     "size": (second_screen.width, second_screen.height),
                     "screen": 1,
                     "fullscr": True,
-                }
-            )
-        else:
-            window_kwargs.update(
-                {
-                "screen": 0,
-                "fullscr": True,
                 }
             )
 
@@ -312,6 +305,8 @@ def run_fixation_presentation(
     seen_vols: set[int] = set()
 
     while True:
+
+        win.fullscr = True
         win.flip()
         try:
             while True:
