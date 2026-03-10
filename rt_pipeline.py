@@ -310,6 +310,7 @@ class RTSessionConfig:
     reference_score_run: Optional[str] = None
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
+    enable_original_score: bool = False
 
     @property
     def subject_root(self) -> Path:
@@ -504,6 +505,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "decoder_roi_txt": str(cfg.decoder_roi_txt) if cfg.decoder_roi_txt else None,
             "reference_score_run": cfg.reference_score_run,
             "reference_score_stats": cfg.reference_score_stats,
+            "enable_original_score": cfg.enable_original_score,
             "tr": REGRESSOR_SETTINGS.TR,
             "regression": {
                 "enable_motion_regression": REGRESSOR_SETTINGS.enable_motion_regression,
@@ -1211,7 +1213,7 @@ def process_volume(
     t0 = time.time()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
-    score_input_orig_nii = mc_nii
+    score_input_orig_nii: Optional[Path] = mc_nii if cfg.enable_original_score else None
 
     if analysis_space == "epi":
         log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
@@ -1244,20 +1246,21 @@ def process_volume(
         run(cmd)
         score_input_nii = t1_nii
 
-        # Save pre-denoise / pre-normalization score source in the same space.
-        t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
-        cmd_orig = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_nii),
-            "-r", str(decoder_template),
-            "-o", str(t1_orig_nii),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd_orig)
-        score_input_orig_nii = t1_orig_nii
+        # Optional: also save pre-denoise / pre-normalization score source.
+        if cfg.enable_original_score:
+            t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+            cmd_orig = [
+                "antsApplyTransforms",
+                "-d", "3",
+                "-i", str(mc_nii),
+                "-r", str(decoder_template),
+                "-o", str(t1_orig_nii),
+                "-t", str(epi2t1),
+                "-n", "Linear",
+                "--float", "1",
+            ]
+            run(cmd_orig)
+            score_input_orig_nii = t1_orig_nii
         log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
@@ -1289,21 +1292,22 @@ def process_volume(
         run(cmd)
         score_input_nii = mni_nii
 
-        # Save pre-denoise / pre-normalization score source in the same space.
-        mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
-        cmd_orig = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_nii),
-            "-r", str(decoder_template),
-            "-o", str(mni_orig_nii),
-            "-t", str(warp_t1_mni),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd_orig)
-        score_input_orig_nii = mni_orig_nii
+        # Optional: also save pre-denoise / pre-normalization score source.
+        if cfg.enable_original_score:
+            mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            cmd_orig = [
+                "antsApplyTransforms",
+                "-d", "3",
+                "-i", str(mc_nii),
+                "-r", str(decoder_template),
+                "-o", str(mni_orig_nii),
+                "-t", str(warp_t1_mni),
+                "-t", str(epi2t1),
+                "-n", "Linear",
+                "--float", "1",
+            ]
+            run(cmd_orig)
+            score_input_orig_nii = mni_orig_nii
         log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
     else:
         log.error(
@@ -1331,8 +1335,11 @@ def process_volume(
         # Load the warped volume (decoder/ROI space)
         score_img = nib.load(str(score_input_nii))
         score_data = np.asanyarray(score_img.dataobj)
-        score_orig_img = nib.load(str(score_input_orig_nii))
-        score_orig_data = np.asanyarray(score_orig_img.dataobj)
+        original_score = None
+        if score_input_orig_nii is not None:
+            score_orig_img = nib.load(str(score_input_orig_nii))
+            score_orig_data = np.asanyarray(score_orig_img.dataobj)
+            original_score = handler.scorer.score_from_array(score_orig_data)
 
         # Only accumulate baseline from *denoised* volumes
         if reg_ready and handler.scorer.baseline_count < handler.scorer.n_baseline:
@@ -1342,7 +1349,6 @@ def process_volume(
 
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(score_data)
-        original_score = handler.scorer.score_from_array(score_orig_data)
         analysis_timestamp = time.time()
         timestamp = append_score(
             cfg.rt_work_dir / "scores.csv",
@@ -1650,6 +1656,11 @@ def main():
         help="Disable decoder scoring (still runs motion correction + warps).",
     )
     parser.add_argument(
+        "--enable-original-score",
+        action="store_true",
+        help="Also compute score_original from a separately warped pre-denoise/pre-normalization volume.",
+    )
+    parser.add_argument(
         "--biopac-enable",
         action="store_true",
         help="Enable BIOPAC RetroTS regressors via TCP.",
@@ -1773,6 +1784,7 @@ def main():
         decoder_roi_txt=Path(args.decoder_roi_txt) if args.decoder_roi_txt else None,
         reference_score_run=args.reference_score_run,
         enable_scoring=not args.no_score,
+        enable_original_score=args.enable_original_score,
     )
 
     if not cfg.incoming_dir.exists():
