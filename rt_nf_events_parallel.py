@@ -277,7 +277,7 @@ def run_nf_events_presentation(
     )
     # Scale circles relative to the presentation window; reference and
     # feedback share the same maximum radius at a perfect score.
-    max_reference_radius = 0.30 * min(win.size)
+    max_reference_radius = 0.60 * min(win.size)
     max_feedback_radius = max_reference_radius
     max_reference_circle = visual.Circle(
         win,
