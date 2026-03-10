@@ -270,9 +270,21 @@ def run_nf_events_presentation(
     )
     feedback_circle = visual.Circle(
         win,
-        radius=80,
+        radius=0,
         fillColor=[0.0, 0.0, 0.0],
         lineColor=[0.0, 0.0, 0.0],
+        pos=(0, 0),
+    )
+    # Scale circles relative to the presentation window; reference and
+    # feedback share the same maximum radius at a perfect score.
+    max_reference_radius = 0.30 * min(win.size)
+    max_feedback_radius = max_reference_radius
+    max_reference_circle = visual.Circle(
+        win,
+        radius=max_reference_radius,
+        fillColor=None,
+        lineColor=[0.85, 0.85, 0.85],
+        lineWidth=4,
         pos=(0, 0),
     )
 
@@ -433,11 +445,15 @@ def run_nf_events_presentation(
                     radius = 0.0
                 else:
                     rating = float(np.clip(t_score, 0.0, 100.0))
-                    radius = 150.0 * (rating / 100.0)
+                    radius = max_feedback_radius * (rating / 100.0)
                 feedback_circle.radius = radius
                 feedback_circle.fillColor = [-0.5, 0.7, -0.5]
                 feedback_circle.lineColor = [-0.5, 0.7, -0.5]
+                # Draw both circles on every feedback frame. Draw the filled
+                # feedback first, then the outline reference on top so both are
+                # visible even when the score reaches the maximum radius.
                 feedback_circle.draw()
+                max_reference_circle.draw()
 
             win.flip()
 
