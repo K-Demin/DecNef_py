@@ -204,6 +204,18 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
         return
 
     reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+    qc_exclude_until_vol = 0
+    metadata_path = run_dir / "session_metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            qc_exclude_until_vol = max(
+                int(metadata.get("voxel_norm_ref_volumes", 0) or 0),
+                int(metadata.get("pre_trial_scans", 0) or 0),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            qc_exclude_until_vol = 0
 
     vols = []
     scores = []
@@ -216,6 +228,8 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
             except (TypeError, ValueError):
                 continue
             if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            if vol <= qc_exclude_until_vol:
                 continue
             vols.append(vol)
             scores.append(score)
