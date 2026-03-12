@@ -83,6 +83,18 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
         return
 
     reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+    qc_exclude_until_vol = 0
+    metadata_path = run_dir / "session_metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            qc_exclude_until_vol = max(
+                int(metadata.get("voxel_norm_ref_volumes", 0) or 0),
+                int(metadata.get("pre_trial_scans", 0) or 0),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            qc_exclude_until_vol = 0
 
     vols = []
     scores = []
@@ -95,6 +107,8 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
             except (TypeError, ValueError):
                 continue
             if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            if vol <= qc_exclude_until_vol:
                 continue
             vols.append(vol)
             scores.append(score)
@@ -227,6 +241,7 @@ def _append_trial_score(csv_path: Path, row: dict) -> None:
                 "score_window_end_tr",
                 "n_scores_used",
                 "trial_score",
+                "score_missing",
             ],
         )
         if not exists:
@@ -244,6 +259,7 @@ def run_nf_events_presentation(
     delay_trs: int,
     feedback_trs: int,
     score_delay: int,
+    tr_seconds: float,
     trial_scores_path: Path,
 ) -> None:
     from psychopy import core, event, visual
@@ -287,22 +303,27 @@ def run_nf_events_presentation(
         lineWidth=4,
         pos=(0, 0),
     )
+    missing_score_text = visual.TextStim(
+        win,
+        text="",
+        color=[0.9, 0.2, 0.2],
+        pos=(0, -int(0.35 * min(win.size))),
+        height=30,
+    )
 
     max_seen_vol = 0
     score_by_exp_tr: dict[int, float] = {}
     start_vol = None
-    tr_count_start_vol: Optional[int] = None
     first_trigger_timestamp: Optional[float] = None
     acquisition_speed_path = trial_scores_path.parent / "acquisition_speed_rt.csv"
 
-    def _exp_tr_for_volume(vol_idx: int) -> Optional[int]:
-        if tr_count_start_vol is None:
+    def _exp_tr_for_time(ts: Optional[float]) -> Optional[int]:
+        if first_trigger_timestamp is None or ts is None:
             return None
-        return max(0, vol_idx - tr_count_start_vol)
+        return max(1, int(np.floor((float(ts) - first_trigger_timestamp) / tr_seconds)) + 1)
 
     def drain_queue() -> None:
         nonlocal max_seen_vol
-        nonlocal tr_count_start_vol
         try:
             while True:
                 message = score_queue.get_nowait()
@@ -310,7 +331,7 @@ def run_nf_events_presentation(
                 if vol_idx > 0:
                     max_seen_vol = max(max_seen_vol, vol_idx)
                 if first_trigger_timestamp is not None and vol_idx > 0:
-                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * 1.4)
+                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * tr_seconds)
                     watchdog_timestamp = message.get("watchdog_timestamp")
                     analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
                     if watchdog_timestamp is not None and analysis_timestamp is not None:
@@ -329,14 +350,16 @@ def run_nf_events_presentation(
                     continue
                 if vol_idx <= start_vol:
                     continue
-                if message.get("reg_ready", True) and tr_count_start_vol is None:
-                    # Do not start the experiment/TR clock until regression/background
-                    # warm-up scans are complete.
-                    tr_count_start_vol = vol_idx - 1
+                analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
+                msg_ts: Optional[float]
+                try:
+                    msg_ts = float(analysis_timestamp) if analysis_timestamp is not None else None
+                except (TypeError, ValueError):
+                    msg_ts = None
 
-                exp_tr = _exp_tr_for_volume(vol_idx)
+                exp_tr = _exp_tr_for_time(msg_ts)
                 if exp_tr is None:
-                    continue
+                    exp_tr = max(1, vol_idx - start_vol)
 
                 if message.get("reg_ready", True) and message.get("score_raw") is not None:
                     try:
@@ -412,7 +435,7 @@ def run_nf_events_presentation(
 
         while True:
             drain_queue()
-            current_exp_tr = _exp_tr_for_volume(max_seen_vol)
+            current_exp_tr = _exp_tr_for_time(time.time())
             if current_exp_tr is None:
                 current_exp_tr = 0
 
@@ -425,6 +448,7 @@ def run_nf_events_presentation(
                     used = [score_by_exp_tr[tr] for tr in range(s_start, s_end + 1) if tr in score_by_exp_tr]
                     trial_score = float(np.mean(used)) if used else float("nan")
                     trial_scores[trial] = trial_score
+                    score_missing = int(len(used) == 0)
                     _append_trial_score(
                         trial_scores_path,
                         {
@@ -433,8 +457,16 @@ def run_nf_events_presentation(
                             "score_window_end_tr": s_end,
                             "n_scores_used": len(used),
                             "trial_score": trial_score,
+                            "score_missing": score_missing,
                         },
                     )
+                    if score_missing:
+                        log.warning(
+                            "Trial %02d score not received in time for TR window [%d, %d]",
+                            trial,
+                            s_start,
+                            s_end,
+                        )
                     print(
                         f"Trial {trial:02d} score over TRs [{s_start}, {s_end}] "
                         f"from {len(used)} samples: {trial_score:.4f}"
@@ -454,6 +486,9 @@ def run_nf_events_presentation(
                 # visible even when the score reaches the maximum radius.
                 feedback_circle.draw()
                 max_reference_circle.draw()
+                missing_score_text.text = "Score not received in time" if np.isnan(t_score) else ""
+                if missing_score_text.text:
+                    missing_score_text.draw()
 
             win.flip()
 
@@ -684,6 +719,7 @@ def main() -> None:
             delay_trs=args.delay_trs,
             feedback_trs=args.feedback_trs,
             score_delay=args.score_delay,
+            tr_seconds=float(REGRESSOR_SETTINGS.TR),
             trial_scores_path=trial_scores_path,
         )
     finally:
