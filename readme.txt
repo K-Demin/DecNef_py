@@ -282,3 +282,27 @@ Per-volume output folders (under `func/<run_id>/`)
 - `mni/` (only when `analysis_space = "mni"`): equivalent pair (`*_mni.nii` and `*_mni_orig.nii`) in MNI/decoder space.
 
 CLI flags still work and can override values for a single run.
+
+Closed-loop T2 (SPM + AFNI) pipeline
+-----------------------------------
+
+If you only point to folders, use:
+
+    python -m fmri_rt_preproc.t2_spm_afni_closed_loop \
+      --subject-root /path/to/sub-00085 \
+      --day day-02 \
+      --spm-dir /opt/spm12 \
+      --mni-template /path/to/MNI152_T1_1mm.nii.gz \
+      --segmentation /path/to/segmentation.nii.gz \
+      --dg-labels 17 53
+
+What it does automatically:
+- Searches `sub-XXXX/anat` for `T2*.nii*`; if missing, converts DICOMs in that folder via `dcm2niix`.
+- Runs SPM segmentation on T2 (GM/WM/CSF + bias-corrected output).
+- Runs AFNI cleanup (`3dUnifize`, `3dSkullStrip`) and optional MNI alignment (`3dAllineate`).
+- Optionally extracts a DG mask from a segmentation volume using provided labels.
+- Writes `day-XX/t2_pipeline/pipeline_summary.json` with all outputs.
+
+Note on DG labels:
+- `--dg-labels 17 53` are a practical fallback (whole hippocampus proxy in aparc+aseg style maps).
+- For true dentate gyrus extraction, pass the atlas-specific DG labels from your own segmentation output.
