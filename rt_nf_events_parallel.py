@@ -107,7 +107,7 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
                 score = float(row["score_raw"])
             except (TypeError, ValueError):
                 continue
-            if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+            if reg_ready_map is not None and vol in reg_ready_map and not reg_ready_map[vol]:
                 continue
             if vol <= qc_exclude_until_vol:
                 continue
