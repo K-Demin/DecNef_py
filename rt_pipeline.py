@@ -452,7 +452,7 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
             if np.isnan(raw):
                 continue
             scores_all.append(raw)
-            if reg_ready_map is None or reg_ready_map.get(vol - 1, False):
+            if reg_ready_map is None or reg_ready_map.get(vol, False):
                 scores.append(raw)
 
     used_reg_ready = reg_ready_map is not None

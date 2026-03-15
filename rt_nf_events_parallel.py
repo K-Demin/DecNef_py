@@ -11,6 +11,7 @@ import time
 from typing import Optional
 
 import numpy as np
+from scipy.stats import norm
 
 from rt_global_settings import load_regressor_settings
 
@@ -240,6 +241,7 @@ def _append_trial_score(csv_path: Path, row: dict) -> None:
                 "score_window_start_tr",
                 "score_window_end_tr",
                 "n_scores_used",
+                "trial_score_raw",
                 "trial_score",
                 "score_missing",
             ],
@@ -247,6 +249,15 @@ def _append_trial_score(csv_path: Path, row: dict) -> None:
         if not exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _score_to_percentile(score_raw: float, reference_stats: Optional[dict]) -> float:
+    if not np.isfinite(score_raw):
+        return float("nan")
+    if reference_stats is None:
+        return float(np.clip(score_raw, 0.0, 100.0))
+    z = (score_raw - reference_stats["mean"]) / reference_stats["std"]
+    return float(np.clip(norm.cdf(z) * 100.0, 0.0, 100.0))
 
 
 def run_nf_events_presentation(
@@ -261,6 +272,7 @@ def run_nf_events_presentation(
     score_delay: int,
     tr_seconds: float,
     trial_scores_path: Path,
+    reference_stats: Optional[dict] = None,
 ) -> None:
     from psychopy import core, event, visual
 
@@ -446,7 +458,8 @@ def run_nf_events_presentation(
                 if trial not in trial_scores:
                     s_start, s_end = trial_windows[trial]
                     used = [score_by_exp_tr[tr] for tr in range(s_start, s_end + 1) if tr in score_by_exp_tr]
-                    trial_score = float(np.mean(used)) if used else float("nan")
+                    trial_score_raw = float(np.mean(used)) if used else float("nan")
+                    trial_score = _score_to_percentile(trial_score_raw, reference_stats)
                     trial_scores[trial] = trial_score
                     score_missing = int(len(used) == 0)
                     _append_trial_score(
@@ -456,6 +469,7 @@ def run_nf_events_presentation(
                             "score_window_start_tr": s_start,
                             "score_window_end_tr": s_end,
                             "n_scores_used": len(used),
+                            "trial_score_raw": trial_score_raw,
                             "trial_score": trial_score,
                             "score_missing": score_missing,
                         },
@@ -469,7 +483,7 @@ def run_nf_events_presentation(
                         )
                     print(
                         f"Trial {trial:02d} score over TRs [{s_start}, {s_end}] "
-                        f"from {len(used)} samples: {trial_score:.4f}"
+                        f"from {len(used)} samples: raw={trial_score_raw:.4f} percentile={trial_score:.4f}"
                     )
 
                 t_score = trial_scores[trial]
@@ -611,7 +625,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
+    from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS, load_reference_score_stats
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
@@ -638,7 +652,10 @@ def main() -> None:
         incoming_root=Path(args.incoming_root),
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        reference_score_run=args.reference_score_run,
     )
+
+    cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
@@ -721,6 +738,7 @@ def main() -> None:
             score_delay=args.score_delay,
             tr_seconds=float(REGRESSOR_SETTINGS.TR),
             trial_scores_path=trial_scores_path,
+            reference_stats=cfg.reference_score_stats,
         )
     finally:
         if pipeline_process.is_alive():
