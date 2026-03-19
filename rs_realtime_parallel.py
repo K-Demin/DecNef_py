@@ -204,6 +204,15 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
         return
 
     reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+    if prefer_reg_ready and reg_ready_map is None:
+        return
+
+    first_reg_ready_vol = None
+    if reg_ready_map:
+        ready_vols = [vol for vol, ready in reg_ready_map.items() if ready]
+        if ready_vols:
+            first_reg_ready_vol = min(ready_vols)
+
     qc_exclude_until_vol = 0
     metadata_path = run_dir / "session_metadata.json"
     if metadata_path.exists():
@@ -229,6 +238,8 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
                 continue
             if reg_ready_map is not None and not reg_ready_map.get(vol, False):
                 continue
+            if first_reg_ready_vol is not None and vol <= first_reg_ready_vol:
+                continue
             if vol <= qc_exclude_until_vol:
                 continue
             vols.append(vol)
@@ -241,6 +252,14 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
     if motion.ndim == 1:
         motion = motion[None, :]
 
+    motion_vols = np.arange(1, motion.shape[0] + 1)
+    include_motion = np.isin(motion_vols, np.asarray(vols, dtype=int))
+    motion = motion[include_motion]
+    motion_vols = motion_vols[include_motion]
+
+    if motion.shape[0] == 0:
+        return
+
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
     axes[0].plot(vols, scores, label="Decoder score (regressed)")
     axes[0].set_xlabel("Volume")
@@ -248,7 +267,7 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
     axes[0].legend(loc="upper right")
 
     for idx in range(min(motion.shape[1], 6)):
-        axes[1].plot(motion[:, idx], label=f"Motion {idx + 1}")
+        axes[1].plot(motion_vols, motion[:, idx], label=f"Motion {idx + 1}")
     axes[1].set_xlabel("Volume")
     axes[1].set_ylabel("Motion")
     axes[1].legend(loc="upper right", ncol=3, fontsize=8)
