@@ -45,6 +45,7 @@ class RegressorSettings:
     biopac_timelag: bool = False
     max_workers: int = 6
     max_retries: int = 3
+    skip_first_trs: int = 0
 
     def update(self, overrides: dict[str, Any]) -> None:
         known = {f.name: f for f in fields(self)}
@@ -55,6 +56,8 @@ class RegressorSettings:
                 setattr(self, key, Path(value))
             elif key == "voxel_norm_ref_volumes":
                 setattr(self, key, max(1, int(value)))
+            elif key == "skip_first_trs":
+                setattr(self, key, max(0, int(value)))
             else:
                 setattr(self, key, value)
 

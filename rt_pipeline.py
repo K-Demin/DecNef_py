@@ -642,7 +642,7 @@ class DICOMHandler(FileSystemEventHandler):
         self.fd_file = self.cfg.rt_work_dir / "fd_rt.csv"
         self.prev_motion = None              # previous 6-vector
         self.brain_radius_mm = 50.0          # standard radius for FD
-        self.pre_trial_scans = 0             # if you ever want NaNs for early scans
+        self.pre_trial_scans = max(0, int(REGRESSOR_SETTINGS.skip_first_trs))
 
         # --- NEW: DVARS state ---
         self.prev_mc_for_dvars = None
@@ -792,7 +792,9 @@ class DICOMHandler(FileSystemEventHandler):
             self.scorer = DecoderScorer(
                 decoder_path,
                 roi_txt=roi_txt,
-                n_baseline=20,   # keep your current baseline length
+                # Keep decoder baseline aligned with the shared normalization
+                # window used by the RT pipeline.
+                n_baseline=max(1, int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)),
             )
         else:
             log.info("[SCORE] Scoring disabled; skipping decoder initialization.")

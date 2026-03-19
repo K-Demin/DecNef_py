@@ -270,6 +270,7 @@ def _score_to_percentile(score_raw: float, reference_stats: Optional[dict]) -> f
 
 def run_nf_events_presentation(
     score_queue: Queue,
+    skip_first_trs: int,
     baseline_trs: int,
     n_trials: int,
     iti_trs: int,
@@ -333,14 +334,23 @@ def run_nf_events_presentation(
 
     max_seen_vol = 0
     score_by_exp_tr: dict[int, float] = {}
-    start_vol = None
+    first_nonbaseline_tr = baseline_trs + 1
     first_trigger_timestamp: Optional[float] = None
     acquisition_speed_path = trial_scores_path.parent / "acquisition_speed_rt.csv"
 
-    def _exp_tr_for_time(ts: Optional[float]) -> Optional[int]:
-        if first_trigger_timestamp is None or ts is None:
+    def _exp_tr_for_volume(vol_idx: int) -> Optional[int]:
+        if vol_idx <= 0:
             return None
-        return max(1, int(np.floor((float(ts) - first_trigger_timestamp) / tr_seconds)) + 1)
+        return vol_idx
+
+    def _analysis_tr_for_volume(vol_idx: int) -> Optional[int]:
+        exp_tr = _exp_tr_for_volume(vol_idx)
+        if exp_tr is None:
+            return None
+        analysis_tr = exp_tr - skip_first_trs
+        if analysis_tr <= 0:
+            return None
+        return analysis_tr
 
     def drain_queue() -> None:
         nonlocal max_seen_vol
@@ -366,22 +376,16 @@ def run_nf_events_presentation(
                                 "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
                             },
                         )
-                if start_vol is None:
-                    continue
-                if vol_idx <= start_vol:
-                    continue
-                analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
-                msg_ts: Optional[float]
-                try:
-                    msg_ts = float(analysis_timestamp) if analysis_timestamp is not None else None
-                except (TypeError, ValueError):
-                    msg_ts = None
-
-                exp_tr = _exp_tr_for_time(msg_ts)
+                exp_tr = _analysis_tr_for_volume(vol_idx)
                 if exp_tr is None:
-                    exp_tr = max(1, vol_idx - start_vol)
+                    continue
 
-                if message.get("reg_ready", True) and message.get("score_raw") is not None:
+                # Baseline TRs are for normalization / denoising warmup and
+                # must never leak into trial-scoring windows.
+                if exp_tr < first_nonbaseline_tr:
+                    continue
+                # Accept only explicitly regressed samples.
+                if bool(message.get("reg_ready", False)) and message.get("score_raw") is not None:
                     try:
                         score_by_exp_tr[exp_tr] = float(message["score_raw"])
                     except (TypeError, ValueError):
@@ -397,7 +401,6 @@ def run_nf_events_presentation(
         keys = event.getKeys()
         if "s" in keys:
             first_trigger_timestamp = time.time()
-            start_vol = max_seen_vol
             break
         if "escape" in keys:
             win.close()
@@ -455,9 +458,7 @@ def run_nf_events_presentation(
 
         while True:
             drain_queue()
-            current_exp_tr = _exp_tr_for_time(time.time())
-            if current_exp_tr is None:
-                current_exp_tr = 0
+            current_exp_tr = _analysis_tr_for_volume(max_seen_vol) or 0
 
             win.color = [-0.004,-0.004,-0.004]  # gray background
             if stage_name == "cue":
@@ -556,6 +557,12 @@ def main() -> None:
         default=20,
         help="Number of NF trials to run.",
     )
+    parser.add_argument(
+        "--skip-first-trs",
+        type=int,
+        default=0,
+        help="TRs to skip entirely after trigger (excluded from baseline/trials/scoring).",
+    )
     parser.add_argument("--baseline-trs", type=int, default=None, help="Baseline duration before trial 1 (TRs).")
     parser.add_argument("--iti-trs", type=int, default=3, help="ITI duration (TRs).")
     parser.add_argument("--cue-trs", type=int, default=4, help="Cue duration (TRs).")
@@ -644,6 +651,8 @@ def main() -> None:
         if args.baseline_trs is not None
         else int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
     )
+    if args.skip_first_trs < 0:
+        raise ValueError("--skip-first-trs must be >= 0")
     if baseline_trs < 0:
         raise ValueError("--baseline-trs must be >= 0")
 
@@ -666,6 +675,9 @@ def main() -> None:
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
+    # Baseline TRs define the warmup window for voxel-wise normalization and
+    # denoising startup; keep pipeline normalization in sync with presentation.
+    settings_payload["voxel_norm_ref_volumes"] = max(1, baseline_trs)
     settings_payload.update(
         {
             "enable_biopac_physio": args.biopac_enable,
@@ -689,6 +701,7 @@ def main() -> None:
             "psychopy": {
                 "script": "rt_nf_events_parallel.py",
                 "n_trials": args.n_trials,
+                "skip_first_trs": args.skip_first_trs,
                 "baseline_trs": baseline_trs,
                 "iti_trs": args.iti_trs,
                 "cue_trs": args.cue_trs,
@@ -736,6 +749,7 @@ def main() -> None:
     try:
         run_nf_events_presentation(
             score_queue=score_queue,
+            skip_first_trs=args.skip_first_trs,
             baseline_trs=baseline_trs,
             n_trials=args.n_trials,
             iti_trs=args.iti_trs,
