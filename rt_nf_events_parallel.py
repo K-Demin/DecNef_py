@@ -84,6 +84,15 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
         return
 
     reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+    if prefer_reg_ready and reg_ready_map is None:
+        return
+
+    first_reg_ready_vol = None
+    if reg_ready_map:
+        ready_vols = [vol for vol, ready in reg_ready_map.items() if ready]
+        if ready_vols:
+            first_reg_ready_vol = min(ready_vols)
+
     qc_exclude_until_vol = 0
     metadata_path = run_dir / "session_metadata.json"
     if metadata_path.exists():
@@ -107,7 +116,9 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
                 score = float(row["score_raw"])
             except (TypeError, ValueError):
                 continue
-            if reg_ready_map is not None and vol in reg_ready_map and not reg_ready_map[vol]:
+            if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            if first_reg_ready_vol is not None and vol <= first_reg_ready_vol:
                 continue
             if vol <= qc_exclude_until_vol:
                 continue
