@@ -479,6 +479,18 @@ def main() -> None:
         help="Stop the run after this many TRs (or press ESC).",
     )
     parser.add_argument(
+        "--skip-first-trs",
+        type=int,
+        default=10,
+        help="TRs to exclude from downstream analyses (warmup after trigger).",
+    )
+    parser.add_argument(
+        "--baseline-trs",
+        type=int,
+        default=None,
+        help="TRs for voxel-wise normalization baseline (defaults to settings voxel_norm_ref_volumes).",
+    )
+    parser.add_argument(
         "--settings-file",
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
@@ -496,6 +508,15 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    if args.skip_first_trs < 0:
+        raise ValueError("--skip-first-trs must be >= 0")
+    baseline_trs = (
+        int(args.baseline_trs)
+        if args.baseline_trs is not None
+        else int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
+    )
+    if baseline_trs < 0:
+        raise ValueError("--baseline-trs must be >= 0")
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
 
     if args.epi_block is not None:
@@ -529,6 +550,8 @@ def main() -> None:
             "fixation_display": {
                 "description": "Grey screen only.",
                 "started_at": datetime.now(timezone.utc).isoformat(),
+                "skip_first_trs": args.skip_first_trs,
+                "baseline_trs": baseline_trs,
             }
         },
     )
@@ -604,6 +627,8 @@ def main() -> None:
         settings_payload = vars(REGRESSOR_SETTINGS).copy()
         settings_payload.update(
             {
+                "skip_first_trs": args.skip_first_trs,
+                "voxel_norm_ref_volumes": max(1, baseline_trs),
                 "enable_biopac_physio": args.biopac_enable,
                 "biopac_host": args.biopac_host,
                 "biopac_port": args.biopac_port,
