@@ -211,13 +211,6 @@ def _build_presentation_window(visual, color):
                     "fullscr": True,
                 }
             )
-        else:
-            window_kwargs.update(
-                {
-                    "screen": 0,
-                    "fullscr": True,
-                }
-            )
 
     except Exception as exc:
         log.warning("Could not detect external monitor; using default window size: %s", exc)
@@ -299,18 +292,17 @@ def run_nf_events_presentation(
     fixation = visual.ShapeStim(
         win,
         vertices="cross",
-        size=(0.05, 0.05),
+        size=[0.1 * win.size[1], 0.1 * win.size[1]],
         lineWidth=1.0,
-        fillColor=[0.0, 0.0, 0.0],
-        lineColor=[0.0, 0.0, 0.0],
-        pos=(0, 0),
+        fillColor="white",
+        lineColor="white",
     )
     feedback_circle = visual.Circle(
         win,
-        radius=0,
-        fillColor=[0.0, 0.0, 0.0],
-        lineColor=[0.0, 0.0, 0.0],
-        pos=(0, 0),
+        radius=1,
+        lineWidth=10,
+        fillColor=[-0.5, 0.7, -0.5],
+        lineColor=[-0.5, 0.7, -0.5],
     )
     # Scale circles relative to the presentation window; reference and
     # feedback share the same maximum radius at a perfect score.
@@ -319,10 +311,9 @@ def run_nf_events_presentation(
     max_reference_circle = visual.Circle(
         win,
         radius=max_reference_radius,
-        fillColor=None,
+        fillColor=[-0.004,-0.004,-0.004], #same as background
         lineColor=[0.85, 0.85, 0.85],
-        lineWidth=4,
-        pos=(0, 0),
+        lineWidth=10,
     )
     missing_score_text = visual.TextStim(
         win,
@@ -395,6 +386,7 @@ def run_nf_events_presentation(
 
     # Wait for manual trigger.
     while True:
+        win.fullscr = True
         drain_queue()
         waiting_text.draw()
         win.flip()
@@ -501,14 +493,15 @@ def run_nf_events_presentation(
                 else:
                     rating = float(np.clip(t_score, 0.0, 100.0))
                     radius = max_feedback_radius * (rating / 100.0)
-                feedback_circle.radius = radius
+                feedback_circle.setRadius(radius, log=False)
+                # print(feedback_circle.fillColor)
                 feedback_circle.fillColor = [-0.5, 0.7, -0.5]
                 feedback_circle.lineColor = [-0.5, 0.7, -0.5]
                 # Draw both circles on every feedback frame. Draw the filled
                 # feedback first, then the outline reference on top so both are
                 # visible even when the score reaches the maximum radius.
-                feedback_circle.draw()
                 max_reference_circle.draw()
+                feedback_circle.draw()
                 missing_score_text.text = "Score not received in time" if np.isnan(t_score) else ""
                 if missing_score_text.text:
                     missing_score_text.draw()

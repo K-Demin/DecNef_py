@@ -8,6 +8,7 @@
   "mot_reg": "mot6",
   "max_poly_order": "inf",
   "enable_motion_regression": true,
+  "skip_first_trs": 10,
   "voxel_norm_ref_volumes": 30,
 
   "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
@@ -38,6 +39,6 @@
   "biopac_timelag": false,
 
   "_comment_runtime": "Pipeline robustness/performance settings.",
-  "max_workers": 1,
+  "max_workers": 2,
   "max_retries": 3
 }

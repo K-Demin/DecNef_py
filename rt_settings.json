@@ -8,7 +8,8 @@
   "mot_reg": "mot6",
   "max_poly_order": "inf",
   "enable_motion_regression": true,
-  "voxel_norm_ref_volumes": 1,
+  "skip_first_trs": 10,
+  "voxel_norm_ref_volumes": 30,
 
   "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
   "use_gs": false,
