@@ -60,6 +60,7 @@ def append_score(
     volume_idx: int,
     raw_score: float,
     original_score: Optional[float] = None,
+    reg_ready: Optional[bool] = None,
     timestamp: Optional[float] = None,
 ) -> float:
     if timestamp is None:
@@ -69,8 +70,8 @@ def append_score(
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not exists:
-            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_original"])
-        writer.writerow([volume_idx, timestamp, raw_score, original_score])
+            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_original", "reg_ready"])
+        writer.writerow([volume_idx, timestamp, raw_score, original_score, int(reg_ready) if reg_ready is not None else ""])
     return timestamp
 
 
@@ -81,6 +82,7 @@ def append_score_z(
     raw_score: float,
     z_score: float,
     ref_stats: dict,
+    reg_ready: Optional[bool] = None,
 ) -> None:
     exists = csv_path.exists()
     with open(csv_path, "a", newline="") as f:
@@ -97,6 +99,7 @@ def append_score_z(
                     "ref_std",
                     "ref_n",
                     "ref_used_reg_ready",
+                    "reg_ready",
                 ]
             )
         writer.writerow(
@@ -110,6 +113,7 @@ def append_score_z(
                 ref_stats["std"],
                 ref_stats["n"],
                 int(ref_stats.get("used_reg_ready", False)),
+                int(reg_ready) if reg_ready is not None else "",
             ]
         )
 
@@ -441,8 +445,10 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
 
     scores = []
     scores_all = []
+    reg_ready_scores = []
     with open(scores_path, newline="") as f:
         reader = csv.DictReader(f)
+        has_score_reg_ready = bool(reader.fieldnames and "reg_ready" in reader.fieldnames)
         for row in reader:
             try:
                 vol = int(row["volume_idx"])
@@ -452,10 +458,27 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
             if np.isnan(raw):
                 continue
             scores_all.append(raw)
-            if reg_ready_map is None or reg_ready_map.get(vol, False):
+            score_reg_ready = None
+            if has_score_reg_ready:
+                try:
+                    score_reg_ready = bool(int(row["reg_ready"]))
+                except (TypeError, ValueError, KeyError):
+                    score_reg_ready = None
+            ready = reg_ready_map.get(vol, False) if reg_ready_map is not None else score_reg_ready
+            if ready is None:
+                ready = True
+            if ready:
                 scores.append(raw)
+            if ready:
+                reg_ready_scores.append((vol, raw))
 
-    used_reg_ready = reg_ready_map is not None
+    used_reg_ready = (reg_ready_map is not None) or has_score_reg_ready
+    skipped_first_reg_ready = False
+    if reg_ready_scores:
+        # Drop the first regressed sample from RS reference normalization.
+        # RTP regression output can still show a transient at the first reg_ready TR.
+        scores = [raw for _, raw in reg_ready_scores[1:]]
+        skipped_first_reg_ready = True
     if used_reg_ready and not scores:
         log.warning(
             "[SCORE] No reg_ready scores found in %s; falling back to all scores.",
@@ -481,6 +504,7 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
         "std": std,
         "n": int(len(scores)),
         "used_reg_ready": used_reg_ready,
+        "skipped_first_reg_ready": skipped_first_reg_ready,
     }
 
 
@@ -1357,6 +1381,7 @@ def process_volume(
             volume_idx,
             raw_score,
             original_score=original_score,
+            reg_ready=reg_ready,
             timestamp=analysis_timestamp,
         )
         z_score = None
@@ -1370,6 +1395,7 @@ def process_volume(
                 raw_score,
                 z_score,
                 stats,
+                reg_ready=reg_ready,
             )
         if handler.score_queue is not None:
             try:
