@@ -835,13 +835,23 @@ def process_dataset(
 
         motion_qc = _pc_motion_qc(timecourses, motion_used) if USE_MOTION_QC else None
 
-        # Save outputs
+        # Save outputs (same naming/layout across ROIs for downstream scoring scripts)
         np.save(roi_dir / "pca_explained.npy", explained)
         np.save(roi_dir / "pca_timecourses.npy", timecourses)
         np.save(roi_dir / "decoder_voxel_indices.npy", flat_indices)
         np.save(roi_dir / "decoder_weights.npy", components)
         np.save(roi_dir / "decoder_norm_mean.npy", mean_vox.astype(np.float32))
         np.save(roi_dir / "decoder_norm_std.npy", std_safe.astype(np.float32))
+        # Single-file bundle for robust loading (keeps all arrays in one consistent container).
+        np.savez_compressed(
+            roi_dir / "decoder_bundle.npz",
+            voxel_indices=flat_indices.astype(np.int64, copy=False),
+            weights=components.astype(np.float32, copy=False),
+            norm_mean=mean_vox.astype(np.float32, copy=False),
+            norm_std=std_safe.astype(np.float32, copy=False),
+            explained=explained.astype(np.float32, copy=False),
+            timecourses=timecourses.astype(np.float32, copy=False),
+        )
 
         reference_img = tsnr_img
         for i in range(components.shape[0]):
@@ -869,6 +879,9 @@ def process_dataset(
             "motion_file": str(run_dir / "motion_rt.1D") if (run_dir / "motion_rt.1D").exists() else None,
             "pc_motion_qc": motion_qc,
             "decoder_ready": "scores = weights @ voxel_values (optionally z-scored)",
+            "decoder_bundle": "decoder_bundle.npz",
+            "normalization_for_scoring": "zscore_using_decoder_norm_mean_std",
+            "cross_day_note": "for longitudinal comparability, keep training normalization fixed and optionally z-score component outputs against a stable reference run",
         }
         with open(roi_dir / "decoder_metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
