@@ -55,6 +55,89 @@ def log_step(step: str, vol: int, extra: str = "", start_t=None):
         log.info(f"[{step:<5}] vol {v}  {extra}")
 
 
+
+
+class ScoreEventTracker:
+    """Infer per-volume event/stage labels from session_metadata.json."""
+
+    def __init__(self, run_dir: Path):
+        self.run_dir = run_dir
+        self._mode = None
+        self._skip_first_trs = 0
+        self._baseline_trs = 0
+        self._n_trials = 0
+        self._stage_defs: list[tuple[str, int]] = []
+        self._load_metadata()
+
+    def _load_metadata(self) -> None:
+        metadata_path = self.run_dir / "session_metadata.json"
+        if not metadata_path.exists():
+            return
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        if isinstance(metadata.get("fixation_display"), dict):
+            fix = metadata["fixation_display"]
+            self._mode = "rest"
+            self._skip_first_trs = int(fix.get("skip_first_trs", 0) or 0)
+            self._baseline_trs = int(fix.get("baseline_trs", 0) or 0)
+
+        psychopy = metadata.get("psychopy")
+        if not isinstance(psychopy, dict):
+            return
+        script = psychopy.get("script")
+        if script != "rt_nf_events_parallel.py":
+            return
+
+        self._mode = "nf_events"
+        self._skip_first_trs = int(psychopy.get("skip_first_trs", 0) or 0)
+        self._baseline_trs = int(psychopy.get("baseline_trs", 0) or 0)
+        self._n_trials = int(psychopy.get("n_trials", 0) or 0)
+        self._stage_defs = [
+            ("iti", int(psychopy.get("iti_trs", 0) or 0)),
+            ("cue", int(psychopy.get("cue_trs", 0) or 0)),
+            ("scans", int(psychopy.get("scans_trs", 0) or 0)),
+            ("delay", int(psychopy.get("delay_trs", 0) or 0)),
+            ("feedback", int(psychopy.get("feedback_trs", 0) or 0)),
+        ]
+
+    def for_volume(self, volume_idx: int) -> Optional[str]:
+        if self._mode is None:
+            return None
+        if volume_idx <= self._skip_first_trs:
+            return "background"
+
+        exp_tr = volume_idx - self._skip_first_trs
+
+        if self._mode == "rest":
+            if exp_tr <= self._baseline_trs:
+                return "background"
+            return "rest"
+
+        if exp_tr <= self._baseline_trs:
+            return "background"
+
+        if self._mode != "nf_events":
+            return None
+
+        stage_cycle: list[str] = []
+        for stage, dur in self._stage_defs:
+            stage_cycle.extend([stage] * max(0, dur))
+        if not stage_cycle:
+            return None
+
+        tr_after_baseline = exp_tr - self._baseline_trs
+        cycle_len = len(stage_cycle)
+        trial_idx = (tr_after_baseline - 1) // cycle_len
+        if trial_idx >= self._n_trials:
+            return "post_task"
+        stage_pos = (tr_after_baseline - 1) % cycle_len
+        return stage_cycle[stage_pos]
+
+
 def append_score(
     csv_path: Path,
     volume_idx: int,
@@ -62,6 +145,7 @@ def append_score(
     original_score: Optional[float] = None,
     reg_ready: Optional[bool] = None,
     timestamp: Optional[float] = None,
+    event_type: Optional[str] = None,
 ) -> float:
     if timestamp is None:
         timestamp = time.time()
@@ -70,8 +154,8 @@ def append_score(
     with open(csv_path, "a", newline="") as f:
         writer = csv.writer(f)
         if not exists:
-            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_original", "reg_ready"])
-        writer.writerow([volume_idx, timestamp, raw_score, original_score, int(reg_ready) if reg_ready is not None else ""])
+            writer.writerow(["volume_idx", "timestamp", "score_raw", "score_original", "reg_ready", "event_type"])
+        writer.writerow([volume_idx, timestamp, raw_score, original_score, int(reg_ready) if reg_ready is not None else "", event_type or ""])
     return timestamp
 
 
@@ -634,6 +718,7 @@ class DICOMHandler(FileSystemEventHandler):
         self._biopac_timelag_count = 0
         self._biopac_timelag_path = self.cfg.rt_work_dir / "biopac_timelag.csv"
         self.reference_score_stats = cfg.reference_score_stats
+        self.score_event_tracker = ScoreEventTracker(cfg.rt_work_dir)
         if self.reference_score_stats is not None:
             log.info(
                 "[SCORE] Using reference run %s (mean=%.4f, std=%.4f, n=%s, reg_ready=%s)",
@@ -1375,6 +1460,7 @@ def process_volume(
 
         # Always compute raw; z will be NaN until baseline_ready
         raw_score = handler.scorer.score_from_array(score_data)
+        event_type = handler.score_event_tracker.for_volume(volume_idx)
         analysis_timestamp = time.time()
         timestamp = append_score(
             cfg.rt_work_dir / "scores.csv",
@@ -1383,6 +1469,7 @@ def process_volume(
             original_score=original_score,
             reg_ready=reg_ready,
             timestamp=analysis_timestamp,
+            event_type=event_type,
         )
         z_score = None
         if handler.reference_score_stats is not None:
@@ -1407,6 +1494,7 @@ def process_volume(
                     "score_raw": raw_score,
                     "score_original": original_score,
                     "reg_ready": reg_ready,
+                    "event_type": event_type,
                 }
                 if z_score is not None:
                     payload["score_z"] = z_score
