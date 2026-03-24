@@ -626,6 +626,13 @@ def main() -> None:
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, args.sub, args.day)
 
+        decoder_selected = bool(args.decoder_template)
+        enable_scoring = decoder_selected and not args.no_score
+        if not decoder_selected:
+            log.info("[SCORE] No decoder selected (--decoder-template not provided); scoring will be skipped.")
+        elif args.no_score:
+            log.info("[SCORE] Decoder was provided but --no-score is set; scoring will be skipped.")
+
         cfg = RTSessionConfig(
             subject=args.sub,
             day=args.day,
@@ -633,7 +640,7 @@ def main() -> None:
             incoming_root=incoming_root,
             base_data=base_data,
             decoder_template=Path(args.decoder_template) if args.decoder_template else None,
-            enable_scoring=not args.no_score,
+            enable_scoring=enable_scoring,
         )
 
         # pca_root = cfg.day_root / "PCA"
