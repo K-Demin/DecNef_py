@@ -20,6 +20,7 @@ from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap_to_3d
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -1521,12 +1522,35 @@ def process_volume(
 
 
 def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
-    warp = cfg.day_root / "fmap" / "AP2PA_1InverseWarp.nii"
-    affine = cfg.day_root / "fmap" / "AP2PA_0GenericAffine.mat"
-    pa_mean = cfg.day_root / "fmap" / "PA_mean.nii.gz"
+    fmap_dir = cfg.day_root / "fmap"
+    method = str(REGRESSOR_SETTINGS.fieldmap_method).lower()
+    epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
+
+    if method == "pyhysco":
+        pyhysco_field = fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        if not pyhysco_field.exists():
+            log.error("[FMAP] Missing PyHySCO fieldmap: %s", pyhysco_field)
+            return False
+        polarity = 1 if epi_pe == "AP" else -1
+        pyhysco_ped = 1 if epi_pe == "AP" else 2
+        apply_pyhysco_fieldmap_to_3d(
+            epi_3d=raw_nii,
+            fieldmap_path=pyhysco_field,
+            out_path=out_nii,
+            phase_encoding_direction=pyhysco_ped,
+            polarity=polarity,
+        )
+        return True
+
+    warp = fmap_dir / "AP2PA_1InverseWarp.nii"
+    affine = fmap_dir / "AP2PA_0GenericAffine.mat"
+    ref_img = fmap_dir / "PA_mean.nii.gz"
+    if epi_pe == "AP":
+        warp = fmap_dir / "AP2PA_1Warp.nii.gz"
+        ref_img = fmap_dir / "AP_mean.nii.gz"
 
     if not warp.exists() or not affine.exists():
-        log.error("[FMAP] Missing AP→PA warp or affine")
+        log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
         return False
 
     cmd = [
@@ -1539,7 +1563,7 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
             -d 3 \
             -e 3 \
             -i {raw_nii} \
-            -r {pa_mean} \
+            -r {ref_img} \
             -o {out_nii} \
             -t {warp} \
             -t {affine} --float 1

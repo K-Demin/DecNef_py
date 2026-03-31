@@ -19,6 +19,8 @@ class SubjectDayConfig:
     t1_file: Path
     mni_template: Path
     runs: list[RunConfig]
+    fieldmap_method: str = "pyhysco"
+    epi_phase_encoding: str = "PA"
     project_root = Path(__file__).resolve().parents[1]
     decoder_template = project_root / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
@@ -41,6 +43,8 @@ class SubjectDayConfig:
             t1_file=subject_root / "anat" / "T1.nii",
             mni_template=Path(cfg["templates"]["mni_t1"]),
             runs=runs,
+            fieldmap_method=cfg.get("fieldmap_method", "pyhysco"),
+            epi_phase_encoding=cfg.get("epi_phase_encoding", "PA"),
         )
 
     @classmethod
@@ -97,6 +101,8 @@ class SubjectDayConfig:
             t1_file=root.parent / "anat" / "T1.nii.gz",
             mni_template=mni_template,
             runs=runs,
+            fieldmap_method="pyhysco",
+            epi_phase_encoding="PA",
         )
 
     @classmethod
@@ -163,6 +169,8 @@ class SubjectDayConfig:
             t1_file=t1_path,
             mni_template=mni_template,
             runs=runs,
+            fieldmap_method="pyhysco",
+            epi_phase_encoding="PA",
         )
 
 
@@ -181,6 +189,8 @@ class SubjectDayConfig:
             "templates": {
                 "mni_t1": str(self.mni_template),
             },
+            "fieldmap_method": self.fieldmap_method,
+            "epi_phase_encoding": self.epi_phase_encoding,
             "runs": [
                 {
                     "id": r.id,

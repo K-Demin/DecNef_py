@@ -1,7 +1,6 @@
 {
   "_comment": "Global realtime defaults shared by rt_pipeline.py, rt_psychopy_parallel.py, and rs_realtime_parallel.py.",
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
-
   "_comment_timing": "Acquisition timing/model settings. analysis_space: epi (native EPI), t1 (EPI->T1), or mni (EPI->T1->MNI). voxel_norm_ref_volumes controls normalization reference length in both regression and no-regression modes.",
   "TR": 1.0,
   "analysis_space": "mni",
@@ -10,12 +9,10 @@
   "enable_motion_regression": true,
   "skip_first_trs": 10,
   "voxel_norm_ref_volumes": 30,
-
   "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
   "use_gs": false,
   "use_wm": true,
   "use_vent": true,
-
   "_comment_censor": "Motion/outlier censoring thresholds.",
   "enable_fd_censor_reg": true,
   "fd_thr": 0.3,
@@ -24,7 +21,6 @@
   "censor_plus1": true,
   "dvars_warmup": 20,
   "dvars_mask_source": "ref_mask",
-
   "_comment_biopac": "BIOPAC/RETROTS receiver defaults. Override per run with CLI if needed.",
   "enable_biopac_physio": true,
   "biopac_phys_reg": "RICOR8",
@@ -37,8 +33,10 @@
   "biopac_file": null,
   "biopac_poll_interval": 0.05,
   "biopac_timelag": false,
-
   "_comment_runtime": "Pipeline robustness/performance settings.",
   "max_workers": 6,
-  "max_retries": 3
+  "max_retries": 3,
+  "_comment_fieldmap": "Fieldmap correction settings for realtime unwarping (PyHySCO PED is derived from epi_phase_encoding).",
+  "fieldmap_method": "pyhysco",
+  "epi_phase_encoding": "PA"
 }

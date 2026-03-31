@@ -46,6 +46,8 @@ class RegressorSettings:
     max_workers: int = 6
     max_retries: int = 3
     skip_first_trs: int = 0
+    fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
+    epi_phase_encoding: str = "PA"  # "AP" or "PA"
 
     def update(self, overrides: dict[str, Any]) -> None:
         known = {f.name: f for f in fields(self)}
@@ -58,6 +60,10 @@ class RegressorSettings:
                 setattr(self, key, max(1, int(value)))
             elif key == "skip_first_trs":
                 setattr(self, key, max(0, int(value)))
+            elif key == "fieldmap_method":
+                setattr(self, key, str(value).lower())
+            elif key == "epi_phase_encoding":
+                setattr(self, key, str(value).upper())
             else:
                 setattr(self, key, value)
 
