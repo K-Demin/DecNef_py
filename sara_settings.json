@@ -4,12 +4,14 @@
 
   "_comment_timing": "Acquisition timing/model settings. analysis_space: epi (native EPI), t1 (EPI->T1), or mni (EPI->T1->MNI). voxel_norm_ref_volumes controls normalization reference length in both regression and no-regression modes.",
   "TR": 1,
-  "analysis_space": "t1",
+  "analysis_space": "mni",
+  "skip_first_trs": 10,
+  "voxel_norm_ref_volumes": 30,
+
   "mot_reg": "mot6",
   "max_poly_order": "inf",
   "enable_motion_regression": true,
-  "skip_first_trs": 10,
-  "voxel_norm_ref_volumes": 30,
+
 
   "_comment_masks": "Mask-based nuisance regressors. GS often removed to avoid over-correcting global signal.",
   "use_gs": false,
