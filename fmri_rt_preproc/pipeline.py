@@ -13,6 +13,8 @@ import gzip
 import shutil
 import os
 
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap_to_4d
+
 def gunzip_python(gz_path):
     gz_path = Path(gz_path)
     out_path = gz_path.with_suffix("")  # removes .gz → gives .nii
@@ -35,6 +37,8 @@ class FMRIRealtimePreprocessor:
         self.ants_env = ants_env
         self.trans_dir = self.func_dir / "trans"
         self.fastsurfer_sid = self.cfg.subject_id
+        self.fieldmap_method = str(getattr(cfg, "fieldmap_method", "pyhysco")).lower()
+        self.epi_phase_encoding = str(getattr(cfg, "epi_phase_encoding", "PA")).upper()
 
         # --- NEW: global EPI reference for RT (per day) ---
         # This will be set from the FIRST run we preprocess.
@@ -228,9 +232,41 @@ class FMRIRealtimePreprocessor:
         ap_mean = self.fmap_dir / "AP_mean.nii"
         pa_mean = self.fmap_dir / "PA_mean.nii"
 
-        ap2pa_warp = self.fmap_dir / "AP2PA_Warped.nii"
-        if not ap2pa_warp.exists():
-            self._run_ap_pa_ants(ap_mean, pa_mean)
+        if self.fieldmap_method == "pyhysco":
+            self._run_ap_pa_pyhysco(ap_mean, pa_mean)
+        elif self.fieldmap_method == "ants":
+            ap2pa_warp = self.fmap_dir / "AP2PA_Warped.nii"
+            if not ap2pa_warp.exists():
+                self._run_ap_pa_ants(ap_mean, pa_mean)
+        else:
+            raise ValueError(
+                f"Unknown fieldmap_method={self.fieldmap_method}. Use 'pyhysco' or 'ants'."
+            )
+
+    def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path):
+        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        if pyhysco_field.exists():
+            print("✓ PyHySCO fieldmap already exists — skipping")
+            return
+
+        pyhysco_prefix = self.fmap_dir / "pyhysco"
+        pyhysco_src = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
+        cmd = [
+            "bash", "-lc",
+            f"""
+            export PYTHONPATH="{pyhysco_src}:$PYTHONPATH"
+            python "{pyhysco_src / 'scripts' / 'pyhysco.py'}" \
+              "{ap_mean}" "{pa_mean}" {self.pyhysco_phase_encoding_direction} \
+              --output_dir "{pyhysco_prefix}" --max_iter 50 --correction jac
+            """
+        ]
+        run(cmd)
+
+        generated_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        if not generated_field.exists():
+            raise FileNotFoundError(
+                f"Expected PyHySCO fieldmap not found: {generated_field}"
+            )
 
     def _run_ap_pa_ants(self, ap_mean: Path, pa_mean: Path):
         out_prefix = self.fmap_dir / "AP2PA_"
@@ -354,9 +390,24 @@ class FMRIRealtimePreprocessor:
         if out.exists():
             return
 
+        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        if self.fieldmap_method == "pyhysco" and pyhysco_field.exists():
+            polarity = 1 if self.epi_phase_encoding == "AP" else -1
+            print(f"→ Applying PyHySCO fieldmap to {epi_4d.name}")
+            apply_pyhysco_fieldmap_to_4d(
+                epi_4d=epi_4d,
+                fieldmap_path=pyhysco_field,
+                out_path=out,
+                phase_encoding_direction=self.pyhysco_phase_encoding_direction,
+                polarity=polarity,
+            )
+            return
         warp = self.fmap_dir / "AP2PA_1InverseWarp.nii"
         affine = self.fmap_dir / "AP2PA_0GenericAffine.mat"
         PA_mean = self.fmap_dir / "PA_mean.nii"
+        if self.epi_phase_encoding == "AP":
+            warp = self.fmap_dir / "AP2PA_1Warp.nii.gz"
+            PA_mean = self.fmap_dir / "AP_mean.nii"
 
         if not warp.exists() or not affine.exists():
             raise FileNotFoundError(
@@ -383,6 +434,14 @@ class FMRIRealtimePreprocessor:
 
         ]
         run(cmd)
+
+    @property
+    def pyhysco_phase_encoding_direction(self) -> int:
+        """
+        Derive PyHySCO PED from chosen EPI phase-encoding:
+          AP -> 1, PA -> 2.
+        """
+        return 1 if self.epi_phase_encoding == "AP" else 2
 
     def _skullstrip_epi(self, epi_unwarped: Path, brain: Path, mask: Path):
         if brain.exists() and mask.exists():
