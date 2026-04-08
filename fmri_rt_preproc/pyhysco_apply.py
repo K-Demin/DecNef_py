@@ -39,11 +39,11 @@ def _load_internal_fieldmap(fieldmap_path: Path, data_obj: DataObject) -> torch.
         )
 
     internal_perm = _inverse_permutation(data_obj.p)
-    return field.permute(internal_perm).contiguous().view(-1, 1)
+    return field.permute(internal_perm).contiguous()
 
 
-def apply_pyhysco_fieldmap_to_4d(
-    epi_4d: Path,
+def apply_pyhysco_fieldmap(
+    epi_path: Path,
     fieldmap_path: Path,
     out_path: Path,
     phase_encoding_direction: int = 1,
@@ -52,12 +52,12 @@ def apply_pyhysco_fieldmap_to_4d(
     dtype: torch.dtype = torch.float32,
 ) -> Path:
     """
-    Apply a pre-estimated PyHySCO fieldmap to every volume of a 4D EPI.
+    Apply a pre-estimated PyHySCO fieldmap to a 3D or 4D EPI.
 
     Parameters
     ----------
-    epi_4d:
-        Input distorted 4D EPI.
+    epi_path:
+        Input distorted 3D or 4D EPI.
     fieldmap_path:
         Fieldmap saved by PyHySCO (`*-EstFieldMap.nii.gz`).
     out_path:
@@ -74,80 +74,49 @@ def apply_pyhysco_fieldmap_to_4d(
     if device is None:
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    epi_img = nib.load(str(epi_4d))
+    epi_img = nib.load(str(epi_path))
     epi = np.asarray(epi_img.dataobj)
-    if epi.ndim != 4:
-        raise ValueError(f"Expected 4D EPI, got shape {epi.shape}")
+    if epi.ndim == 3:
+        epi_work = epi[..., np.newaxis]
+        squeeze_output = True
+    elif epi.ndim == 4:
+        epi_work = epi
+        squeeze_output = False
+    else:
+        raise ValueError(f"Expected 3D or 4D EPI, got shape {epi.shape}")
 
-    corrected = np.zeros_like(epi, dtype=np.float32)
+    corrected = np.zeros_like(epi_work, dtype=np.float32)
     run_tag = uuid4().hex
 
-    for t in range(epi.shape[-1]):
-        vol_path = epi_4d.parent / f".__pyhysco_tmp_{epi_4d.stem}_{run_tag}_vol_{t:04d}.nii.gz"
-        nib.save(nib.Nifti1Image(epi[..., t], epi_img.affine, epi_img.header), str(vol_path))
+    for t in range(epi_work.shape[-1]):
+        vol_path = epi_path.parent / f".__pyhysco_tmp_{epi_path.stem}_{run_tag}_vol_{t:04d}.nii.gz"
+        try:
+            nib.save(nib.Nifti1Image(epi_work[..., t], epi_img.affine, epi_img.header), str(vol_path))
 
-        data_obj = DataObject(
-            str(vol_path),
-            str(vol_path),
-            phase_encoding_direction=phase_encoding_direction,
-            do_normalize=False,
-            dtype=dtype,
-            device=device,
-        )
-        corr_obj = EPIMRIDistortionCorrection(data_obj, alpha=1.0, beta=0.0)
-        b = _load_internal_fieldmap(fieldmap_path, data_obj)
-        if polarity < 0:
-            b = -b
+            data_obj = DataObject(
+                str(vol_path),
+                str(vol_path),
+                phase_encoding_direction=phase_encoding_direction,
+                do_normalize=False,
+                dtype=dtype,
+                device=device,
+            )
+            corr_obj = EPIMRIDistortionCorrection(data_obj, alpha=1.0, beta=0.0)
+            b = _load_internal_fieldmap(fieldmap_path, data_obj)
+            if polarity < 0:
+                b = -b
 
-        corr_vol, _, _, _ = corr_obj.mp_transform(corr_obj.dataObj.I1, b, do_derivative=False)
-        corr_vol = corr_vol.reshape(tuple(corr_obj.dataObj.m)).permute(corr_obj.dataObj.p)
-        corrected[..., t] = corr_vol.detach().cpu().numpy().astype(np.float32)
+            corr_vol, _, _, _ = corr_obj.mp_transform(corr_obj.dataObj.I1, b, do_derivative=False)
+            corr_vol = corr_vol.reshape(tuple(corr_obj.dataObj.m)).permute(corr_obj.dataObj.p)
+            corrected[..., t] = corr_vol.detach().cpu().numpy().astype(np.float32)
+        finally:
+            vol_path.unlink(missing_ok=True)
 
-        vol_path.unlink(missing_ok=True)
-
-    nib.save(nib.Nifti1Image(corrected, epi_img.affine, epi_img.header), str(out_path))
+    out_data = corrected[..., 0] if squeeze_output else corrected
+    nib.save(nib.Nifti1Image(out_data, epi_img.affine, epi_img.header), str(out_path))
     return out_path
 
 
-def apply_pyhysco_fieldmap_to_3d(
-    epi_3d: Path,
-    fieldmap_path: Path,
-    out_path: Path,
-    phase_encoding_direction: int = 1,
-    polarity: int = 1,
-    device: str | None = None,
-    dtype: torch.dtype = torch.float32,
-) -> Path:
-    """
-    Apply a pre-estimated PyHySCO fieldmap to a single 3D EPI volume.
-    """
-    img = nib.load(str(epi_3d))
-    data = np.asarray(img.dataobj)
-    if data.ndim == 4 and data.shape[-1] == 1:
-        data = data[..., 0]
-    if data.ndim != 3:
-        raise ValueError(f"Expected 3D EPI, got shape {data.shape}")
-
-    tmp_4d = epi_3d.parent / f".__pyhysco_tmp_{epi_3d.stem}_4d.nii.gz"
-    tmp_uw_4d = epi_3d.parent / f".__pyhysco_tmp_{epi_3d.stem}_uw4d.nii.gz"
-    try:
-        nib.save(
-            nib.Nifti1Image(data[..., np.newaxis], img.affine, img.header),
-            str(tmp_4d),
-        )
-        apply_pyhysco_fieldmap_to_4d(
-            epi_4d=tmp_4d,
-            fieldmap_path=fieldmap_path,
-            out_path=tmp_uw_4d,
-            phase_encoding_direction=phase_encoding_direction,
-            polarity=polarity,
-            device=device,
-            dtype=dtype,
-        )
-        uw_img = nib.load(str(tmp_uw_4d))
-        uw_data = np.asarray(uw_img.dataobj)[..., 0]
-        nib.save(nib.Nifti1Image(uw_data, img.affine, img.header), str(out_path))
-    finally:
-        tmp_4d.unlink(missing_ok=True)
-        tmp_uw_4d.unlink(missing_ok=True)
-    return out_path
+def apply_pyhysco_fieldmap_to_4d(*args, **kwargs) -> Path:
+    """Backward-compatible alias."""
+    return apply_pyhysco_fieldmap(*args, **kwargs)

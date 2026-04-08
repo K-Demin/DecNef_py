@@ -21,7 +21,7 @@ from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
-from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap_to_3d
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -1558,8 +1558,8 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
             return False
         polarity = 1 if epi_pe == "AP" else -1
         pyhysco_ped = 1 if epi_pe == "AP" else 2
-        apply_pyhysco_fieldmap_to_3d(
-            epi_3d=raw_nii,
+        apply_pyhysco_fieldmap(
+            epi_path=raw_nii,
             fieldmap_path=pyhysco_field,
             out_path=out_nii,
             phase_encoding_direction=pyhysco_ped,

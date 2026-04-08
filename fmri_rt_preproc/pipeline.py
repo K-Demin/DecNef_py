@@ -13,7 +13,7 @@ import gzip
 import shutil
 import os
 
-from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap_to_4d
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
 
 def gunzip_python(gz_path):
     gz_path = Path(gz_path)
@@ -394,8 +394,8 @@ class FMRIRealtimePreprocessor:
         if self.fieldmap_method == "pyhysco" and pyhysco_field.exists():
             polarity = 1 if self.epi_phase_encoding == "AP" else -1
             print(f"→ Applying PyHySCO fieldmap to {epi_4d.name}")
-            apply_pyhysco_fieldmap_to_4d(
-                epi_4d=epi_4d,
+            apply_pyhysco_fieldmap(
+                epi_path=epi_4d,
                 fieldmap_path=pyhysco_field,
                 out_path=out,
                 phase_encoding_direction=self.pyhysco_phase_encoding_direction,
