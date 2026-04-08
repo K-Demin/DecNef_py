@@ -4,13 +4,14 @@ import csv
 import logging
 import argparse
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, CancelledError
 
 import nibabel as nib
 import numpy as np
@@ -20,7 +21,7 @@ from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
-from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap_to_3d
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -985,8 +986,32 @@ class DICOMHandler(FileSystemEventHandler):
             if self._next_scan_to_process is None:
                 self._next_scan_to_process = scan
                 self._order_cv.notify_all()
-        self._executor.submit(self._process_scan, path, scan, volume_idx)
+        fut = self._executor.submit(self._process_scan, path, scan, volume_idx)
+        fut.add_done_callback(lambda f, s=scan, v=volume_idx: self._on_scan_future_done(f, s, v))
         return True
+
+    def _on_scan_future_done(self, future, scan: int, volume_idx: int) -> None:
+        try:
+            exc = future.exception()
+        except CancelledError:
+            return
+        if exc is None:
+            return
+
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        log.error(
+            "[WATCHDOG] Unhandled exception for scan %s (vol %05d): %s\n%s",
+            scan,
+            volume_idx,
+            exc,
+            tb,
+        )
+
+        with self._lock:
+            if scan in self._inflight_scans:
+                self._inflight_scans.discard(scan)
+                self.mark_processed(scan)
+                self._advance_expected_scan_locked(scan)
 
     def _advance_expected_scan_locked(self, finished_scan: int) -> None:
         candidates = [s for s in self._inflight_scans.union(self._pending_scans) if s > finished_scan]
@@ -1533,8 +1558,8 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
             return False
         polarity = 1 if epi_pe == "AP" else -1
         pyhysco_ped = 1 if epi_pe == "AP" else 2
-        apply_pyhysco_fieldmap_to_3d(
-            epi_3d=raw_nii,
+        apply_pyhysco_fieldmap(
+            epi_path=raw_nii,
             fieldmap_path=pyhysco_field,
             out_path=out_nii,
             phase_encoding_direction=pyhysco_ped,
