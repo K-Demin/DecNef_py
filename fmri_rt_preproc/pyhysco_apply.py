@@ -121,6 +121,8 @@ def apply_pyhysco_fieldmap_to_3d(
     """
     img = nib.load(str(epi_3d))
     data = np.asarray(img.dataobj)
+    if data.ndim == 4 and data.shape[-1] == 1:
+        data = data[..., 0]
     if data.ndim != 3:
         raise ValueError(f"Expected 3D EPI, got shape {data.shape}")
 
