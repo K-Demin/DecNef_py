@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+from uuid import uuid4
 
 import nibabel as nib
 import numpy as np
@@ -79,9 +80,10 @@ def apply_pyhysco_fieldmap_to_4d(
         raise ValueError(f"Expected 4D EPI, got shape {epi.shape}")
 
     corrected = np.zeros_like(epi, dtype=np.float32)
+    run_tag = uuid4().hex
 
     for t in range(epi.shape[-1]):
-        vol_path = epi_4d.parent / f".__pyhysco_tmp_vol_{t:04d}.nii.gz"
+        vol_path = epi_4d.parent / f".__pyhysco_tmp_{epi_4d.stem}_{run_tag}_vol_{t:04d}.nii.gz"
         nib.save(nib.Nifti1Image(epi[..., t], epi_img.affine, epi_img.header), str(vol_path))
 
         data_obj = DataObject(
@@ -121,6 +123,8 @@ def apply_pyhysco_fieldmap_to_3d(
     """
     img = nib.load(str(epi_3d))
     data = np.asarray(img.dataobj)
+    if data.ndim == 4 and data.shape[-1] == 1:
+        data = data[..., 0]
     if data.ndim != 3:
         raise ValueError(f"Expected 3D EPI, got shape {data.shape}")
 

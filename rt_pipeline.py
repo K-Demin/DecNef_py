@@ -4,13 +4,14 @@ import csv
 import logging
 import argparse
 import json
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, CancelledError
 
 import nibabel as nib
 import numpy as np
@@ -985,8 +986,32 @@ class DICOMHandler(FileSystemEventHandler):
             if self._next_scan_to_process is None:
                 self._next_scan_to_process = scan
                 self._order_cv.notify_all()
-        self._executor.submit(self._process_scan, path, scan, volume_idx)
+        fut = self._executor.submit(self._process_scan, path, scan, volume_idx)
+        fut.add_done_callback(lambda f, s=scan, v=volume_idx: self._on_scan_future_done(f, s, v))
         return True
+
+    def _on_scan_future_done(self, future, scan: int, volume_idx: int) -> None:
+        try:
+            exc = future.exception()
+        except CancelledError:
+            return
+        if exc is None:
+            return
+
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        log.error(
+            "[WATCHDOG] Unhandled exception for scan %s (vol %05d): %s\n%s",
+            scan,
+            volume_idx,
+            exc,
+            tb,
+        )
+
+        with self._lock:
+            if scan in self._inflight_scans:
+                self._inflight_scans.discard(scan)
+                self.mark_processed(scan)
+                self._advance_expected_scan_locked(scan)
 
     def _advance_expected_scan_locked(self, finished_scan: int) -> None:
         candidates = [s for s in self._inflight_scans.union(self._pending_scans) if s > finished_scan]
