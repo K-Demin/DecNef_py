@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, CancelledError
 
 import nibabel as nib
 import numpy as np
@@ -991,7 +991,10 @@ class DICOMHandler(FileSystemEventHandler):
         return True
 
     def _on_scan_future_done(self, future, scan: int, volume_idx: int) -> None:
-        exc = future.exception()
+        try:
+            exc = future.exception()
+        except CancelledError:
+            return
         if exc is None:
             return
 
