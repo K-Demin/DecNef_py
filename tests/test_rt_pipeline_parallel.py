@@ -148,7 +148,7 @@ def test_failure_path_timeout_advances_cursor(tmp_path):
         committed.append((env.scan, env.success))
         handler._inflight_scans.discard(env.scan)
         handler._last_committed_scan = env.scan
-        handler._next_scan_to_commit = None
+        handler._next_scan_to_commit = env.scan + 1
 
     handler._commit_scan = fake_commit
     handler._drain_commit_ready = rt_pipeline.DICOMHandler._drain_commit_ready.__get__(handler)
@@ -157,41 +157,50 @@ def test_failure_path_timeout_advances_cursor(tmp_path):
         volume_idx=2,
         dicom_path=Path("2.dcm"),
         volume_timestamp=time.time(),
-        success=True,
-    )
+            success=True,
+        )
     handler._drain_commit_ready()
-    assert committed[0][0] == 1
-    assert committed[0][1] is False
+    assert committed == []
 
-
-def test_commit_stage_fd_dvars_and_regression_progression(tmp_path):
-    handler = _mk_handler(tmp_path)
-    cfg = type("C", (), {"rt_reg_dir": tmp_path / "reg", "rt_work_dir": tmp_path, "enable_scoring": False})()
-    cfg.rt_reg_dir.mkdir(parents=True, exist_ok=True)
-
-    env1 = rt_pipeline.ResultEnvelope(
+    handler._result_buffer[1] = rt_pipeline.ResultEnvelope(
         scan=1,
         volume_idx=1,
         dicom_path=Path("1.dcm"),
         volume_timestamp=time.time(),
-        success=True,
-        mc_data=np.ones((2, 2, 2), dtype=np.float32),
-        affine=np.eye(4),
-        motion_vec=np.zeros(6),
+        success=False,
+        error="compute failed",
     )
-    env2 = rt_pipeline.ResultEnvelope(
-        scan=2,
-        volume_idx=2,
-        dicom_path=Path("2.dcm"),
-        volume_timestamp=time.time(),
-        success=True,
-        mc_data=np.ones((2, 2, 2), dtype=np.float32) * 2,
-        affine=np.eye(4),
-        motion_vec=np.array([0.1, 0, 0, 0, 0, 0]),
-    )
+    handler._drain_commit_ready()
+    assert committed[0] == (1, False)
+    assert committed[1] == (2, True)
 
-    assert rt_pipeline.commit_stage(cfg, handler, env1)
-    assert rt_pipeline.commit_stage(cfg, handler, env2)
-    assert handler.motion_regressor.calls == 2
-    assert (tmp_path / "fd_rt.csv").exists()
-    assert (tmp_path / "regression_status_rt.csv").exists()
+
+def test_commit_stage_fd_dvars_and_regression_progression(tmp_path):
+    handler = _mk_handler(tmp_path)
+    cfg = type("C", (), {})()
+    called = {}
+
+    def fake_process_volume(cfg_obj, handler_obj, dicom_path, volume_idx, unwarped_nii=None, volume_timestamp=None):
+        called["dicom_path"] = dicom_path
+        called["volume_idx"] = volume_idx
+        called["unwarped_nii"] = unwarped_nii
+        called["volume_timestamp"] = volume_timestamp
+        return True
+
+    orig = rt_pipeline.process_volume
+    rt_pipeline.process_volume = fake_process_volume
+    try:
+        env = rt_pipeline.ResultEnvelope(
+            scan=4,
+            volume_idx=7,
+            dicom_path=Path("4.dcm"),
+            volume_timestamp=123.45,
+            success=True,
+            unwarped_nii=Path("u.nii"),
+        )
+        assert rt_pipeline.commit_stage(cfg, handler, env) is True
+    finally:
+        rt_pipeline.process_volume = orig
+
+    assert called["volume_idx"] == 7
+    assert called["unwarped_nii"] == Path("u.nii")

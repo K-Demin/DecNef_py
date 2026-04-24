@@ -1213,8 +1213,7 @@ class DICOMHandler(FileSystemEventHandler):
                 if env is None:
                     has_newer_ready = any(s > expected_scan for s in self._result_buffer)
                     is_missing = (expected_scan not in self._inflight_scans) and (expected_scan not in self._pending_scans)
-                    is_stalled = (expected_scan in self._inflight_scans)
-                    if (is_missing or is_stalled) and has_newer_ready:
+                    if is_missing and has_newer_ready:
                         first_seen = self._scan_first_seen.get(expected_scan, time.time())
                         if time.time() - first_seen > self._commit_wait_timeout_s:
                             env = ResultEnvelope(
@@ -1226,7 +1225,6 @@ class DICOMHandler(FileSystemEventHandler):
                                 error=f"Commit timeout waiting for scan {expected_scan}",
                             )
                             self._timed_out_scans.add(expected_scan)
-                            self._inflight_scans.discard(expected_scan)
                             self._pending_scans.discard(expected_scan)
                     if env is None:
                         return
@@ -1314,8 +1312,9 @@ class DICOMHandler(FileSystemEventHandler):
         finally:
             with self._lock:
                 if env.scan <= self._last_committed_scan:
-                    log.error("[COMMIT] Non-monotonic commit detected: last=%s current=%s", self._last_committed_scan, env.scan)
-                self._last_committed_scan = max(self._last_committed_scan, env.scan)
+                    log.warning("[COMMIT] Ignoring already-committed/late scan=%s (last=%s)", env.scan, self._last_committed_scan)
+                else:
+                    self._last_committed_scan = env.scan
                 self._inflight_scans.discard(env.scan)
                 self.mark_processed(env.scan)
                 self._scan_first_seen.pop(env.scan, None)
@@ -1415,28 +1414,6 @@ def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx:
     unwarped_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
     if unwarped_nii is None or volume_timestamp is None:
         raise RuntimeError("prepare_volume_input failed")
-    mc_nii = cfg.rt_mc_dir / f"vol_{volume_idx:05d}_mc.nii"
-    mc_data, affine, motion_vec = run_worker_local_volreg(cfg.rt_ref_epi, unwarped_nii, mc_nii, volume_idx)
-    score_input_nii = mc_nii
-    score_input_orig_nii: Optional[Path] = mc_nii
-    analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
-    if analysis_space == "t1":
-        t1_dir = cfg.rt_work_dir / "t1"
-        t1_dir.mkdir(parents=True, exist_ok=True)
-        t1_nii = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
-        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-        t1_ref = cfg.t1_reference_override or resolve_decoder_template(cfg)
-        run(["antsApplyTransforms", "-d", "3", "-i", str(mc_nii), "-r", str(t1_ref), "-o", str(t1_nii), "-t", str(epi2t1), "-n", "Linear", "--float", "1"])
-        score_input_nii = t1_nii
-        score_input_orig_nii = t1_nii
-    elif analysis_space == "mni":
-        mni_nii = cfg.rt_mni_dir / f"vol_{volume_idx:05d}_mni.nii"
-        warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
-        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-        decoder_template = resolve_decoder_template(cfg)
-        run(["antsApplyTransforms", "-d", "3", "-i", str(mc_nii), "-r", str(decoder_template), "-o", str(mni_nii), "-t", str(warp_t1_mni), "-t", str(epi2t1), "-n", "Linear", "--float", "1"])
-        score_input_nii = mni_nii
-        score_input_orig_nii = mni_nii
     return ResultEnvelope(
         scan=scan,
         volume_idx=volume_idx,
@@ -1445,86 +1422,24 @@ def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx:
         success=True,
         attempts=attempt,
         unwarped_nii=unwarped_nii,
-        mc_nii=mc_nii,
-        score_input_nii=score_input_nii,
-        score_input_orig_nii=score_input_orig_nii,
-        mc_data=mc_data,
-        affine=affine,
-        motion_vec=motion_vec,
     )
 
 
 def commit_stage(cfg: RTSessionConfig, handler: "DICOMHandler", env: ResultEnvelope) -> bool:
-    assert handler._next_scan_to_commit is None or env.scan >= handler._next_scan_to_commit
     if not env.success:
         log.error("[COMMIT] scan=%s failed in compute: %s", env.scan, env.error)
         return False
-    assert env.mc_data is not None and env.affine is not None
-    volume_idx = env.volume_idx
-    motion_vec = np.asarray(env.motion_vec if env.motion_vec is not None else np.zeros(6), dtype=float)
-    append_motion(handler.motion_file, motion_vec)
-    delta = np.zeros_like(motion_vec) if handler.prev_motion is None else (motion_vec - handler.prev_motion)
-    handler.prev_motion = motion_vec.copy()
-    trans = delta[:3]
-    rot_rad = delta[3:] * np.pi / 180.0
-    fd_value = float(np.sum(np.abs(np.concatenate([trans, handler.brain_radius_mm * rot_rad]))))
-    fd_to_save = float("nan") if volume_idx <= handler.pre_trial_scans else fd_value
-    append_fd(handler.fd_file, volume_idx, fd_to_save)
-    fd_censor = 0
-    dvars_censor = 0
-    if REGRESSOR_SETTINGS.enable_fd_censor_reg:
-        hit_fd = np.isfinite(fd_to_save) and (fd_value > REGRESSOR_SETTINGS.fd_thr)
-        if handler.censor_next_fd:
-            fd_censor = 1
-            handler.censor_next_fd = False
-        if hit_fd:
-            fd_censor = 1
-            if REGRESSOR_SETTINGS.censor_plus1:
-                handler.censor_next_fd = True
-    if REGRESSOR_SETTINGS.enable_dvars_censor_reg and handler.dvars_mask is not None:
-        if handler.prev_mc_for_dvars is not None:
-            dvars_val = compute_dvars(handler.prev_mc_for_dvars, env.mc_data, handler.dvars_mask)
-            z = robust_z(dvars_val, handler.dvars_hist)
-            handler.dvars_hist.append(dvars_val)
-            append_dvars(handler.cfg.rt_work_dir / "dvars_rt.csv", volume_idx, fd_to_save, dvars_val, z)
-            handler.last_dvars_val = dvars_val
-            handler.last_dvars_z = z
-            enough = (len(handler.dvars_hist) >= REGRESSOR_SETTINGS.dvars_warmup)
-            hit_dvars = enough and np.isfinite(z) and (z > REGRESSOR_SETTINGS.dvars_thr_robust_z)
-            if handler.censor_next_dvars:
-                dvars_censor = 1
-                handler.censor_next_dvars = False
-            if hit_dvars:
-                dvars_censor = 1
-                if REGRESSOR_SETTINGS.censor_plus1:
-                    handler.censor_next_dvars = True
-        else:
-            handler.dvars_hist.append(0.0)
-            handler.last_dvars_val = float("nan")
-            handler.last_dvars_z = float("nan")
-    handler.prev_mc_for_dvars = env.mc_data.copy()
-    mc_img = nib.Nifti1Image(env.mc_data, env.affine)
-    reg_ready = True
-    if handler.motion_regressor is not None:
-        handler.proc_src.proc_data = env.mc_data
-        cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx, fd_censor=fd_censor, dvars_censor=dvars_censor)
-        reg_nii = cfg.rt_reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, env.affine), str(reg_nii))
-    else:
-        cleaned = handler.voxel_normalizer.apply(env.mc_data)
-        reg_nii = cfg.rt_reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, env.affine), str(reg_nii))
-    append_regression_status(handler.cfg.rt_work_dir / "regression_status_rt.csv", volume_idx, fd_to_save, handler.last_dvars_val, handler.last_dvars_z, fd_censor, dvars_censor, reg_ready, False)
-    if cfg.enable_scoring and handler.scorer is not None and env.score_input_nii is not None:
-        score_img = nib.load(str(env.score_input_nii))
-        score_data = np.asanyarray(score_img.dataobj)
-        raw_score = handler.scorer.score_from_array(score_data)
-        event_type = handler.score_event_tracker.for_volume(volume_idx)
-        analysis_timestamp = time.time()
-        timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score, reg_ready=reg_ready, timestamp=analysis_timestamp, event_type=event_type)
-        if handler.score_queue is not None:
-            handler.score_queue.put_nowait({"volume_idx": volume_idx, "timestamp": timestamp, "analysis_timestamp": analysis_timestamp, "watchdog_timestamp": env.volume_timestamp, "score_raw": raw_score, "reg_ready": reg_ready, "event_type": event_type})
-    return True
+    if env.unwarped_nii is None:
+        log.error("[COMMIT] scan=%s missing unwarped input.", env.scan)
+        return False
+    return process_volume(
+        cfg,
+        handler,
+        env.dicom_path,
+        env.volume_idx,
+        unwarped_nii=env.unwarped_nii,
+        volume_timestamp=env.volume_timestamp,
+    )
 
 
 def process_volume(
