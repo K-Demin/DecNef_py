@@ -4,6 +4,7 @@ import csv
 import logging
 import argparse
 import json
+import importlib
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -401,6 +402,7 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
+    t1_reference_override: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -492,6 +494,111 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
         / "decoders"
         / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
     )
+
+
+def _same_grid(a_path: Path, b_path: Path) -> bool:
+    try:
+        a_img = nib.load(str(a_path))
+        b_img = nib.load(str(b_path))
+    except Exception:
+        return False
+    return (
+        a_img.shape == b_img.shape
+        and np.allclose(a_img.affine, b_img.affine, atol=1e-3)
+    )
+
+
+def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]:
+    """
+    Optionally crop T1-space reference to EPI coverage (in native T1 resolution).
+
+    Steps:
+      1) Warp epi_mask_mean -> T1 with epi2t1 transform (nearest-neighbor)
+      2) Compute bounding box of nonzero voxels + padding
+      3) Save cropped T1_N4 reference for fast per-volume EPI->T1 warps
+      4) If decoder template is on the same T1 grid, crop it with the same bbox
+         so scoring remains shape-compatible.
+    """
+    if not REGRESSOR_SETTINGS.truncate_t1_to_epi_fov:
+        return None
+
+    epi_mask = cfg.trans_dir / "epi_mask_mean.nii"
+    epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+    t1_n4 = cfg.subject_root / "anat" / "T1_N4.nii"
+    if not t1_n4.exists():
+        t1_n4 = cfg.subject_root / "anat" / "T1.nii.gz"
+
+    if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
+        log.warning(
+            "[ANTS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
+            "Using full T1 reference."
+        )
+        return None
+
+    pad = int(REGRESSOR_SETTINGS.truncate_t1_padding_vox)
+    trunc_dir = cfg.trans_dir / "truncated_t1_refs"
+    trunc_dir.mkdir(parents=True, exist_ok=True)
+    warped_mask_t1 = trunc_dir / "epi_mask_mean_in_t1.nii.gz"
+    t1_trunc_path = trunc_dir / f"T1_N4_epi_fov_pad{pad}.nii.gz"
+
+    if not warped_mask_t1.exists():
+        run(
+            [
+                "antsApplyTransforms",
+                "-d", "3",
+                "-i", str(epi_mask),
+                "-r", str(t1_n4),
+                "-o", str(warped_mask_t1),
+                "-t", str(epi2t1),
+                "-n", "NearestNeighbor",
+                "--float", "1",
+            ]
+        )
+
+    try:
+        mask_img = nib.load(str(warped_mask_t1))
+        mask_arr = np.asanyarray(mask_img.dataobj)
+    except Exception as exc:
+        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1, exc)
+        return None
+
+    nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
+    if nz.size == 0:
+        log.warning("[ANTS] Warped EPI mask in T1 has zero support; using full T1 reference.")
+        return None
+
+    mins = np.maximum(nz.min(axis=0) - pad, 0)
+    maxs = np.minimum(nz.max(axis=0) + pad + 1, np.array(mask_arr.shape))
+    x0, y0, z0 = mins.tolist()
+    x1, y1, z1 = maxs.tolist()
+
+    if not t1_trunc_path.exists():
+        t1_img = nib.load(str(t1_n4))
+        t1_trunc = t1_img.slicer[x0:x1, y0:y1, z0:z1]
+        nib.save(t1_trunc, str(t1_trunc_path))
+        log.info(
+            "[ANTS] Truncated T1 reference saved: %s (%s -> %s)",
+            t1_trunc_path,
+            t1_img.shape,
+            t1_trunc.shape,
+        )
+
+    decoder_template = resolve_decoder_template(cfg)
+    if decoder_template.exists() and _same_grid(decoder_template, t1_n4):
+        decoder_trunc_path = trunc_dir / f"{decoder_template.stem}_epi_fov_pad{pad}.nii.gz"
+        if not decoder_trunc_path.exists():
+            decoder_img = nib.load(str(decoder_template))
+            decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
+            nib.save(decoder_trunc, str(decoder_trunc_path))
+        cfg.decoder_template = decoder_trunc_path
+        log.info("[ANTS] Truncated decoder template saved: %s", decoder_trunc_path)
+    elif decoder_template.exists() and cfg.enable_scoring:
+        log.warning(
+            "[ANTS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
+            "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
+        )
+
+    return t1_trunc_path
 
 
 def resolve_decoder_roi_txt(cfg: RTSessionConfig) -> Optional[Path]:
@@ -699,6 +806,7 @@ class DICOMHandler(FileSystemEventHandler):
         self._pending_scans: set[int] = set()
         self._processed_scans: set[int] = set()
         self._inflight_scans: set[int] = set()
+        self._scan_watchdog_ts: dict[int, float] = {}
         self._lock = threading.Lock()
         self._order_cv = threading.Condition(self._lock)
         self._next_scan_to_process: Optional[int] = None
@@ -938,9 +1046,9 @@ class DICOMHandler(FileSystemEventHandler):
 
         path = Path(event.src_path)
         log.info(f"[WATCHDOG] File detected: {path}")
-        self.enqueue_path(path)
+        self.enqueue_path(path, detected_ts=time.time())
 
-    def enqueue_path(self, path: Path) -> None:
+    def enqueue_path(self, path: Path, detected_ts: Optional[float] = None) -> None:
         parsed = parse_dicom_name(path.name)
         if parsed is None:
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
@@ -960,6 +1068,7 @@ class DICOMHandler(FileSystemEventHandler):
             return
         self._pending.put((scan, path))
         self._pending_scans.add(scan)
+        self._scan_watchdog_ts[scan] = float(detected_ts if detected_ts is not None else time.time())
 
     def next_pending(self, timeout: float = 0.1) -> Optional[tuple[int, Path]]:
         try:
@@ -1023,6 +1132,7 @@ class DICOMHandler(FileSystemEventHandler):
 
         prepared_unwarped: Optional[Path] = None
         volume_timestamp: Optional[float] = None
+        watchdog_timestamp = self._scan_watchdog_ts.get(scan)
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
             prepared_unwarped, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
             if prepared_unwarped is not None:
@@ -1037,9 +1147,17 @@ class DICOMHandler(FileSystemEventHandler):
 
         ok = False
         if prepared_unwarped is not None and volume_timestamp is not None:
+            wait_t0 = time.time()
             with self._order_cv:
                 while self._next_scan_to_process is not None and scan != self._next_scan_to_process:
                     self._order_cv.wait(timeout=0.1)
+            queue_wait_s = time.time() - wait_t0
+            if queue_wait_s > 0.05:
+                log.info(
+                    "[WATCHDOG] vol %05d waited %.3fs for in-order processing",
+                    volume_idx,
+                    queue_wait_s,
+                )
             log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
             for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
                 ok = process_volume(
@@ -1049,6 +1167,7 @@ class DICOMHandler(FileSystemEventHandler):
                     volume_idx,
                     unwarped_nii=prepared_unwarped,
                     volume_timestamp=volume_timestamp,
+                    watchdog_timestamp=watchdog_timestamp,
                 )
                 if ok:
                     break
@@ -1064,6 +1183,7 @@ class DICOMHandler(FileSystemEventHandler):
             log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
         with self._lock:
             self._inflight_scans.discard(scan)
+            self._scan_watchdog_ts.pop(scan, None)
             self.mark_processed(scan)
             self._advance_expected_scan_locked(scan)
 
@@ -1085,6 +1205,120 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC) ----------
 
+def _convert_dicom_with_dcm2niix(dicom_path: Path, raw_dir: Path, volume_idx: int) -> Optional[Path]:
+    for attempt in range(3):
+        run([
+            "dcm2niix",
+            "-z", "n",  # no gzip
+            "-s", "y",
+            "-b", "n",
+            "-f", f"vol_{volume_idx:05d}",
+            "-o", str(raw_dir),
+            str(dicom_path),
+        ])
+
+        produced = sorted(raw_dir.glob(f"vol_{volume_idx:05d}*.nii*"))
+        if produced:
+            return produced[0]
+        log.warning("[DICOM] vol %05d conversion retry %d/3", volume_idx, attempt + 1)
+        time.sleep(0.2)
+    return None
+
+
+def _convert_dicom_with_pydicom(dicom_path: Path, out_nii: Path, volume_idx: int) -> Optional[Path]:
+    try:
+        pydicom = importlib.import_module("pydicom")
+    except Exception as exc:
+        log.warning("[DICOM] pydicom backend unavailable (%s); falling back to dcm2niix.", exc)
+        return None
+
+    try:
+        ds = pydicom.dcmread(str(dicom_path), force=True)
+        arr = ds.pixel_array.astype(np.float32)
+
+        if arr.ndim == 2:
+            arr = arr[:, :, np.newaxis]
+        elif arr.ndim != 3:
+            log.warning(
+                "[DICOM] Unsupported pixel array ndim=%s for vol %05d; falling back to dcm2niix.",
+                arr.ndim,
+                volume_idx,
+            )
+            return None
+
+        spacing_xy = getattr(ds, "PixelSpacing", [1.0, 1.0])
+        dz = float(getattr(ds, "SliceThickness", 1.0))
+        row_spacing = float(spacing_xy[0]) if len(spacing_xy) > 0 else 1.0
+        col_spacing = float(spacing_xy[1]) if len(spacing_xy) > 1 else row_spacing
+
+        orient = np.asarray(getattr(ds, "ImageOrientationPatient", [1, 0, 0, 0, 1, 0]), dtype=float)
+        row_cos = orient[:3]
+        col_cos = orient[3:6]
+        slice_cos = np.cross(row_cos, col_cos)
+        origin = np.asarray(getattr(ds, "ImagePositionPatient", [0, 0, 0]), dtype=float)
+
+        affine = np.eye(4, dtype=float)
+        affine[:3, 0] = row_cos * row_spacing
+        affine[:3, 1] = col_cos * col_spacing
+        affine[:3, 2] = slice_cos * dz
+        affine[:3, 3] = origin
+
+        nib.save(nib.Nifti1Image(arr, affine), str(out_nii))
+        return out_nii
+    except Exception as exc:
+        log.warning("[DICOM] pydicom conversion failed for vol %05d (%s); falling back to dcm2niix.", volume_idx, exc)
+        return None
+
+
+def convert_dicom_to_nifti(dicom_path: Path, raw_dir: Path, volume_idx: int) -> Optional[Path]:
+    backend = str(REGRESSOR_SETTINGS.dicom_backend).lower()
+    out_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
+
+    if backend == "pydicom":
+        converted = _convert_dicom_with_pydicom(dicom_path, out_nii, volume_idx)
+        if converted is not None:
+            return converted
+    return _convert_dicom_with_dcm2niix(dicom_path, raw_dir, volume_idx)
+
+
+def apply_transforms_resample(
+    moving_nii: Path,
+    fixed_nii: Path,
+    out_nii: Path,
+    transforms: list[Path],
+    interpolation: str = "Linear",
+) -> None:
+    backend = str(REGRESSOR_SETTINGS.warp_backend).lower()
+    if backend == "antspy":
+        try:
+            ants = importlib.import_module("ants")
+            fixed_img = ants.image_read(str(fixed_nii))
+            moving_img = ants.image_read(str(moving_nii))
+            warped = ants.apply_transforms(
+                fixed=fixed_img,
+                moving=moving_img,
+                transformlist=[str(t) for t in transforms],
+                interpolator=interpolation.lower(),
+                singleprecision=True,
+            )
+            ants.image_write(warped, str(out_nii))
+            return
+        except Exception as exc:
+            log.warning("[ANTS] antspy backend failed (%s); falling back to CLI.", exc)
+
+    cmd = [
+        "antsApplyTransforms",
+        "-d", "3",
+        "-i", str(moving_nii),
+        "-r", str(fixed_nii),
+        "-o", str(out_nii),
+    ]
+    for t in transforms:
+        cmd += ["-t", str(t)]
+    cmd += ["-n", interpolation, "--float", "1"]
+    run(cmd)
+
+
 def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
     """
     Convert DICOM to NIfTI and run fieldmap unwarp.
@@ -1098,29 +1332,19 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
     if not raw_nii.exists():
-        if not wait_for_file_complete(dicom_path, timeout=5.0, interval=0.1):
+        if not wait_for_file_complete(
+            dicom_path,
+            timeout=5.0,
+            interval=0.1,
+            required_hits=2,
+        ):
             log.error(f"[DICOM] vol {volume_idx:05d} FAILED (file not stable)")
             return None, None
-        for attempt in range(3):
-            run([
-                "dcm2niix",
-                "-z", "n",  # no gzip
-                "-s", "y",
-                "-b", "n",
-                "-f", f"vol_{volume_idx:05d}",
-                "-o", str(raw_dir),
-                str(dicom_path),
-            ])
-
-            produced = sorted(raw_dir.glob(f"vol_{volume_idx:05d}*.nii*"))
-            if produced:
-                raw_nii = produced[0]
-                break
-            log.warning("[DICOM] vol %05d conversion retry %d/3", volume_idx, attempt + 1)
-            time.sleep(0.2)
-        else:
+        converted = convert_dicom_to_nifti(dicom_path, raw_dir, volume_idx)
+        if converted is None:
             log.error(f"[DICOM] vol {volume_idx:05d} FAILED (no output)")
             return None, None
+        raw_nii = converted
 
     log_step("DICOM", volume_idx, start_t=t0)
 
@@ -1148,6 +1372,7 @@ def process_volume(
     volume_idx: int,
     unwarped_nii: Optional[Path] = None,
     volume_timestamp: Optional[float] = None,
+    watchdog_timestamp: Optional[float] = None,
 ):
     """
     For each incoming DICOM:
@@ -1161,8 +1386,12 @@ def process_volume(
         if unwarped_nii is None or prepared_timestamp is None:
             return False
         volume_timestamp = prepared_timestamp
+        if watchdog_timestamp is None:
+            watchdog_timestamp = prepared_timestamp
     elif volume_timestamp is None:
         volume_timestamp = time.time()
+    if watchdog_timestamp is None:
+        watchdog_timestamp = volume_timestamp
 
     # ---------- 2) Motion correction (RtpVolreg) ----------
     t0 = time.time()
@@ -1361,6 +1590,7 @@ def process_volume(
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
+        t1_ref = cfg.t1_reference_override or decoder_template
 
         if not decoder_template.exists():
             log.error(f"Decoder template not found at {decoder_template}")
@@ -1370,33 +1600,25 @@ def process_volume(
             log.error(f"Missing EPI→T1 transform in {cfg.trans_dir}")
             return False
 
-        cmd = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_for_warp),
-            "-r", str(decoder_template),
-            "-o", str(t1_nii),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd)
+        apply_transforms_resample(
+            moving_nii=mc_for_warp,
+            fixed_nii=t1_ref,
+            out_nii=t1_nii,
+            transforms=[epi2t1],
+            interpolation="Linear",
+        )
         score_input_nii = t1_nii
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
             t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
-            cmd_orig = [
-                "antsApplyTransforms",
-                "-d", "3",
-                "-i", str(mc_nii),
-                "-r", str(decoder_template),
-                "-o", str(t1_orig_nii),
-                "-t", str(epi2t1),
-                "-n", "Linear",
-                "--float", "1",
-            ]
-            run(cmd_orig)
+            apply_transforms_resample(
+                moving_nii=mc_nii,
+                fixed_nii=t1_ref,
+                out_nii=t1_orig_nii,
+                transforms=[epi2t1],
+                interpolation="Linear",
+            )
             score_input_orig_nii = t1_orig_nii
         log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
     elif analysis_space == "mni":
@@ -1415,35 +1637,25 @@ def process_volume(
             log.error(f"Missing transforms in {cfg.trans_dir}")
             return False
 
-        cmd = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_for_warp),
-            "-r", str(decoder_template),
-            "-o", str(mni_nii),
-            "-t", str(warp_t1_mni),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd)
+        apply_transforms_resample(
+            moving_nii=mc_for_warp,
+            fixed_nii=decoder_template,
+            out_nii=mni_nii,
+            transforms=[warp_t1_mni, epi2t1],
+            interpolation="Linear",
+        )
         score_input_nii = mni_nii
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
             mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
-            cmd_orig = [
-                "antsApplyTransforms",
-                "-d", "3",
-                "-i", str(mc_nii),
-                "-r", str(decoder_template),
-                "-o", str(mni_orig_nii),
-                "-t", str(warp_t1_mni),
-                "-t", str(epi2t1),
-                "-n", "Linear",
-                "--float", "1",
-            ]
-            run(cmd_orig)
+            apply_transforms_resample(
+                moving_nii=mc_nii,
+                fixed_nii=decoder_template,
+                out_nii=mni_orig_nii,
+                transforms=[warp_t1_mni, epi2t1],
+                interpolation="Linear",
+            )
             score_input_orig_nii = mni_orig_nii
         log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
     else:
@@ -1459,7 +1671,7 @@ def process_volume(
                 handler.score_queue.put_nowait(
                     {
                         "volume_idx": volume_idx,
-                        "watchdog_timestamp": volume_timestamp,
+                        "watchdog_timestamp": watchdog_timestamp,
                     }
                 )
             except Exception as exc:
@@ -1516,7 +1728,7 @@ def process_volume(
                     "volume_idx": volume_idx,
                     "timestamp": timestamp,
                     "analysis_timestamp": analysis_timestamp,
-                    "watchdog_timestamp": volume_timestamp,
+                    "watchdog_timestamp": watchdog_timestamp,
                     "score_raw": raw_score,
                     "score_original": original_score,
                     "reg_ready": reg_ready,
@@ -1598,11 +1810,17 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     return True
 
 
-def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0.1) -> bool:
+def wait_for_file_complete(
+    path: Path,
+    timeout: float = 5.0,
+    interval: float = 0.1,
+    required_hits: int = 2,
+) -> bool:
     """
     Wait until file size is stable for two consecutive checks.
     """
     deadline = time.monotonic() + max(0.0, timeout)
+    required_hits = max(1, int(required_hits))
     last_size = -1
     stable_hits = 0
     while time.monotonic() < deadline:
@@ -1612,7 +1830,7 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
             size = -1
         if size > 0 and size == last_size:
             stable_hits += 1
-            if stable_hits >= 2:
+            if stable_hits >= required_hits:
                 return True
         else:
             stable_hits = 0
@@ -1626,7 +1844,6 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 # ---------- Main ----------
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
-    decoder_template = resolve_decoder_template(cfg)
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     if analysis_space not in {"epi", "t1", "mni"}:
         raise ValueError(
@@ -1637,6 +1854,9 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         raise ValueError(
             "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
         )
+    t1_reference = maybe_prepare_truncated_t1_reference(cfg)
+    cfg.t1_reference_override = t1_reference
+    decoder_template = resolve_decoder_template(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
