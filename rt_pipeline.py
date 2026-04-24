@@ -7,8 +7,8 @@ import json
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Any
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, CancelledError
@@ -46,6 +46,26 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
+
+
+@dataclass
+class ResultEnvelope:
+    scan: int
+    volume_idx: int
+    dicom_path: Path
+    volume_timestamp: float
+    success: bool
+    error: Optional[str] = None
+    traceback_text: Optional[str] = None
+    attempts: int = 0
+    unwarped_nii: Optional[Path] = None
+    mc_nii: Optional[Path] = None
+    score_input_nii: Optional[Path] = None
+    score_input_orig_nii: Optional[Path] = None
+    mc_data: Optional[np.ndarray] = None
+    affine: Optional[np.ndarray] = None
+    motion_vec: Optional[np.ndarray] = None
+    meta: dict[str, Any] = field(default_factory=dict)
 
 def log_step(step: str, vol: int, extra: str = "", start_t=None):
     """Compact colored/clean log."""
@@ -751,6 +771,8 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
                 "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
                 "analysis_space": REGRESSOR_SETTINGS.analysis_space,
                 "voxel_norm_ref_volumes": REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+                "pipeline_engine": REGRESSOR_SETTINGS.pipeline_engine,
+                "commit_wait_timeout_s": REGRESSOR_SETTINGS.commit_wait_timeout_s,
             },
             "biopac": {
                 "enabled": REGRESSOR_SETTINGS.enable_biopac_physio,
@@ -819,7 +841,14 @@ class DICOMHandler(FileSystemEventHandler):
         self._inflight_scans: set[int] = set()
         self._lock = threading.Lock()
         self._order_cv = threading.Condition(self._lock)
+        self._result_buffer: dict[int, ResultEnvelope] = {}
+        self._scan_first_seen: dict[int, float] = {}
+        self._next_scan_to_commit: Optional[int] = None
         self._next_scan_to_process: Optional[int] = None
+        self._last_committed_scan: int = 0
+        self._timed_out_scans: set[int] = set()
+        self._engine_mode = str(getattr(REGRESSOR_SETTINGS, "pipeline_engine", "parallel_ordered")).lower()
+        self._commit_wait_timeout_s = float(getattr(REGRESSOR_SETTINGS, "commit_wait_timeout_s", 1.0))
         max_workers = int(REGRESSOR_SETTINGS.max_workers)
         if max_workers > 10:
             log.warning(
@@ -831,6 +860,12 @@ class DICOMHandler(FileSystemEventHandler):
             log.warning("[WATCHDOG] max_workers=%d is invalid; using 1.", max_workers)
             max_workers = 1
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        log.info(
+            "[ENGINE] mode=%s workers=%d commit_wait_timeout_s=%.2f",
+            self._engine_mode,
+            max_workers,
+            self._commit_wait_timeout_s,
+        )
         self._online_mode = False
         self._biopac_started = start_biopac
         self._biopac_run_started = False
@@ -1111,11 +1146,15 @@ class DICOMHandler(FileSystemEventHandler):
             volume_idx = self.next_volume_idx
             self.next_volume_idx += 1
             self._inflight_scans.add(scan)
-            if self._next_scan_to_process is None:
-                self._next_scan_to_process = scan
-                self._order_cv.notify_all()
-        fut = self._executor.submit(self._process_scan, path, scan, volume_idx)
-        fut.add_done_callback(lambda f, s=scan, v=volume_idx: self._on_scan_future_done(f, s, v))
+            self._scan_first_seen.setdefault(scan, time.time())
+            if self._next_scan_to_commit is None:
+                self._next_scan_to_commit = scan
+        if self._engine_mode == "legacy":
+            fut = self._executor.submit(self._process_scan, path, scan, volume_idx)
+            fut.add_done_callback(lambda f, s=scan, v=volume_idx: self._on_scan_future_done(f, s, v))
+        else:
+            fut = self._executor.submit(self._compute_scan, path, scan, volume_idx)
+            fut.add_done_callback(self._on_compute_future_done)
         return True
 
     def _on_scan_future_done(self, future, scan: int, volume_idx: int) -> None:
@@ -1139,14 +1178,63 @@ class DICOMHandler(FileSystemEventHandler):
             if scan in self._inflight_scans:
                 self._inflight_scans.discard(scan)
                 self.mark_processed(scan)
-                self._advance_expected_scan_locked(scan)
+                self._advance_expected_scan_locked()
 
-    def _advance_expected_scan_locked(self, finished_scan: int) -> None:
-        candidates = [s for s in self._inflight_scans.union(self._pending_scans) if s > finished_scan]
-        self._next_scan_to_process = min(candidates) if candidates else None
+    def _advance_expected_scan_locked(self) -> None:
+        all_candidates = self._inflight_scans.union(self._pending_scans).union(self._result_buffer.keys())
+        candidates = sorted(s for s in all_candidates if s > self._last_committed_scan)
+        self._next_scan_to_commit = candidates[0] if candidates else None
+        self._next_scan_to_process = self._next_scan_to_commit
         self._order_cv.notify_all()
 
+    def _on_compute_future_done(self, future) -> None:
+        try:
+            env: ResultEnvelope = future.result()
+        except Exception as exc:
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            log.error("[ENGINE] compute future failed: %s\n%s", exc, tb)
+            return
+        with self._lock:
+            if env.scan <= self._last_committed_scan or env.scan in self._timed_out_scans:
+                log.warning("[ENGINE] dropping late envelope scan=%s (last_committed=%s timed_out=%s)", env.scan, self._last_committed_scan, env.scan in self._timed_out_scans)
+                return
+            self._result_buffer[env.scan] = env
+            self._order_cv.notify_all()
+        self._drain_commit_ready()
+
+    def _drain_commit_ready(self) -> None:
+        while True:
+            with self._lock:
+                if self._next_scan_to_commit is None:
+                    self._advance_expected_scan_locked()
+                    if self._next_scan_to_commit is None:
+                        return
+                expected_scan = self._next_scan_to_commit
+                env = self._result_buffer.pop(expected_scan, None)
+                if env is None:
+                    has_newer_ready = any(s > expected_scan for s in self._result_buffer)
+                    is_missing = (expected_scan not in self._inflight_scans) and (expected_scan not in self._pending_scans)
+                    is_stalled = (expected_scan in self._inflight_scans)
+                    if (is_missing or is_stalled) and has_newer_ready:
+                        first_seen = self._scan_first_seen.get(expected_scan, time.time())
+                        if time.time() - first_seen > self._commit_wait_timeout_s:
+                            env = ResultEnvelope(
+                                scan=expected_scan,
+                                volume_idx=expected_scan,
+                                dicom_path=Path("missing"),
+                                volume_timestamp=time.time(),
+                                success=False,
+                                error=f"Commit timeout waiting for scan {expected_scan}",
+                            )
+                            self._timed_out_scans.add(expected_scan)
+                            self._inflight_scans.discard(expected_scan)
+                            self._pending_scans.discard(expected_scan)
+                    if env is None:
+                        return
+            self._commit_scan(env)
+
     def _process_scan(self, path: Path, scan: int, volume_idx: int) -> None:
+        # Legacy path (kept for backward compatibility).
         log.info(f"[WATCHDOG] Preparing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
 
         prepared_unwarped: Optional[Path] = None
@@ -1193,7 +1281,46 @@ class DICOMHandler(FileSystemEventHandler):
         with self._lock:
             self._inflight_scans.discard(scan)
             self.mark_processed(scan)
-            self._advance_expected_scan_locked(scan)
+            self._advance_expected_scan_locked()
+
+    def _compute_scan(self, path: Path, scan: int, volume_idx: int) -> ResultEnvelope:
+        err_txt = None
+        tb_txt = None
+        for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
+            try:
+                env = compute_stage(self.cfg, path, scan=scan, volume_idx=volume_idx, attempt=attempt)
+                env.attempts = attempt
+                return env
+            except Exception as exc:
+                err_txt = str(exc)
+                tb_txt = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                log.warning("[ENGINE] compute retry scan=%s attempt=%s/%s err=%s", scan, attempt, REGRESSOR_SETTINGS.max_retries, exc)
+                time.sleep(0.2)
+        return ResultEnvelope(
+            scan=scan,
+            volume_idx=volume_idx,
+            dicom_path=path,
+            volume_timestamp=time.time(),
+            success=False,
+            error=err_txt or "unknown compute failure",
+            traceback_text=tb_txt,
+            attempts=REGRESSOR_SETTINGS.max_retries,
+        )
+
+    def _commit_scan(self, env: ResultEnvelope) -> None:
+        try:
+            commit_stage(self.cfg, self, env)
+        except Exception as exc:
+            log.error("[ENGINE] commit failure scan=%s vol=%05d err=%s", env.scan, env.volume_idx, exc)
+        finally:
+            with self._lock:
+                if env.scan <= self._last_committed_scan:
+                    log.error("[COMMIT] Non-monotonic commit detected: last=%s current=%s", self._last_committed_scan, env.scan)
+                self._last_committed_scan = max(self._last_committed_scan, env.scan)
+                self._inflight_scans.discard(env.scan)
+                self.mark_processed(env.scan)
+                self._scan_first_seen.pop(env.scan, None)
+                self._advance_expected_scan_locked()
 
     def process_file(self, path: Path):
         parsed = parse_dicom_name(path.name)
@@ -1264,6 +1391,141 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
         log.info(f"[FMAP] Unwarp exists for vol {volume_idx}")
 
     return unwarped_nii, volume_timestamp
+
+
+def run_worker_local_volreg(ref_epi: Path, unwarped_nii: Path, mc_nii: Path, volume_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    volreg = RtpVolreg(regmode='heptic')
+    volreg.ignore_init = 0
+    volreg.save_proc = False
+    volreg.set_ref_vol(str(ref_epi))
+    img = nib.load(str(unwarped_nii))
+    data = np.asanyarray(img.dataobj).astype(np.float32)
+    tmp_img = nib.Nifti1Image(data, img.affine, img.header.copy())
+    tmp_img.set_filename(str(mc_nii))
+    volreg.do_proc(tmp_img, vol_idx=volume_idx - 1)
+    mc_data = np.asanyarray(tmp_img.dataobj).astype(np.float32)
+    nib.save(nib.Nifti1Image(mc_data, img.affine), str(mc_nii))
+    try:
+        motion_vec = np.asarray(volreg._motion[volume_idx - 1]).astype(float)
+    except Exception:
+        motion_vec = np.zeros(6, dtype=float)
+    return mc_data, img.affine, motion_vec
+
+
+def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1) -> ResultEnvelope:
+    unwarped_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+    if unwarped_nii is None or volume_timestamp is None:
+        raise RuntimeError("prepare_volume_input failed")
+    mc_nii = cfg.rt_mc_dir / f"vol_{volume_idx:05d}_mc.nii"
+    mc_data, affine, motion_vec = run_worker_local_volreg(cfg.rt_ref_epi, unwarped_nii, mc_nii, volume_idx)
+    score_input_nii = mc_nii
+    score_input_orig_nii: Optional[Path] = mc_nii
+    analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if analysis_space == "t1":
+        t1_dir = cfg.rt_work_dir / "t1"
+        t1_dir.mkdir(parents=True, exist_ok=True)
+        t1_nii = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+        t1_ref = cfg.t1_reference_override or resolve_decoder_template(cfg)
+        run(["antsApplyTransforms", "-d", "3", "-i", str(mc_nii), "-r", str(t1_ref), "-o", str(t1_nii), "-t", str(epi2t1), "-n", "Linear", "--float", "1"])
+        score_input_nii = t1_nii
+        score_input_orig_nii = t1_nii
+    elif analysis_space == "mni":
+        mni_nii = cfg.rt_mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+        warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
+        epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+        decoder_template = resolve_decoder_template(cfg)
+        run(["antsApplyTransforms", "-d", "3", "-i", str(mc_nii), "-r", str(decoder_template), "-o", str(mni_nii), "-t", str(warp_t1_mni), "-t", str(epi2t1), "-n", "Linear", "--float", "1"])
+        score_input_nii = mni_nii
+        score_input_orig_nii = mni_nii
+    return ResultEnvelope(
+        scan=scan,
+        volume_idx=volume_idx,
+        dicom_path=dicom_path,
+        volume_timestamp=volume_timestamp,
+        success=True,
+        attempts=attempt,
+        unwarped_nii=unwarped_nii,
+        mc_nii=mc_nii,
+        score_input_nii=score_input_nii,
+        score_input_orig_nii=score_input_orig_nii,
+        mc_data=mc_data,
+        affine=affine,
+        motion_vec=motion_vec,
+    )
+
+
+def commit_stage(cfg: RTSessionConfig, handler: "DICOMHandler", env: ResultEnvelope) -> bool:
+    assert handler._next_scan_to_commit is None or env.scan >= handler._next_scan_to_commit
+    if not env.success:
+        log.error("[COMMIT] scan=%s failed in compute: %s", env.scan, env.error)
+        return False
+    assert env.mc_data is not None and env.affine is not None
+    volume_idx = env.volume_idx
+    motion_vec = np.asarray(env.motion_vec if env.motion_vec is not None else np.zeros(6), dtype=float)
+    append_motion(handler.motion_file, motion_vec)
+    delta = np.zeros_like(motion_vec) if handler.prev_motion is None else (motion_vec - handler.prev_motion)
+    handler.prev_motion = motion_vec.copy()
+    trans = delta[:3]
+    rot_rad = delta[3:] * np.pi / 180.0
+    fd_value = float(np.sum(np.abs(np.concatenate([trans, handler.brain_radius_mm * rot_rad]))))
+    fd_to_save = float("nan") if volume_idx <= handler.pre_trial_scans else fd_value
+    append_fd(handler.fd_file, volume_idx, fd_to_save)
+    fd_censor = 0
+    dvars_censor = 0
+    if REGRESSOR_SETTINGS.enable_fd_censor_reg:
+        hit_fd = np.isfinite(fd_to_save) and (fd_value > REGRESSOR_SETTINGS.fd_thr)
+        if handler.censor_next_fd:
+            fd_censor = 1
+            handler.censor_next_fd = False
+        if hit_fd:
+            fd_censor = 1
+            if REGRESSOR_SETTINGS.censor_plus1:
+                handler.censor_next_fd = True
+    if REGRESSOR_SETTINGS.enable_dvars_censor_reg and handler.dvars_mask is not None:
+        if handler.prev_mc_for_dvars is not None:
+            dvars_val = compute_dvars(handler.prev_mc_for_dvars, env.mc_data, handler.dvars_mask)
+            z = robust_z(dvars_val, handler.dvars_hist)
+            handler.dvars_hist.append(dvars_val)
+            append_dvars(handler.cfg.rt_work_dir / "dvars_rt.csv", volume_idx, fd_to_save, dvars_val, z)
+            handler.last_dvars_val = dvars_val
+            handler.last_dvars_z = z
+            enough = (len(handler.dvars_hist) >= REGRESSOR_SETTINGS.dvars_warmup)
+            hit_dvars = enough and np.isfinite(z) and (z > REGRESSOR_SETTINGS.dvars_thr_robust_z)
+            if handler.censor_next_dvars:
+                dvars_censor = 1
+                handler.censor_next_dvars = False
+            if hit_dvars:
+                dvars_censor = 1
+                if REGRESSOR_SETTINGS.censor_plus1:
+                    handler.censor_next_dvars = True
+        else:
+            handler.dvars_hist.append(0.0)
+            handler.last_dvars_val = float("nan")
+            handler.last_dvars_z = float("nan")
+    handler.prev_mc_for_dvars = env.mc_data.copy()
+    mc_img = nib.Nifti1Image(env.mc_data, env.affine)
+    reg_ready = True
+    if handler.motion_regressor is not None:
+        handler.proc_src.proc_data = env.mc_data
+        cleaned, reg_ready = handler.motion_regressor.apply(mc_img, volume_idx, fd_censor=fd_censor, dvars_censor=dvars_censor)
+        reg_nii = cfg.rt_reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, env.affine), str(reg_nii))
+    else:
+        cleaned = handler.voxel_normalizer.apply(env.mc_data)
+        reg_nii = cfg.rt_reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, env.affine), str(reg_nii))
+    append_regression_status(handler.cfg.rt_work_dir / "regression_status_rt.csv", volume_idx, fd_to_save, handler.last_dvars_val, handler.last_dvars_z, fd_censor, dvars_censor, reg_ready, False)
+    if cfg.enable_scoring and handler.scorer is not None and env.score_input_nii is not None:
+        score_img = nib.load(str(env.score_input_nii))
+        score_data = np.asanyarray(score_img.dataobj)
+        raw_score = handler.scorer.score_from_array(score_data)
+        event_type = handler.score_event_tracker.for_volume(volume_idx)
+        analysis_timestamp = time.time()
+        timestamp = append_score(cfg.rt_work_dir / "scores.csv", volume_idx, raw_score, reg_ready=reg_ready, timestamp=analysis_timestamp, event_type=event_type)
+        if handler.score_queue is not None:
+            handler.score_queue.put_nowait({"volume_idx": volume_idx, "timestamp": timestamp, "analysis_timestamp": analysis_timestamp, "watchdog_timestamp": env.volume_timestamp, "score_raw": raw_score, "reg_ready": reg_ready, "event_type": event_type})
+    return True
 
 
 def process_volume(
@@ -2010,6 +2272,18 @@ def main():
         help="Maximum parallel processing workers for DICOM handling.",
     )
     parser.add_argument(
+        "--pipeline-engine",
+        choices=["parallel_ordered", "legacy"],
+        default=REGRESSOR_SETTINGS.pipeline_engine,
+        help="Pipeline execution engine.",
+    )
+    parser.add_argument(
+        "--commit-wait-timeout-s",
+        type=float,
+        default=REGRESSOR_SETTINGS.commit_wait_timeout_s,
+        help="Seconds to wait before force-advancing ordered commit for stalled scans.",
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=REGRESSOR_SETTINGS.max_retries,
@@ -2040,6 +2314,8 @@ def main():
     REGRESSOR_SETTINGS.analysis_space = args.analysis_space
     REGRESSOR_SETTINGS.voxel_norm_ref_volumes = max(1, int(args.voxel_norm_ref_volumes))
     REGRESSOR_SETTINGS.max_workers = args.max_workers
+    REGRESSOR_SETTINGS.pipeline_engine = args.pipeline_engine
+    REGRESSOR_SETTINGS.commit_wait_timeout_s = max(0.1, float(args.commit_wait_timeout_s))
     REGRESSOR_SETTINGS.max_retries = args.max_retries
 
     cfg = RTSessionConfig(
