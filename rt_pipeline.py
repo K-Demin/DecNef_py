@@ -5,6 +5,7 @@ import logging
 import argparse
 import json
 import traceback
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass
@@ -402,6 +403,8 @@ class RTSessionConfig:
     enable_scoring: bool = True
     enable_original_score: bool = False
     t1_reference_override: Optional[Path] = None
+    trans_dir_override: Optional[Path] = None
+    anat_dir_override: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -414,7 +417,15 @@ class RTSessionConfig:
     @property
     def trans_dir(self) -> Path:
         # precomputed transforms live here (from offline pipeline)
+        if self.trans_dir_override is not None:
+            return self.trans_dir_override
         return self.day_root / "func" / "trans"
+
+    @property
+    def anat_dir(self) -> Path:
+        if self.anat_dir_override is not None:
+            return self.anat_dir_override
+        return self.subject_root / "anat"
 
     @property
     def rt_wm_mask(self) -> Path:
@@ -476,7 +487,7 @@ class RTSessionConfig:
         """
         Global real-time reference EPI (set by offline preprocessor).
         """
-        return self.day_root / "func" / "trans" / "epi_unwarped_mean.nii"
+        return self.trans_dir / "epi_unwarped_mean.nii"
 
     @property
     def rt_ref_mask(self) -> Path:
@@ -484,7 +495,7 @@ class RTSessionConfig:
         Optional mask for the RT reference (not strictly needed here,
         but kept for completeness / future use).
         """
-        return self.day_root / "func" / "trans" / "epi_mask_mean.nii"
+        return self.trans_dir / "epi_mask_mean.nii"
 
 
 def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
@@ -517,6 +528,60 @@ def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
     return path_nii
 
 
+def _copy_if_exists(src: Path, dst: Path) -> Optional[Path]:
+    if not src.exists():
+        return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def maybe_prepare_ramdisk_cache(cfg: RTSessionConfig) -> None:
+    if not REGRESSOR_SETTINGS.use_ramdisk_cache:
+        return
+
+    cache_root = Path(str(REGRESSOR_SETTINGS.ramdisk_root)).expanduser()
+    session_cache = cache_root / f"sub-{cfg.subject}" / str(cfg.day) / f"run-{cfg.run}"
+    trans_src = cfg.trans_dir
+    anat_src = cfg.anat_dir
+
+    try:
+        session_cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning("[RAM] Could not create RAM cache at %s (%s). Continuing without RAM cache.", session_cache, exc)
+        return
+
+    trans_dst = session_cache / "trans"
+    try:
+        shutil.copytree(trans_src, trans_dst, dirs_exist_ok=True)
+    except OSError as exc:
+        log.warning("[RAM] Failed to mirror transforms from %s to %s (%s).", trans_src, trans_dst, exc)
+        return
+
+    anat_dst = session_cache / "anat"
+    copied_any_anat = False
+    for fname in ("T1_N4.nii", "T1.nii.gz", "warp_T1_to_MNI_synth.nii"):
+        copied = _copy_if_exists(anat_src / fname, anat_dst / fname)
+        copied_any_anat = copied_any_anat or (copied is not None)
+
+    if cfg.decoder_template is not None and cfg.decoder_template.exists():
+        decoder_dst = session_cache / "decoder" / cfg.decoder_template.name
+        copied_decoder = _copy_if_exists(cfg.decoder_template, decoder_dst)
+        if copied_decoder is not None:
+            cfg.decoder_template = copied_decoder
+    if cfg.decoder_roi_txt is not None and cfg.decoder_roi_txt.exists():
+        roi_dst = session_cache / "decoder" / cfg.decoder_roi_txt.name
+        copied_roi = _copy_if_exists(cfg.decoder_roi_txt, roi_dst)
+        if copied_roi is not None:
+            cfg.decoder_roi_txt = copied_roi
+
+    cfg.trans_dir_override = trans_dst
+    if copied_any_anat:
+        cfg.anat_dir_override = anat_dst
+
+    log.info("[RAM] Using RAM-backed cache at %s", session_cache)
+
+
 def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]:
     """
     Optionally crop T1-space reference to EPI coverage (in native T1 resolution).
@@ -533,9 +598,9 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
 
     epi_mask = cfg.trans_dir / "epi_mask_mean.nii"
     epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-    t1_n4 = cfg.subject_root / "anat" / "T1_N4.nii"
+    t1_n4 = cfg.anat_dir / "T1_N4.nii"
     if not t1_n4.exists():
-        t1_n4 = cfg.subject_root / "anat" / "T1.nii.gz"
+        t1_n4 = cfg.anat_dir / "T1.nii.gz"
 
     if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
         log.warning(
@@ -1522,7 +1587,7 @@ def process_volume(
         mni_dir = cfg.rt_mni_dir
         mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
 
-        warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
+        warp_t1_mni = cfg.anat_dir / "warp_T1_to_MNI_synth.nii"
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
 
@@ -1755,6 +1820,7 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         raise ValueError(
             "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
         )
+    maybe_prepare_ramdisk_cache(cfg)
     t1_reference = maybe_prepare_truncated_t1_reference(cfg)
     cfg.t1_reference_override = t1_reference
     decoder_template = resolve_decoder_template(cfg)
