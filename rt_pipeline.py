@@ -1055,7 +1055,17 @@ class DICOMHandler(FileSystemEventHandler):
             return
 
         path = Path(event.src_path)
-        log.info(f"[WATCHDOG] File detected: {path}")
+        # `on_created` can fire before the writer closes/flushed the file.
+        # We still enqueue as a fallback for filesystems that don't emit
+        # close events, but the preferred path is `on_closed` below.
+        log.info(f"[WATCHDOG] File created: {path}")
+        self.enqueue_path(path)
+
+    def on_closed(self, event):
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        log.info(f"[WATCHDOG] File closed: {path}")
         self.enqueue_path(path)
 
     def enqueue_path(self, path: Path) -> None:
@@ -1216,9 +1226,6 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
     if not raw_nii.exists():
-        if not wait_for_file_complete(dicom_path, timeout=5.0, interval=0.1):
-            log.error(f"[DICOM] vol {volume_idx:05d} FAILED (file not stable)")
-            return None, None
         for attempt in range(3):
             run([
                 "dcm2niix",
@@ -1715,31 +1722,6 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     ]
     run(cmd)
     return True
-
-
-def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0.1) -> bool:
-    """
-    Wait until file size is stable for two consecutive checks.
-    """
-    deadline = time.monotonic() + max(0.0, timeout)
-    last_size = -1
-    stable_hits = 0
-    while time.monotonic() < deadline:
-        try:
-            size = path.stat().st_size
-        except FileNotFoundError:
-            size = -1
-        if size > 0 and size == last_size:
-            stable_hits += 1
-            if stable_hits >= 2:
-                return True
-        else:
-            stable_hits = 0
-        last_size = size
-        time.sleep(interval)
-    return False
-
-
 
 
 # ---------- Main ----------
