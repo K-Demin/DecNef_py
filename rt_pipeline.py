@@ -846,6 +846,7 @@ class DICOMHandler(FileSystemEventHandler):
         self._next_scan_to_commit: Optional[int] = None
         self._next_scan_to_process: Optional[int] = None
         self._last_committed_scan: int = 0
+        self._timed_out_scans: set[int] = set()
         self._engine_mode = str(getattr(REGRESSOR_SETTINGS, "pipeline_engine", "parallel_ordered")).lower()
         self._commit_wait_timeout_s = float(getattr(REGRESSOR_SETTINGS, "commit_wait_timeout_s", 1.0))
         max_workers = int(REGRESSOR_SETTINGS.max_workers)
@@ -1179,7 +1180,8 @@ class DICOMHandler(FileSystemEventHandler):
                 self._advance_expected_scan_locked()
 
     def _advance_expected_scan_locked(self) -> None:
-        candidates = sorted(self._inflight_scans.union(self._pending_scans).union(self._result_buffer.keys()))
+        all_candidates = self._inflight_scans.union(self._pending_scans).union(self._result_buffer.keys())
+        candidates = sorted(s for s in all_candidates if s > self._last_committed_scan)
         self._next_scan_to_commit = candidates[0] if candidates else None
         self._next_scan_to_process = self._next_scan_to_commit
         self._order_cv.notify_all()
@@ -1192,6 +1194,9 @@ class DICOMHandler(FileSystemEventHandler):
             log.error("[ENGINE] compute future failed: %s\n%s", exc, tb)
             return
         with self._lock:
+            if env.scan <= self._last_committed_scan or env.scan in self._timed_out_scans:
+                log.warning("[ENGINE] dropping late envelope scan=%s (last_committed=%s timed_out=%s)", env.scan, self._last_committed_scan, env.scan in self._timed_out_scans)
+                return
             self._result_buffer[env.scan] = env
             self._order_cv.notify_all()
         self._drain_commit_ready()
@@ -1206,7 +1211,10 @@ class DICOMHandler(FileSystemEventHandler):
                 expected_scan = self._next_scan_to_commit
                 env = self._result_buffer.pop(expected_scan, None)
                 if env is None:
-                    if self._inflight_scans and any(s > expected_scan for s in self._result_buffer):
+                    has_newer_ready = any(s > expected_scan for s in self._result_buffer)
+                    is_missing = (expected_scan not in self._inflight_scans) and (expected_scan not in self._pending_scans)
+                    is_stalled = (expected_scan in self._inflight_scans)
+                    if (is_missing or is_stalled) and has_newer_ready:
                         first_seen = self._scan_first_seen.get(expected_scan, time.time())
                         if time.time() - first_seen > self._commit_wait_timeout_s:
                             env = ResultEnvelope(
@@ -1217,6 +1225,9 @@ class DICOMHandler(FileSystemEventHandler):
                                 success=False,
                                 error=f"Commit timeout waiting for scan {expected_scan}",
                             )
+                            self._timed_out_scans.add(expected_scan)
+                            self._inflight_scans.discard(expected_scan)
+                            self._pending_scans.discard(expected_scan)
                     if env is None:
                         return
             self._commit_scan(env)

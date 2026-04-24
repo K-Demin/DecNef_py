@@ -81,6 +81,7 @@ def _mk_handler(tmp_path: Path):
     h = type("H", (), {})()
     h._next_scan_to_commit = 1
     h._last_committed_scan = 0
+    h._timed_out_scans = set()
     h._inflight_scans = {1, 2, 3}
     h._pending_scans = set()
     h._result_buffer = {}
