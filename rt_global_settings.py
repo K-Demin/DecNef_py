@@ -50,8 +50,6 @@ class RegressorSettings:
     truncate_t1_padding_vox: int = 2
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
-    use_ramdisk_cache: bool = False
-    ramdisk_root: str = "/dev/shm/decnef_rt"
 
     def update(self, overrides: dict[str, Any]) -> None:
         known = {f.name: f for f in fields(self)}
