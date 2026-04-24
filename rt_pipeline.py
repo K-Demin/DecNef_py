@@ -1143,8 +1143,7 @@ class DICOMHandler(FileSystemEventHandler):
         with self._lock:
             if scan in self._processed_scans or scan in self._inflight_scans:
                 return True
-            volume_idx = self.next_volume_idx
-            self.next_volume_idx += 1
+            volume_idx = scan
             self._inflight_scans.add(scan)
             self._scan_first_seen.setdefault(scan, time.time())
             if self._next_scan_to_commit is None:
