@@ -24,6 +24,16 @@ def gunzip_python(gz_path):
 
     return out_path
 
+
+def prefer_uncompressed_nifti(path_nii: Path) -> Path:
+    """Prefer .nii, but fall back to .nii.gz for backward compatibility."""
+    if path_nii.exists():
+        return path_nii
+    gz = path_nii.with_suffix(path_nii.suffix + ".gz")
+    if gz.exists():
+        return gz
+    return path_nii
+
 class FMRIRealtimePreprocessor:
     def __init__(self, cfg: SubjectDayConfig,
                  fastsurfer_env: str = "fastsurfer",
@@ -244,7 +254,7 @@ class FMRIRealtimePreprocessor:
             )
 
     def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path):
-        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii"
         if pyhysco_field.exists():
             print("✓ PyHySCO fieldmap already exists — skipping")
             return
@@ -263,10 +273,12 @@ class FMRIRealtimePreprocessor:
         run(cmd)
 
         generated_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
-        if not generated_field.exists():
+        if not generated_field.exists() and not pyhysco_field.exists():
             raise FileNotFoundError(
                 f"Expected PyHySCO fieldmap not found: {generated_field}"
             )
+        if generated_field.exists() and not pyhysco_field.exists():
+            gunzip_python(generated_field)
 
     def _run_ap_pa_ants(self, ap_mean: Path, pa_mean: Path):
         out_prefix = self.fmap_dir / "AP2PA_"
@@ -307,8 +319,10 @@ class FMRIRealtimePreprocessor:
             """
         ]
         run(cmd)
-        # unzip inverse warp
+        # unzip ANTs warps for faster repeated access during RT unwarping
+        forward_warp_path = self.fmap_dir / "AP2PA_1Warp.nii.gz"
         inverse_warp_path = self.fmap_dir / "AP2PA_1InverseWarp.nii.gz"
+        gunzip_python(forward_warp_path)
         gunzip_python(inverse_warp_path)
 
 
@@ -390,7 +404,7 @@ class FMRIRealtimePreprocessor:
         if out.exists():
             return
 
-        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        pyhysco_field = prefer_uncompressed_nifti(self.fmap_dir / "pyhysco-EstFieldMap.nii")
         if self.fieldmap_method == "pyhysco" and pyhysco_field.exists():
             polarity = 1 if self.epi_phase_encoding == "AP" else -1
             print(f"→ Applying PyHySCO fieldmap to {epi_4d.name}")
@@ -402,11 +416,11 @@ class FMRIRealtimePreprocessor:
                 polarity=polarity,
             )
             return
-        warp = self.fmap_dir / "AP2PA_1InverseWarp.nii"
+        warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1InverseWarp.nii")
         affine = self.fmap_dir / "AP2PA_0GenericAffine.mat"
         PA_mean = self.fmap_dir / "PA_mean.nii"
         if self.epi_phase_encoding == "AP":
-            warp = self.fmap_dir / "AP2PA_1Warp.nii.gz"
+            warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1Warp.nii")
             PA_mean = self.fmap_dir / "AP_mean.nii"
 
         if not warp.exists() or not affine.exists():

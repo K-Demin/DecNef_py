@@ -507,6 +507,16 @@ def _same_grid(a_path: Path, b_path: Path) -> bool:
     )
 
 
+def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
+    """Prefer .nii, but transparently fall back to .nii.gz when needed."""
+    if path_nii.exists():
+        return path_nii
+    gz = path_nii.with_suffix(path_nii.suffix + ".gz")
+    if gz.exists():
+        return gz
+    return path_nii
+
+
 def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]:
     """
     Optionally crop T1-space reference to EPI coverage (in native T1 resolution).
@@ -537,10 +547,11 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
     pad = int(REGRESSOR_SETTINGS.truncate_t1_padding_vox)
     trunc_dir = cfg.trans_dir / "truncated_t1_refs"
     trunc_dir.mkdir(parents=True, exist_ok=True)
-    warped_mask_t1 = trunc_dir / "epi_mask_mean_in_t1.nii.gz"
-    t1_trunc_path = trunc_dir / f"T1_N4_epi_fov_pad{pad}.nii.gz"
+    warped_mask_t1 = trunc_dir / "epi_mask_mean_in_t1.nii"
+    t1_trunc_path = trunc_dir / f"T1_N4_epi_fov_pad{pad}.nii"
 
-    if not warped_mask_t1.exists():
+    warped_mask_t1_existing = _prefer_uncompressed_nifti(warped_mask_t1)
+    if not warped_mask_t1_existing.exists():
         run(
             [
                 "antsApplyTransforms",
@@ -554,11 +565,12 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
             ]
         )
 
+    warped_mask_t1_existing = _prefer_uncompressed_nifti(warped_mask_t1)
     try:
-        mask_img = nib.load(str(warped_mask_t1))
+        mask_img = nib.load(str(warped_mask_t1_existing))
         mask_arr = np.asanyarray(mask_img.dataobj)
     except Exception as exc:
-        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1, exc)
+        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
         return None
 
     nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
@@ -584,7 +596,7 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
 
     decoder_template = resolve_decoder_template(cfg)
     if decoder_template.exists() and _same_grid(decoder_template, t1_n4):
-        decoder_trunc_path = trunc_dir / f"{decoder_template.stem}_epi_fov_pad{pad}.nii.gz"
+        decoder_trunc_path = trunc_dir / f"{decoder_template.stem}_epi_fov_pad{pad}.nii"
         if not decoder_trunc_path.exists():
             decoder_img = nib.load(str(decoder_template))
             decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
@@ -1659,7 +1671,7 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
 
     if method == "pyhysco":
-        pyhysco_field = fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        pyhysco_field = _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
         if not pyhysco_field.exists():
             log.error("[FMAP] Missing PyHySCO fieldmap: %s", pyhysco_field)
             return False
@@ -1674,12 +1686,12 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
         )
         return True
 
-    warp = fmap_dir / "AP2PA_1InverseWarp.nii"
+    warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1InverseWarp.nii")
     affine = fmap_dir / "AP2PA_0GenericAffine.mat"
-    ref_img = fmap_dir / "PA_mean.nii.gz"
+    ref_img = _prefer_uncompressed_nifti(fmap_dir / "PA_mean.nii")
     if epi_pe == "AP":
-        warp = fmap_dir / "AP2PA_1Warp.nii.gz"
-        ref_img = fmap_dir / "AP_mean.nii.gz"
+        warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1Warp.nii")
+        ref_img = _prefer_uncompressed_nifti(fmap_dir / "AP_mean.nii")
 
     if not warp.exists() or not affine.exists():
         log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
