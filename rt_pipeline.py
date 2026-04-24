@@ -58,7 +58,7 @@ class ResultEnvelope:
     error: Optional[str] = None
     traceback_text: Optional[str] = None
     attempts: int = 0
-    unwarped_nii: Optional[Path] = None
+    raw_nii: Optional[Path] = None
     mc_nii: Optional[Path] = None
     score_input_nii: Optional[Path] = None
     score_input_orig_nii: Optional[Path] = None
@@ -1234,11 +1234,11 @@ class DICOMHandler(FileSystemEventHandler):
         # Legacy path (kept for backward compatibility).
         log.info(f"[WATCHDOG] Preparing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
 
-        prepared_unwarped: Optional[Path] = None
+        prepared_raw: Optional[Path] = None
         volume_timestamp: Optional[float] = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-            prepared_unwarped, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
-            if prepared_unwarped is not None:
+            prepared_raw, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
+            if prepared_raw is not None:
                 break
             log.warning(
                 "[WATCHDOG] Retry scan %s prep (attempt %s/%s)",
@@ -1249,7 +1249,7 @@ class DICOMHandler(FileSystemEventHandler):
             time.sleep(0.2)
 
         ok = False
-        if prepared_unwarped is not None and volume_timestamp is not None:
+        if prepared_raw is not None and volume_timestamp is not None:
             with self._order_cv:
                 while self._next_scan_to_process is not None and scan != self._next_scan_to_process:
                     self._order_cv.wait(timeout=0.1)
@@ -1260,7 +1260,7 @@ class DICOMHandler(FileSystemEventHandler):
                     self,
                     path,
                     volume_idx,
-                    unwarped_nii=prepared_unwarped,
+                    raw_nii=prepared_raw,
                     volume_timestamp=volume_timestamp,
                 )
                 if ok:
@@ -1336,11 +1336,11 @@ class DICOMHandler(FileSystemEventHandler):
         self.enqueue_path(path)
 
 
-# ---------- Core processing hook (DICOM -> NIfTI -> MC) ----------
+# ---------- Core processing hook (DICOM -> NIfTI -> MC -> FMAP) ----------
 
 def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
     """
-    Convert DICOM to NIfTI and run fieldmap unwarp.
+    Convert DICOM to raw NIfTI.
     This stage is safe to run ahead of ordered/stateful realtime steps.
     """
     volume_timestamp = time.time()
@@ -1374,21 +1374,7 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
 
     log_step("DICOM", volume_idx, start_t=t0)
 
-    # ---------- 1.5) APPLY FIELD MAP UNWARP BEFORE MC ----------
-    t0 = time.time()
-    unwarp_dir = cfg.rt_unwarp_dir
-    unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_uw.nii"
-
-    if not unwarped_nii.exists():
-        ok = unwarp_volume(raw_nii, unwarped_nii, cfg)
-        if not ok:
-            log.error(f"[FMAP] Failed unwarp for {raw_nii}")
-            return None, None
-        log_step("FMAP", volume_idx, start_t=t0)
-    else:
-        log.info(f"[FMAP] Unwarp exists for vol {volume_idx}")
-
-    return unwarped_nii, volume_timestamp
+    return raw_nii, volume_timestamp
 
 
 def run_worker_local_volreg(ref_epi: Path, unwarped_nii: Path, mc_nii: Path, volume_idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1411,8 +1397,8 @@ def run_worker_local_volreg(ref_epi: Path, unwarped_nii: Path, mc_nii: Path, vol
 
 
 def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1) -> ResultEnvelope:
-    unwarped_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
-    if unwarped_nii is None or volume_timestamp is None:
+    raw_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+    if raw_nii is None or volume_timestamp is None:
         raise RuntimeError("prepare_volume_input failed")
     return ResultEnvelope(
         scan=scan,
@@ -1421,7 +1407,7 @@ def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx:
         volume_timestamp=volume_timestamp,
         success=True,
         attempts=attempt,
-        unwarped_nii=unwarped_nii,
+        raw_nii=raw_nii,
     )
 
 
@@ -1429,15 +1415,15 @@ def commit_stage(cfg: RTSessionConfig, handler: "DICOMHandler", env: ResultEnvel
     if not env.success:
         log.error("[COMMIT] scan=%s failed in compute: %s", env.scan, env.error)
         return False
-    if env.unwarped_nii is None:
-        log.error("[COMMIT] scan=%s missing unwarped input.", env.scan)
+    if env.raw_nii is None:
+        log.error("[COMMIT] scan=%s missing raw input.", env.scan)
         return False
     return process_volume(
         cfg,
         handler,
         env.dicom_path,
         env.volume_idx,
-        unwarped_nii=env.unwarped_nii,
+        raw_nii=env.raw_nii,
         volume_timestamp=env.volume_timestamp,
     )
 
@@ -1447,19 +1433,20 @@ def process_volume(
     handler: "DICOMHandler",
     dicom_path: Path,
     volume_idx: int,
-    unwarped_nii: Optional[Path] = None,
+    raw_nii: Optional[Path] = None,
     volume_timestamp: Optional[float] = None,
 ):
     """
     For each incoming DICOM:
       1) DICOM -> raw NIfTI (single volume)
       2) Motion correction with RTPSpy -> mc NIfTI
-      3) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
+      3) Fieldmap unwarp of MC volume
+      4) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
     """
 
-    if unwarped_nii is None:
-        unwarped_nii, prepared_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
-        if unwarped_nii is None or prepared_timestamp is None:
+    if raw_nii is None:
+        raw_nii, prepared_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+        if raw_nii is None or prepared_timestamp is None:
             return False
         volume_timestamp = prepared_timestamp
     elif volume_timestamp is None:
@@ -1470,8 +1457,8 @@ def process_volume(
     mc_dir = cfg.rt_mc_dir
     mc_nii = mc_dir / f"vol_{volume_idx:05d}_mc.nii"
 
-    # use UNWARPED as input to MC
-    img = nib.load(str(unwarped_nii))
+    # MC FIRST: use RAW as input to MC
+    img = nib.load(str(raw_nii))
     data = np.asanyarray(img.dataobj).astype(np.float32)
 
     # Create a temporary NIfTI for RtpVolreg to work on
@@ -1587,28 +1574,41 @@ def process_volume(
     handler.prev_mc_for_dvars = mc_data.copy()
 
 
-    # ---------- 2c) Motion regression (RTPS_py) ----------
+    # ---------- 2c) Fieldmap unwarp AFTER MC ----------
+    uw_t0 = time.time()
+    unwarp_dir = cfg.rt_unwarp_dir
+    mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
+    if not mc_unwarped_nii.exists():
+        ok = unwarp_volume(mc_nii, mc_unwarped_nii, cfg)
+        if not ok:
+            log.error(f"[FMAP] Failed unwarp for MC volume {mc_nii}")
+            return False
+    log_step("FMAP", volume_idx, start_t=uw_t0)
+
+    mc_unwarped_img = nib.load(str(mc_unwarped_nii))
+
+    # ---------- 2d) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
-    mc_for_warp = mc_nii
+    mc_for_warp = mc_unwarped_nii
     if handler.motion_regressor is not None:
-        handler.proc_src.proc_data = np.asanyarray(mc_img.dataobj)
+        handler.proc_src.proc_data = np.asanyarray(mc_unwarped_img.dataobj)
         cleaned, reg_ready = handler.motion_regressor.apply(
-            mc_img,
+            mc_unwarped_img,
             volume_idx,
             fd_censor=fd_censor,
             dvars_censor=dvars_censor,
         )
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
         log_step("REG", volume_idx, "motion", start_t=reg_t0)
     else:
-        cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_img.dataobj))
+        cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
         reg_ready = True
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, img.affine), str(reg_nii))
+        nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
         log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0)
 
@@ -1651,7 +1651,7 @@ def process_volume(
     t0 = time.time()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
-    score_input_orig_nii: Optional[Path] = mc_nii if cfg.enable_original_score else None
+    score_input_orig_nii: Optional[Path] = mc_unwarped_nii if cfg.enable_original_score else None
 
     if analysis_space == "epi":
         log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
@@ -1875,6 +1875,11 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     if epi_pe == "AP":
         warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1Warp.nii")
         ref_img = _prefer_uncompressed_nifti(fmap_dir / "AP_mean.nii")
+
+    # NOTE:
+    # Keep unwarping in the native AP/PA fieldmap reference space
+    # (AP_mean/PA_mean). The resulting volume is then motion-corrected to
+    # cfg.rt_ref_epi in the next stage.
 
     if not warp.exists() or not affine.exists():
         log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)

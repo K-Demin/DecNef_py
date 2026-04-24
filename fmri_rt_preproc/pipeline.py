@@ -335,36 +335,50 @@ class FMRIRealtimePreprocessor:
         # 0) Input: 4D epi, already combined outside this script
         epi_4d = run_cfg.epi_file  # e.g. epi_4d.nii
 
-        # 1) Apply AP/PA warp -> epi_unwarped (4D)
-        epi_unwarped = run_dir / "epi_unwarped.nii"
-        self._unwarp_epi(epi_4d, epi_unwarped)
+        # 1) Skullstrip raw EPI (for nuisance mask preparation during MC stats)
+        epi_brain_raw = run_dir / "epi_brain_raw.nii"
+        epi_mask_raw = run_dir / "epi_mask_raw.nii"
+        self._skullstrip_epi(epi_4d, epi_brain_raw, epi_mask_raw)
 
-        # 2) Skullstrip all EPI -> epi_brain (4D) + epi_mask (3D or 4D depending on SynthStrip)
+        # 2) Motion correction first (to run EPI1)
+        rt_mc_ref_mean = run_dir / "epi_mc_mean.nii"
+        rt_mc_ref_mask_mean = run_dir / "epi_mc_mask_mean.nii"
+        self._motion_correct_and_mean(
+            epi_unwarped=epi_4d,
+            epi_mask=epi_mask_raw,
+            epi_mean=rt_mc_ref_mean,
+            epi_mask_mean=rt_mc_ref_mask_mean,
+            n_vols_for_mean=20,  # or None to use all volumes
+        )
+
+        # --- Set global RT MC reference from MC-first mean ---
+        self._maybe_set_rt_reference(rt_mc_ref_mean, rt_mc_ref_mask_mean)
+
+        # 3) Apply AP/PA warp to motion-corrected 4D EPI
+        epi_mc = epi_4d.with_name("epi_mc.nii")
+        epi_unwarped = run_dir / "epi_unwarped.nii"
+        self._unwarp_epi(epi_mc, epi_unwarped)
+
+        # 4) Skullstrip unwarped EPI for registration and nuisance masks
         epi_brain = run_dir / "epi_brain.nii"
         epi_mask = run_dir / "epi_mask.nii"
         self._skullstrip_epi(epi_unwarped, epi_brain, epi_mask)
 
-        # 3–4) Motion correction + means
+        # 5) Build means from unwarped outputs used for registration
         epi_mean = run_dir / "epi_unwarped_mean.nii"
         epi_mask_mean = run_dir / "epi_mask_mean.nii"
-        self._motion_correct_and_mean(
-            epi_unwarped=epi_unwarped,
-            epi_mask=epi_mask,
-            epi_mean=epi_mean,
-            epi_mask_mean=epi_mask_mean,
-            n_vols_for_mean=20,  # or None to use all volumes
-        )
+        if not epi_mean.exists():
+            run(["fslmaths", str(epi_unwarped), "-Tmean", str(epi_mean)])
+        if not epi_mask_mean.exists():
+            run(["fslmaths", str(epi_mask), "-Tmean", str(epi_mask_mean)])
 
-        # --- NEW: set global RT reference if not yet set ---
-        self._maybe_set_rt_reference(epi_mean, epi_mask_mean)
-
-        # 5) EPI->T1 registration using EPI mean + masks
+        # 6) EPI->T1 registration using EPI mean + masks
         self._register_epi_to_t1(run_dir, epi_mean, epi_mask_mean)
 
-        # 5.5 create masks for regression
+        # 6.5 create masks for regression
         self._make_rtp_nuisance_masks()
 
-        # 6) EPI mean -> MNI
+        # 7) EPI mean -> MNI
         self._warp_epi_mean_to_mni(run_dir, epi_mean)
 
         # ----- Build ROI on *decoder/template* grid -----
@@ -571,7 +585,7 @@ class FMRIRealtimePreprocessor:
         """
         Set the global real-time EPI reference if it does not exist yet.
 
-        We use the first run's unwarped+MC'd mean EPI as the reference
+        We use the first run's MC-first mean EPI as the reference
         for:
           - RT motion correction (RtpVolreg)
           - epi→T1 registration anchor
