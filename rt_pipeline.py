@@ -401,6 +401,7 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
+    t1_reference_override: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -492,6 +493,111 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
         / "decoders"
         / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
     )
+
+
+def _same_grid(a_path: Path, b_path: Path) -> bool:
+    try:
+        a_img = nib.load(str(a_path))
+        b_img = nib.load(str(b_path))
+    except Exception:
+        return False
+    return (
+        a_img.shape == b_img.shape
+        and np.allclose(a_img.affine, b_img.affine, atol=1e-3)
+    )
+
+
+def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]:
+    """
+    Optionally crop T1-space reference to EPI coverage (in native T1 resolution).
+
+    Steps:
+      1) Warp epi_mask_mean -> T1 with epi2t1 transform (nearest-neighbor)
+      2) Compute bounding box of nonzero voxels + padding
+      3) Save cropped T1_N4 reference for fast per-volume EPI->T1 warps
+      4) If decoder template is on the same T1 grid, crop it with the same bbox
+         so scoring remains shape-compatible.
+    """
+    if not REGRESSOR_SETTINGS.truncate_t1_to_epi_fov:
+        return None
+
+    epi_mask = cfg.trans_dir / "epi_mask_mean.nii"
+    epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
+    t1_n4 = cfg.subject_root / "anat" / "T1_N4.nii"
+    if not t1_n4.exists():
+        t1_n4 = cfg.subject_root / "anat" / "T1.nii.gz"
+
+    if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
+        log.warning(
+            "[ANTS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
+            "Using full T1 reference."
+        )
+        return None
+
+    pad = int(REGRESSOR_SETTINGS.truncate_t1_padding_vox)
+    trunc_dir = cfg.trans_dir / "truncated_t1_refs"
+    trunc_dir.mkdir(parents=True, exist_ok=True)
+    warped_mask_t1 = trunc_dir / "epi_mask_mean_in_t1.nii.gz"
+    t1_trunc_path = trunc_dir / f"T1_N4_epi_fov_pad{pad}.nii.gz"
+
+    if not warped_mask_t1.exists():
+        run(
+            [
+                "antsApplyTransforms",
+                "-d", "3",
+                "-i", str(epi_mask),
+                "-r", str(t1_n4),
+                "-o", str(warped_mask_t1),
+                "-t", str(epi2t1),
+                "-n", "NearestNeighbor",
+                "--float", "1",
+            ]
+        )
+
+    try:
+        mask_img = nib.load(str(warped_mask_t1))
+        mask_arr = np.asanyarray(mask_img.dataobj)
+    except Exception as exc:
+        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1, exc)
+        return None
+
+    nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
+    if nz.size == 0:
+        log.warning("[ANTS] Warped EPI mask in T1 has zero support; using full T1 reference.")
+        return None
+
+    mins = np.maximum(nz.min(axis=0) - pad, 0)
+    maxs = np.minimum(nz.max(axis=0) + pad + 1, np.array(mask_arr.shape))
+    x0, y0, z0 = mins.tolist()
+    x1, y1, z1 = maxs.tolist()
+
+    if not t1_trunc_path.exists():
+        t1_img = nib.load(str(t1_n4))
+        t1_trunc = t1_img.slicer[x0:x1, y0:y1, z0:z1]
+        nib.save(t1_trunc, str(t1_trunc_path))
+        log.info(
+            "[ANTS] Truncated T1 reference saved: %s (%s -> %s)",
+            t1_trunc_path,
+            t1_img.shape,
+            t1_trunc.shape,
+        )
+
+    decoder_template = resolve_decoder_template(cfg)
+    if decoder_template.exists() and _same_grid(decoder_template, t1_n4):
+        decoder_trunc_path = trunc_dir / f"{decoder_template.stem}_epi_fov_pad{pad}.nii.gz"
+        if not decoder_trunc_path.exists():
+            decoder_img = nib.load(str(decoder_template))
+            decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
+            nib.save(decoder_trunc, str(decoder_trunc_path))
+        cfg.decoder_template = decoder_trunc_path
+        log.info("[ANTS] Truncated decoder template saved: %s", decoder_trunc_path)
+    elif decoder_template.exists() and cfg.enable_scoring:
+        log.warning(
+            "[ANTS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
+            "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
+        )
+
+    return t1_trunc_path
 
 
 def resolve_decoder_roi_txt(cfg: RTSessionConfig) -> Optional[Path]:
@@ -1361,6 +1467,7 @@ def process_volume(
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
+        t1_ref = cfg.t1_reference_override or decoder_template
 
         if not decoder_template.exists():
             log.error(f"Decoder template not found at {decoder_template}")
@@ -1374,7 +1481,7 @@ def process_volume(
             "antsApplyTransforms",
             "-d", "3",
             "-i", str(mc_for_warp),
-            "-r", str(decoder_template),
+            "-r", str(t1_ref),
             "-o", str(t1_nii),
             "-t", str(epi2t1),
             "-n", "Linear",
@@ -1390,7 +1497,7 @@ def process_volume(
                 "antsApplyTransforms",
                 "-d", "3",
                 "-i", str(mc_nii),
-                "-r", str(decoder_template),
+                "-r", str(t1_ref),
                 "-o", str(t1_orig_nii),
                 "-t", str(epi2t1),
                 "-n", "Linear",
@@ -1626,7 +1733,6 @@ def wait_for_file_complete(path: Path, timeout: float = 5.0, interval: float = 0
 # ---------- Main ----------
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
-    decoder_template = resolve_decoder_template(cfg)
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     if analysis_space not in {"epi", "t1", "mni"}:
         raise ValueError(
@@ -1637,6 +1743,9 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         raise ValueError(
             "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
         )
+    t1_reference = maybe_prepare_truncated_t1_reference(cfg)
+    cfg.t1_reference_override = t1_reference
+    decoder_template = resolve_decoder_template(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
