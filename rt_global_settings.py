@@ -45,6 +45,8 @@ class RegressorSettings:
     biopac_timelag: bool = False
     max_workers: int = 6
     max_retries: int = 3
+    pipeline_engine: str = "parallel_ordered"  # "parallel_ordered" or "legacy"
+    commit_wait_timeout_s: float = 1.0
     skip_first_trs: int = 0
     truncate_t1_to_epi_fov: bool = False
     truncate_t1_padding_vox: int = 2
