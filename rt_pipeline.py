@@ -980,6 +980,14 @@ class DICOMHandler(FileSystemEventHandler):
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
         self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
         self._pyhysco_unwarped_save_notice_emitted = False
+        log.info(
+            "[FMAP] Effective settings: use_preloaded_pyhysco=%s save_intermediate_unwarped=%s "
+            "pyhysco_backend=%s pyhysco_device=%s",
+            bool(getattr(REGRESSOR_SETTINGS, "use_preloaded_pyhysco", True)),
+            bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)),
+            str(getattr(REGRESSOR_SETTINGS, "pyhysco_backend", "grid_sample")),
+            str(getattr(REGRESSOR_SETTINGS, "pyhysco_device", "cuda")),
+        )
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -1674,24 +1682,29 @@ def process_volume(
     # ---------- 2c) Fieldmap unwarp AFTER MC ----------
     uw_t0 = time.time()
     unwarp_dir = cfg.rt_unwarp_dir
+    unwarp_dir.mkdir(parents=True, exist_ok=True)
     mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
     use_fast_unwarp = handler.pyhysco_applier is not None
     if use_fast_unwarp:
         try:
             mc_unwarped_data = handler.pyhysco_applier.apply_volume(mc_data)
-            mc_unwarped_img = nib.Nifti1Image(mc_unwarped_data, mc_img.affine)
+            mc_unwarped_img = nib.Nifti1Image(
+                mc_unwarped_data.astype(np.float32, copy=False),
+                mc_img.affine,
+                mc_img.header.copy(),
+            )
             # RTPSpy regression path expects fmri_img.get_filename() to be non-None.
             # Keep an explicit filename even when running in-memory fast mode.
             mc_unwarped_img.set_filename(str(mc_unwarped_nii))
 
-            # Always persist unwarped NIfTI for quality-check auditing.
-            nib.save(mc_unwarped_img, str(mc_unwarped_nii))
-            if (not bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False))
-                    and not handler._pyhysco_unwarped_save_notice_emitted):
+            if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)):
+                nib.save(mc_unwarped_img, str(mc_unwarped_nii))
+                if not mc_unwarped_nii.exists():
+                    raise RuntimeError(f"Failed to save unwarped QC volume: {mc_unwarped_nii}")
+                log.info("[FMAP] saved %s", mc_unwarped_nii.name)
+            elif not handler._pyhysco_unwarped_save_notice_emitted:
                 log.info(
-                    "[FMAP] save_intermediate_unwarped=False, but unwarped NIfTI is still being saved "
-                    "for quality-check auditing: %s",
-                    mc_unwarped_nii,
+                    "[FMAP] in-memory mode (save_intermediate_unwarped=False) for preloaded PyHySCO."
                 )
                 handler._pyhysco_unwarped_save_notice_emitted = True
         except Exception as exc:

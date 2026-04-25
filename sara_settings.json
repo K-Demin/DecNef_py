@@ -38,5 +38,6 @@
   "max_retries": 3,
   "_comment_fieldmap": "Fieldmap correction settings for realtime unwarping (PyHySCO PED is derived from epi_phase_encoding).",
   "fieldmap_method": "pyhysco",
-  "epi_phase_encoding": "PA"
+  "epi_phase_encoding": "PA",
+  "save_intermediate_unwarped": true
 }
