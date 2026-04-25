@@ -515,6 +515,53 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     )
 
 
+def maybe_init_gpu_resampler(cfg: RTSessionConfig):
+    if not bool(getattr(REGRESSOR_SETTINGS, "use_gpu_resampler", False)):
+        return None
+
+    analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if analysis_space not in {"t1", "mni"}:
+        log.info("[GPU] Disabled: analysis_space=%s does not require warp.", analysis_space)
+        return None
+
+    from gpu_ants_like_resampler import GpuAntsLikeResampler, precompute_sampling_grid
+
+    if analysis_space == "t1":
+        decoder_template = resolve_decoder_template(cfg)
+        fixed_ref = cfg.t1_reference_override or decoder_template
+        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_t1"
+    else:
+        fixed_ref = resolve_decoder_template(cfg)
+        transforms = [
+            cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii",
+            cfg.trans_dir / "epi2t1_Composite.h5",
+        ]
+        out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_mni"
+
+    missing = [p for p in [fixed_ref, *transforms, cfg.rt_ref_epi] if not p.exists()]
+    if missing:
+        log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
+        return None
+
+    grid_path_npz = out_dir / "sampling_grid.npz"
+    grid_path_pt = out_dir / "sampling_grid.pt"
+    grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
+    if not grid_path.exists():
+        log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
+        grid_path = precompute_sampling_grid(
+            moving_ref=cfg.rt_ref_epi,
+            fixed_ref=fixed_ref,
+            transforms=transforms,
+            out_dir=out_dir,
+        )
+
+    device = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_device", "cuda"))
+    resampler = GpuAntsLikeResampler(grid_path=grid_path, device=device, mode="bilinear")
+    log.info("[GPU] Resampler ready (%s, device=%s).", grid_path, resampler.device)
+    return resampler
+
+
 def _same_grid(a_path: Path, b_path: Path) -> bool:
     try:
         a_img = nib.load(str(a_path))
@@ -559,7 +606,7 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
 
     if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
         log.warning(
-            "[ANTS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
+            "[TRANS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
             "Using full T1 reference."
         )
         return None
@@ -590,12 +637,12 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
         mask_img = nib.load(str(warped_mask_t1_existing))
         mask_arr = np.asanyarray(mask_img.dataobj)
     except Exception as exc:
-        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
+        log.warning("[TRANS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
         return None
 
     nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
     if nz.size == 0:
-        log.warning("[ANTS] Warped EPI mask in T1 has zero support; using full T1 reference.")
+        log.warning("[TRANS] Warped EPI mask in T1 has zero support; using full T1 reference.")
         return None
 
     mins = np.maximum(nz.min(axis=0) - pad, 0)
@@ -608,7 +655,7 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
         t1_trunc = t1_img.slicer[x0:x1, y0:y1, z0:z1]
         nib.save(t1_trunc, str(t1_trunc_path))
         log.info(
-            "[ANTS] Truncated T1 reference saved: %s (%s -> %s)",
+            "[TRANS] Truncated T1 reference saved: %s (%s -> %s)",
             t1_trunc_path,
             t1_img.shape,
             t1_trunc.shape,
@@ -622,10 +669,10 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
             decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
             nib.save(decoder_trunc, str(decoder_trunc_path))
         cfg.decoder_template = decoder_trunc_path
-        log.info("[ANTS] Truncated decoder template saved: %s", decoder_trunc_path)
+        log.info("[TRANS] Truncated decoder template saved: %s", decoder_trunc_path)
     elif decoder_template.exists() and cfg.enable_scoring:
         log.warning(
-            "[ANTS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
+            "[TRANS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
             "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
         )
 
@@ -883,6 +930,7 @@ class DICOMHandler(FileSystemEventHandler):
                 self.reference_score_stats["n"],
                 self.reference_score_stats.get("used_reg_ready", False),
             )
+        self.gpu_resampler = maybe_init_gpu_resampler(cfg)
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -1654,7 +1702,7 @@ def process_volume(
     score_input_orig_nii: Optional[Path] = mc_unwarped_nii if cfg.enable_original_score else None
 
     if analysis_space == "epi":
-        log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
+        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0)
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
@@ -1672,35 +1720,41 @@ def process_volume(
             log.error(f"Missing EPI→T1 transform in {cfg.trans_dir}")
             return False
 
-        cmd = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_for_warp),
-            "-r", str(t1_ref),
-            "-o", str(t1_nii),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd)
+        if handler.gpu_resampler is not None:
+            handler.gpu_resampler.resample_nifti_to_nifti(mc_for_warp, t1_nii)
+        else:
+            cmd = [
+                "antsApplyTransforms",
+                "-d", "3",
+                "-i", str(mc_for_warp),
+                "-r", str(t1_ref),
+                "-o", str(t1_nii),
+                "-t", str(epi2t1),
+                "-n", "Linear",
+                "--float", "1",
+            ]
+            run(cmd)
         score_input_nii = t1_nii
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
             t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
-            cmd_orig = [
-                "antsApplyTransforms",
-                "-d", "3",
-                "-i", str(mc_nii),
-                "-r", str(t1_ref),
-                "-o", str(t1_orig_nii),
-                "-t", str(epi2t1),
-                "-n", "Linear",
-                "--float", "1",
-            ]
-            run(cmd_orig)
+            if handler.gpu_resampler is not None:
+                handler.gpu_resampler.resample_nifti_to_nifti(mc_nii, t1_orig_nii)
+            else:
+                cmd_orig = [
+                    "antsApplyTransforms",
+                    "-d", "3",
+                    "-i", str(mc_nii),
+                    "-r", str(t1_ref),
+                    "-o", str(t1_orig_nii),
+                    "-t", str(epi2t1),
+                    "-n", "Linear",
+                    "--float", "1",
+                ]
+                run(cmd_orig)
             score_input_orig_nii = t1_orig_nii
-        log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→T1", start_t=t0)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
         mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
@@ -1717,37 +1771,43 @@ def process_volume(
             log.error(f"Missing transforms in {cfg.trans_dir}")
             return False
 
-        cmd = [
-            "antsApplyTransforms",
-            "-d", "3",
-            "-i", str(mc_for_warp),
-            "-r", str(decoder_template),
-            "-o", str(mni_nii),
-            "-t", str(warp_t1_mni),
-            "-t", str(epi2t1),
-            "-n", "Linear",
-            "--float", "1",
-        ]
-        run(cmd)
-        score_input_nii = mni_nii
-
-        # Optional: also save pre-denoise / pre-normalization score source.
-        if cfg.enable_original_score:
-            mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
-            cmd_orig = [
+        if handler.gpu_resampler is not None:
+            handler.gpu_resampler.resample_nifti_to_nifti(mc_for_warp, mni_nii)
+        else:
+            cmd = [
                 "antsApplyTransforms",
                 "-d", "3",
-                "-i", str(mc_nii),
+                "-i", str(mc_for_warp),
                 "-r", str(decoder_template),
-                "-o", str(mni_orig_nii),
+                "-o", str(mni_nii),
                 "-t", str(warp_t1_mni),
                 "-t", str(epi2t1),
                 "-n", "Linear",
                 "--float", "1",
             ]
-            run(cmd_orig)
+            run(cmd)
+        score_input_nii = mni_nii
+
+        # Optional: also save pre-denoise / pre-normalization score source.
+        if cfg.enable_original_score:
+            mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            if handler.gpu_resampler is not None:
+                handler.gpu_resampler.resample_nifti_to_nifti(mc_nii, mni_orig_nii)
+            else:
+                cmd_orig = [
+                    "antsApplyTransforms",
+                    "-d", "3",
+                    "-i", str(mc_nii),
+                    "-r", str(decoder_template),
+                    "-o", str(mni_orig_nii),
+                    "-t", str(warp_t1_mni),
+                    "-t", str(epi2t1),
+                    "-n", "Linear",
+                    "--float", "1",
+                ]
+                run(cmd_orig)
             score_input_orig_nii = mni_orig_nii
-        log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0)
     else:
         log.error(
             "Unsupported analysis_space=%r. Expected 'epi', 't1', or 'mni'.",
