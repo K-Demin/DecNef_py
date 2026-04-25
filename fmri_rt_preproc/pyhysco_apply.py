@@ -8,6 +8,7 @@ from uuid import uuid4
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 PYHYSCO_SRC = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
 if str(PYHYSCO_SRC) not in sys.path:
@@ -100,21 +101,61 @@ class PreloadedPyHyscoApplier:
             b = -b
         self.fieldmap_internal = b.contiguous()
         self.device = str(self.data_obj.device)
+        self._init_fast_apply_cache()
+
+    @staticmethod
+    def _idx_to_norm(idx: torch.Tensor, size: int) -> torch.Tensor:
+        if size <= 1:
+            return torch.zeros_like(idx)
+        return 2.0 * idx / float(size - 1) - 1.0
+
+    def _init_fast_apply_cache(self) -> None:
+        """
+        Precompute a fixed sampling grid and Jacobian for fast per-volume apply.
+
+        For fixed fieldmap b:
+            TI(xc) = I(xc + bc) * (1 + dbc)
+        where bc, dbc, and therefore xc+bc/Jac are constant across incoming volumes.
+        """
+        m = tuple(int(v) for v in self.data_obj.m.tolist())
+        if len(m) != 3:
+            raise ValueError(f"Fast fieldmap apply currently expects 3D volumes, got shape rank={len(m)}.")
+
+        # Precompute deformation and Jacobian terms from fixed fieldmap.
+        bc = self.corr_obj.A.mat_mul(self.fieldmap_internal)
+        dbc = self.corr_obj.D.mat_mul(self.fieldmap_internal)
+        jac = (1.0 + dbc).reshape(m).contiguous()
+        xt = (self.corr_obj.xc + bc).reshape(m)
+
+        # Convert physical coordinates to interpolation indices along distortion dim.
+        x_idx = (xt - self.data_obj.omega[-2]) / self.data_obj.h[-1] - 0.5
+        x_idx = torch.clamp(x_idx, 0, m[-1] - 1)
+
+        # Identity coordinates for non-distortion axes.
+        z_idx = torch.arange(m[0], device=self.data_obj.device, dtype=self.data_obj.dtype).view(m[0], 1, 1).expand(m)
+        y_idx = torch.arange(m[1], device=self.data_obj.device, dtype=self.data_obj.dtype).view(1, m[1], 1).expand(m)
+
+        x_norm = self._idx_to_norm(x_idx, m[2]).float()
+        y_norm = self._idx_to_norm(y_idx, m[1]).float()
+        z_norm = self._idx_to_norm(z_idx, m[0]).float()
+
+        # grid_sample expects [x, y, z] components in the last dimension.
+        self.grid = torch.stack([x_norm, y_norm, z_norm], dim=-1).unsqueeze(0).contiguous()
+        self.jac = jac.float()
 
     def apply_volume(self, volume_xyz: np.ndarray) -> np.ndarray:
         """Apply cached fieldmap/correction objects to one 3D volume."""
         vol_internal = _to_internal_volume(volume_xyz, self.data_obj, dtype=self.data_obj.dtype)
-        self.data_obj.I1.data = vol_internal
-        self.data_obj.I2.data = vol_internal
-        self.data_obj.im1 = vol_internal
-        self.data_obj.im2 = vol_internal
-
-        corr_vol, _, _, _ = self.corr_obj.mp_transform(
-            self.data_obj.I1,
-            self.fieldmap_internal,
-            do_derivative=False,
+        src = vol_internal.float().unsqueeze(0).unsqueeze(0)
+        sampled = F.grid_sample(
+            src,
+            self.grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
         )
-        corr_vol = corr_vol.reshape(tuple(self.data_obj.m)).permute(self.data_obj.p)
+        corr_vol = sampled[0, 0] * self.jac
+        corr_vol = corr_vol.permute(self.data_obj.p)
         return corr_vol.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
