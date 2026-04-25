@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -14,6 +13,18 @@ import torch.nn.functional as F
 def _run_cmd(cmd: Sequence[str | Path]) -> None:
     cmd_str = [str(c) for c in cmd]
     subprocess.run(cmd_str, check=True)
+
+
+def _torch_load_compat(path: Path):
+    """
+    PyTorch >=2.6 defaults torch.load(..., weights_only=True), which rejects
+    non-tensor Python objects. Our grid payload is produced locally and trusted.
+    """
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        # Older PyTorch versions do not expose the weights_only argument.
+        return torch.load(str(path), map_location="cpu")
 
 
 def make_voxel_coordinate_images(moving_ref: Path, out_dir: Path) -> dict[str, Path]:
@@ -47,7 +58,7 @@ def precompute_sampling_grid(
     fixed_ref: Path,
     transforms: Sequence[Path],
     out_dir: Path,
-    grid_name: str = "sampling_grid.pt",
+    grid_name: str = "sampling_grid.npz",
 ) -> Path:
     """
     Build a fixed-grid lookup for PyTorch grid_sample that approximates ANTs pull-resampling.
@@ -88,24 +99,14 @@ def precompute_sampling_grid(
     grid_zyx = np.transpose(grid_xyz, (2, 1, 0, 3))
     grid = torch.from_numpy(grid_zyx[None, ...]).float()
 
-    payload = {
-        "grid": grid,
-        "moving_shape": tuple(int(v) for v in moving_img.shape[:3]),
-        "fixed_shape": tuple(int(v) for v in fixed_img.shape[:3]),
-        "fixed_affine": fixed_img.affine.astype(np.float64),
-    }
     grid_path = out_dir / grid_name
-    torch.save(payload, str(grid_path))
-
-    meta_path = out_dir / "sampling_grid_meta.json"
-    meta_payload = {
-        "moving_ref": str(moving_ref),
-        "fixed_ref": str(fixed_ref),
-        "transforms": [str(t) for t in transforms],
-        "moving_shape": payload["moving_shape"],
-        "fixed_shape": payload["fixed_shape"],
-    }
-    meta_path.write_text(json.dumps(meta_payload, indent=2) + "\n", encoding="utf-8")
+    np.savez_compressed(
+        str(grid_path),
+        grid=grid.numpy(),
+        moving_shape=np.asarray(moving_img.shape[:3], dtype=np.int32),
+        fixed_shape=np.asarray(fixed_img.shape[:3], dtype=np.int32),
+        fixed_affine=fixed_img.affine.astype(np.float64),
+    )
     return grid_path
 
 
@@ -117,7 +118,7 @@ class GpuAntsLikeResampler:
         mode: str = "bilinear",
         padding_mode: str = "zeros",
     ):
-        payload = torch.load(str(grid_path), map_location="cpu")
+        payload = self._load_payload(grid_path)
         selected_device = device if (device != "cuda" or torch.cuda.is_available()) else "cpu"
         self.device = torch.device(selected_device)
         self.mode = mode
@@ -131,6 +132,22 @@ class GpuAntsLikeResampler:
             dtype=torch.float32,
             device=self.device,
         )
+
+    @staticmethod
+    def _load_payload(grid_path: Path) -> dict:
+        if grid_path.suffix == ".npz":
+            with np.load(str(grid_path)) as npz:
+                return {
+                    "grid": torch.from_numpy(npz["grid"]).float(),
+                    "moving_shape": tuple(int(v) for v in npz["moving_shape"].tolist()),
+                    "fixed_shape": tuple(int(v) for v in npz["fixed_shape"].tolist()),
+                    "fixed_affine": np.asarray(npz["fixed_affine"], dtype=np.float64),
+                }
+
+        # Backward compatibility with older .pt payloads.
+        payload = _torch_load_compat(grid_path)
+        payload["fixed_affine"] = np.asarray(payload["fixed_affine"], dtype=np.float64)
+        return payload
 
     @torch.inference_mode()
     def resample_array(self, data_xyz: np.ndarray) -> np.ndarray:

@@ -544,7 +544,9 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
         log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
         return None
 
-    grid_path = out_dir / "sampling_grid.pt"
+    grid_path_npz = out_dir / "sampling_grid.npz"
+    grid_path_pt = out_dir / "sampling_grid.pt"
+    grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
     if not grid_path.exists():
         log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
         grid_path = precompute_sampling_grid(
@@ -604,7 +606,7 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
 
     if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
         log.warning(
-            "[ANTS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
+            "[TRANS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
             "Using full T1 reference."
         )
         return None
@@ -635,12 +637,12 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
         mask_img = nib.load(str(warped_mask_t1_existing))
         mask_arr = np.asanyarray(mask_img.dataobj)
     except Exception as exc:
-        log.warning("[ANTS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
+        log.warning("[TRANS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
         return None
 
     nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
     if nz.size == 0:
-        log.warning("[ANTS] Warped EPI mask in T1 has zero support; using full T1 reference.")
+        log.warning("[TRANS] Warped EPI mask in T1 has zero support; using full T1 reference.")
         return None
 
     mins = np.maximum(nz.min(axis=0) - pad, 0)
@@ -653,7 +655,7 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
         t1_trunc = t1_img.slicer[x0:x1, y0:y1, z0:z1]
         nib.save(t1_trunc, str(t1_trunc_path))
         log.info(
-            "[ANTS] Truncated T1 reference saved: %s (%s -> %s)",
+            "[TRANS] Truncated T1 reference saved: %s (%s -> %s)",
             t1_trunc_path,
             t1_img.shape,
             t1_trunc.shape,
@@ -667,10 +669,10 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
             decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
             nib.save(decoder_trunc, str(decoder_trunc_path))
         cfg.decoder_template = decoder_trunc_path
-        log.info("[ANTS] Truncated decoder template saved: %s", decoder_trunc_path)
+        log.info("[TRANS] Truncated decoder template saved: %s", decoder_trunc_path)
     elif decoder_template.exists() and cfg.enable_scoring:
         log.warning(
-            "[ANTS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
+            "[TRANS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
             "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
         )
 
@@ -1700,7 +1702,7 @@ def process_volume(
     score_input_orig_nii: Optional[Path] = mc_unwarped_nii if cfg.enable_original_score else None
 
     if analysis_space == "epi":
-        log_step("ANTS", volume_idx, "skipped (EPI space)", start_t=t0)
+        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0)
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
@@ -1752,7 +1754,7 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = t1_orig_nii
-        log_step("ANTS", volume_idx, "warp→T1", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→T1", start_t=t0)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
         mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
@@ -1805,7 +1807,7 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = mni_orig_nii
-        log_step("ANTS", volume_idx, "warp→MNI", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0)
     else:
         log.error(
             "Unsupported analysis_space=%r. Expected 'epi', 't1', or 'mni'.",
