@@ -55,7 +55,7 @@ class RegressorSettings:
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
-    save_intermediate_unwarped: bool = False
+    save_intermediate_unwarped: bool = True
     pyhysco_device: str = "cuda"
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 

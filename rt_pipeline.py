@@ -1684,12 +1684,14 @@ def process_volume(
             # Keep an explicit filename even when running in-memory fast mode.
             mc_unwarped_img.set_filename(str(mc_unwarped_nii))
 
-            if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False)):
-                nib.save(mc_unwarped_img, str(mc_unwarped_nii))
-            elif not handler._pyhysco_unwarped_save_notice_emitted:
+            # Always persist unwarped NIfTI for quality-check auditing.
+            nib.save(mc_unwarped_img, str(mc_unwarped_nii))
+            if (not bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False))
+                    and not handler._pyhysco_unwarped_save_notice_emitted):
                 log.info(
-                    "[FMAP] Preloaded PyHySCO is running in-memory; unwarped NIfTI files are not saved "
-                    "(save_intermediate_unwarped=False)."
+                    "[FMAP] save_intermediate_unwarped=False, but unwarped NIfTI is still being saved "
+                    "for quality-check auditing: %s",
+                    mc_unwarped_nii,
                 )
                 handler._pyhysco_unwarped_save_notice_emitted = True
         except Exception as exc:
