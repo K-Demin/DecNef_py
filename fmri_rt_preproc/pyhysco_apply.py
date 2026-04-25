@@ -42,6 +42,66 @@ def _load_internal_fieldmap(fieldmap_path: Path, data_obj: DataObject) -> torch.
     return field.permute(internal_perm).contiguous()
 
 
+def _to_internal_volume(
+    volume_xyz: np.ndarray,
+    data_obj: DataObject,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Convert an external-orientation volume to PyHySCO's internal orientation."""
+    internal_perm = _inverse_permutation(data_obj.p)
+    vol_t = torch.as_tensor(volume_xyz, dtype=dtype, device=data_obj.device)
+    return vol_t.permute(internal_perm).contiguous()
+
+
+class PreloadedPyHyscoApplier:
+    """
+    Reusable PyHySCO fieldmap applier for fixed geometry.
+
+    This avoids reloading/initializing DataObject and EPIMRIDistortionCorrection for
+    every single volume.
+    """
+
+    def __init__(
+        self,
+        prototype_vol_path: Path,
+        fieldmap_path: Path,
+        phase_encoding_direction: int = 1,
+        polarity: int = 1,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ):
+        self.data_obj = DataObject(
+            str(prototype_vol_path),
+            str(prototype_vol_path),
+            phase_encoding_direction=phase_encoding_direction,
+            do_normalize=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.corr_obj = EPIMRIDistortionCorrection(self.data_obj, alpha=1.0, beta=0.0)
+
+        b = _load_internal_fieldmap(fieldmap_path, self.data_obj)
+        if polarity < 0:
+            b = -b
+        self.fieldmap_internal = b.contiguous()
+
+    def apply_volume(self, volume_xyz: np.ndarray) -> np.ndarray:
+        """Apply cached fieldmap/correction objects to one 3D volume."""
+        vol_internal = _to_internal_volume(volume_xyz, self.data_obj, dtype=self.data_obj.dtype)
+        self.data_obj.I1.data = vol_internal
+        self.data_obj.I2.data = vol_internal
+        self.data_obj.im1 = vol_internal
+        self.data_obj.im2 = vol_internal
+
+        corr_vol, _, _, _ = self.corr_obj.mp_transform(
+            self.data_obj.I1,
+            self.fieldmap_internal,
+            do_derivative=False,
+        )
+        corr_vol = corr_vol.reshape(tuple(self.data_obj.m)).permute(self.data_obj.p)
+        return corr_vol.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
 def apply_pyhysco_fieldmap(
     epi_path: Path,
     fieldmap_path: Path,
@@ -87,30 +147,22 @@ def apply_pyhysco_fieldmap(
 
     corrected = np.zeros_like(epi_work, dtype=np.float32)
     run_tag = uuid4().hex
+    proto_path = epi_path.parent / f".__pyhysco_tmp_{epi_path.stem}_{run_tag}_proto.nii.gz"
+    try:
+        nib.save(nib.Nifti1Image(epi_work[..., 0], epi_img.affine, epi_img.header), str(proto_path))
+        applier = PreloadedPyHyscoApplier(
+            prototype_vol_path=proto_path,
+            fieldmap_path=fieldmap_path,
+            phase_encoding_direction=phase_encoding_direction,
+            polarity=polarity,
+            device=device,
+            dtype=dtype,
+        )
 
-    for t in range(epi_work.shape[-1]):
-        vol_path = epi_path.parent / f".__pyhysco_tmp_{epi_path.stem}_{run_tag}_vol_{t:04d}.nii.gz"
-        try:
-            nib.save(nib.Nifti1Image(epi_work[..., t], epi_img.affine, epi_img.header), str(vol_path))
-
-            data_obj = DataObject(
-                str(vol_path),
-                str(vol_path),
-                phase_encoding_direction=phase_encoding_direction,
-                do_normalize=False,
-                dtype=dtype,
-                device=device,
-            )
-            corr_obj = EPIMRIDistortionCorrection(data_obj, alpha=1.0, beta=0.0)
-            b = _load_internal_fieldmap(fieldmap_path, data_obj)
-            if polarity < 0:
-                b = -b
-
-            corr_vol, _, _, _ = corr_obj.mp_transform(corr_obj.dataObj.I1, b, do_derivative=False)
-            corr_vol = corr_vol.reshape(tuple(corr_obj.dataObj.m)).permute(corr_obj.dataObj.p)
-            corrected[..., t] = corr_vol.detach().cpu().numpy().astype(np.float32)
-        finally:
-            vol_path.unlink(missing_ok=True)
+        for t in range(epi_work.shape[-1]):
+            corrected[..., t] = applier.apply_volume(epi_work[..., t])
+    finally:
+        proto_path.unlink(missing_ok=True)
 
     out_data = corrected[..., 0] if squeeze_output else corrected
     nib.save(nib.Nifti1Image(out_data, epi_img.affine, epi_img.header), str(out_path))
