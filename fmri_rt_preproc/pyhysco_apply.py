@@ -114,6 +114,12 @@ class PreloadedPyHyscoApplier:
         self.phase_encoding_direction = int(phase_encoding_direction)
         self.polarity = int(polarity)
         self.fieldmap_path = Path(fieldmap_path)
+        self.prototype_vol_path = Path(prototype_vol_path)
+
+        proto_img = nib.load(str(self.prototype_vol_path))
+        field_img = nib.load(str(self.fieldmap_path))
+        self.prototype_image_shape = tuple(int(v) for v in proto_img.shape[:3])
+        self.fieldmap_image_shape = tuple(int(v) for v in field_img.shape[:3])
 
         b = _load_internal_fieldmap(self.fieldmap_path, self.data_obj)
         if polarity < 0:
@@ -121,11 +127,29 @@ class PreloadedPyHyscoApplier:
         self.fieldmap_internal = b.contiguous()
         self.device = str(self.data_obj.device)
         self.interpolation_backend = interpolation_backend
-        self.external_shape_xyz = tuple(int(v) for v in m_plus(self.data_obj.m).cpu().numpy()[self.data_obj.p])
+        self.external_input_shape = tuple(int(v) for v in self.data_obj.m.cpu().numpy()[self.data_obj.p])
+        self.external_fieldmap_shape = tuple(int(v) for v in m_plus(self.data_obj.m).cpu().numpy()[self.data_obj.p])
         self.internal_shape = tuple(int(v) for v in self.data_obj.m.tolist())
+        self.data_obj_p = tuple(int(v) for v in self.data_obj.p)
         self._internal_perm = _inverse_permutation(self.data_obj.p)
         self._external_perm = list(self.data_obj.p)
         self._init_fast_apply_cache()
+        log.info(
+            (
+                "[PyHySCO:init] prototype_image_shape=%s fieldmap_image_shape=%s data_obj.m=%s "
+                "data_obj.p=%s external_input_shape=%s external_fieldmap_shape=%s "
+                "fieldmap_internal.shape=%s jac.shape=%s grid.shape=%s"
+            ),
+            self.prototype_image_shape,
+            self.fieldmap_image_shape,
+            self.internal_shape,
+            self.data_obj_p,
+            self.external_input_shape,
+            self.external_fieldmap_shape,
+            tuple(self.fieldmap_internal.shape),
+            tuple(self.jac.shape),
+            tuple(self.grid.shape),
+        )
 
     @staticmethod
     def _idx_to_norm(idx: torch.Tensor, size: int) -> torch.Tensor:
@@ -177,10 +201,10 @@ class PreloadedPyHyscoApplier:
             self.w = w.to(self.data_obj.device)
 
     def _validate_external_volume_shape(self, shape: tuple[int, ...]) -> None:
-        if tuple(shape) != self.external_shape_xyz:
+        if tuple(shape) != self.external_input_shape:
             raise ValueError(
                 "Input volume shape mismatch for PreloadedPyHyscoApplier. "
-                f"Expected external XYZ shape {self.external_shape_xyz}, got {tuple(shape)}."
+                f"Expected external XYZ shape {self.external_input_shape}, got {tuple(shape)}."
             )
 
     def _validate_internal_volume_shape(self, shape: tuple[int, ...]) -> None:

@@ -563,7 +563,10 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     return resampler
 
 
-def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHyscoApplier]:
+def _build_pyhysco_applier(
+    cfg: RTSessionConfig,
+    prototype_vol_path: Path,
+) -> Optional[PreloadedPyHyscoApplier]:
     method = str(getattr(REGRESSOR_SETTINGS, "fieldmap_method", "pyhysco")).lower()
     if method != "pyhysco":
         return None
@@ -585,7 +588,7 @@ def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHysc
     device = str(getattr(REGRESSOR_SETTINGS, "pyhysco_device", "cuda"))
     backend = str(getattr(REGRESSOR_SETTINGS, "pyhysco_backend", "grid_sample")).lower()
     applier = PreloadedPyHyscoApplier(
-        prototype_vol_path=cfg.rt_ref_epi,
+        prototype_vol_path=prototype_vol_path,
         fieldmap_path=pyhysco_field,
         phase_encoding_direction=phase_encoding_direction,
         polarity=polarity,
@@ -593,8 +596,17 @@ def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHysc
         dtype=torch.float32,
         interpolation_backend=backend,
     )
-    log.info("[FMAP] Preloaded PyHySCO applier ready (device=%s, backend=%s).", applier.device, backend)
+    log.info(
+        "[FMAP] Preloaded PyHySCO applier ready (device=%s, backend=%s, prototype=%s).",
+        applier.device,
+        backend,
+        prototype_vol_path,
+    )
     return applier
+
+
+def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHyscoApplier]:
+    return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_ref_epi)
 
 
 def _same_grid(a_path: Path, b_path: Path) -> bool:
@@ -1670,9 +1682,13 @@ def process_volume(
             if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False)):
                 nib.save(mc_unwarped_img, str(mc_unwarped_nii))
         except Exception as exc:
-            log.error("[FMAP] Preloaded PyHySCO apply failed for vol %05d: %s", volume_idx, exc)
-            return False
-    else:
+            log.error(
+                "[FMAP] Preloaded PyHySCO apply failed for vol %05d: %s. Falling back to file-based unwarp.",
+                volume_idx,
+                exc,
+            )
+            use_fast_unwarp = False
+    if not use_fast_unwarp:
         if not mc_unwarped_nii.exists():
             ok = unwarp_volume(mc_nii, mc_unwarped_nii, cfg)
             if not ok:
