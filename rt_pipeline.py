@@ -979,6 +979,7 @@ class DICOMHandler(FileSystemEventHandler):
             )
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
         self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
+        self._pyhysco_unwarped_save_notice_emitted = False
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -1679,8 +1680,18 @@ def process_volume(
         try:
             mc_unwarped_data = handler.pyhysco_applier.apply_volume(mc_data)
             mc_unwarped_img = nib.Nifti1Image(mc_unwarped_data, mc_img.affine)
+            # RTPSpy regression path expects fmri_img.get_filename() to be non-None.
+            # Keep an explicit filename even when running in-memory fast mode.
+            mc_unwarped_img.set_filename(str(mc_unwarped_nii))
+
             if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False)):
                 nib.save(mc_unwarped_img, str(mc_unwarped_nii))
+            elif not handler._pyhysco_unwarped_save_notice_emitted:
+                log.info(
+                    "[FMAP] Preloaded PyHySCO is running in-memory; unwarped NIfTI files are not saved "
+                    "(save_intermediate_unwarped=False)."
+                )
+                handler._pyhysco_unwarped_save_notice_emitted = True
         except Exception as exc:
             log.error(
                 "[FMAP] Preloaded PyHySCO apply failed for vol %05d: %s. Falling back to file-based unwarp.",
