@@ -54,6 +54,10 @@ class RegressorSettings:
     truncate_t1_padding_vox: int = 2
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
+    use_preloaded_pyhysco: bool = True
+    save_intermediate_unwarped: bool = True
+    pyhysco_device: str = "cuda"
+    pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 
     def update(self, overrides: dict[str, Any]) -> None:
         known = {f.name: f for f in fields(self)}
@@ -70,6 +74,8 @@ class RegressorSettings:
                 setattr(self, key, str(value).lower())
             elif key == "epi_phase_encoding":
                 setattr(self, key, str(value).upper())
+            elif key == "pyhysco_backend":
+                setattr(self, key, str(value).lower())
             elif key == "truncate_t1_padding_vox":
                 setattr(self, key, max(0, int(value)))
             else:

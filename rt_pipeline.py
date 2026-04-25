@@ -15,13 +15,14 @@ from concurrent.futures import ThreadPoolExecutor, CancelledError
 
 import nibabel as nib
 import numpy as np
+import torch
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from fmri_rt_preproc.RTPSpy_tools.rtp_regress import RtpRegress
-from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
+from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap, PreloadedPyHyscoApplier
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
@@ -562,6 +563,52 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     return resampler
 
 
+def _build_pyhysco_applier(
+    cfg: RTSessionConfig,
+    prototype_vol_path: Path,
+) -> Optional[PreloadedPyHyscoApplier]:
+    method = str(getattr(REGRESSOR_SETTINGS, "fieldmap_method", "pyhysco")).lower()
+    if method != "pyhysco":
+        return None
+    if not bool(getattr(REGRESSOR_SETTINGS, "use_preloaded_pyhysco", True)):
+        return None
+
+    fmap_dir = cfg.day_root / "fmap"
+    pyhysco_field = _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
+    if not pyhysco_field.exists():
+        log.warning("[FMAP] Preloaded PyHySCO disabled: missing fieldmap at %s", pyhysco_field)
+        return None
+    if not cfg.rt_ref_epi.exists():
+        log.warning("[FMAP] Preloaded PyHySCO disabled: missing rt_ref_epi at %s", cfg.rt_ref_epi)
+        return None
+
+    epi_pe = str(getattr(REGRESSOR_SETTINGS, "epi_phase_encoding", "PA")).upper()
+    polarity = 1 if epi_pe == "AP" else -1
+    phase_encoding_direction = 1 if epi_pe == "AP" else 2
+    device = str(getattr(REGRESSOR_SETTINGS, "pyhysco_device", "cuda"))
+    backend = str(getattr(REGRESSOR_SETTINGS, "pyhysco_backend", "grid_sample")).lower()
+    applier = PreloadedPyHyscoApplier(
+        prototype_vol_path=prototype_vol_path,
+        fieldmap_path=pyhysco_field,
+        phase_encoding_direction=phase_encoding_direction,
+        polarity=polarity,
+        device=device,
+        dtype=torch.float32,
+        interpolation_backend=backend,
+    )
+    log.info(
+        "[FMAP] Preloaded PyHySCO applier ready (device=%s, backend=%s, prototype=%s).",
+        applier.device,
+        backend,
+        prototype_vol_path,
+    )
+    return applier
+
+
+def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHyscoApplier]:
+    return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_ref_epi)
+
+
 def _same_grid(a_path: Path, b_path: Path) -> bool:
     try:
         a_img = nib.load(str(a_path))
@@ -931,6 +978,8 @@ class DICOMHandler(FileSystemEventHandler):
                 self.reference_score_stats.get("used_reg_ready", False),
             )
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
+        self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
+        self._pyhysco_unwarped_save_notice_emitted = False
 
         # --- RTPSpy Volreg ---
         self.volreg = RtpVolreg(regmode='heptic')
@@ -1626,14 +1675,40 @@ def process_volume(
     uw_t0 = time.time()
     unwarp_dir = cfg.rt_unwarp_dir
     mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
-    if not mc_unwarped_nii.exists():
-        ok = unwarp_volume(mc_nii, mc_unwarped_nii, cfg)
-        if not ok:
-            log.error(f"[FMAP] Failed unwarp for MC volume {mc_nii}")
-            return False
-    log_step("FMAP", volume_idx, start_t=uw_t0)
+    use_fast_unwarp = handler.pyhysco_applier is not None
+    if use_fast_unwarp:
+        try:
+            mc_unwarped_data = handler.pyhysco_applier.apply_volume(mc_data)
+            mc_unwarped_img = nib.Nifti1Image(mc_unwarped_data, mc_img.affine)
+            # RTPSpy regression path expects fmri_img.get_filename() to be non-None.
+            # Keep an explicit filename even when running in-memory fast mode.
+            mc_unwarped_img.set_filename(str(mc_unwarped_nii))
 
-    mc_unwarped_img = nib.load(str(mc_unwarped_nii))
+            # Always persist unwarped NIfTI for quality-check auditing.
+            nib.save(mc_unwarped_img, str(mc_unwarped_nii))
+            if (not bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", False))
+                    and not handler._pyhysco_unwarped_save_notice_emitted):
+                log.info(
+                    "[FMAP] save_intermediate_unwarped=False, but unwarped NIfTI is still being saved "
+                    "for quality-check auditing: %s",
+                    mc_unwarped_nii,
+                )
+                handler._pyhysco_unwarped_save_notice_emitted = True
+        except Exception as exc:
+            log.error(
+                "[FMAP] Preloaded PyHySCO apply failed for vol %05d: %s. Falling back to file-based unwarp.",
+                volume_idx,
+                exc,
+            )
+            use_fast_unwarp = False
+    if not use_fast_unwarp:
+        if not mc_unwarped_nii.exists():
+            ok = unwarp_volume(mc_nii, mc_unwarped_nii, cfg)
+            if not ok:
+                log.error(f"[FMAP] Failed unwarp for MC volume {mc_nii}")
+                return False
+        mc_unwarped_img = nib.load(str(mc_unwarped_nii))
+    log_step("FMAP", volume_idx, start_t=uw_t0)
 
     # ---------- 2d) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
@@ -1699,7 +1774,9 @@ def process_volume(
     t0 = time.time()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
-    score_input_orig_nii: Optional[Path] = mc_unwarped_nii if cfg.enable_original_score else None
+    score_input_orig_nii: Optional[Path] = None
+    if cfg.enable_original_score and mc_unwarped_nii.exists():
+        score_input_orig_nii = mc_unwarped_nii
 
     if analysis_space == "epi":
         log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0)
