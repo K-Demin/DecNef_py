@@ -15,6 +15,8 @@ class RegressorSettings:
     max_poly_order: float = np.inf
     TR: float = 1.0
     analysis_space: str = "mni"  # "epi", "t1", or "mni" (default)
+    use_gpu_resampler: bool = False
+    gpu_resampler_device: str = "cuda"
     use_gs: bool = False
     use_wm: bool = True
     use_vent: bool = True
