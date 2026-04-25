@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import sys
 from uuid import uuid4
 
@@ -14,6 +15,8 @@ if str(PYHYSCO_SRC) not in sys.path:
 
 from EPI_MRI.EPIMRIDistortionCorrection import DataObject, EPIMRIDistortionCorrection
 from EPI_MRI.utils import m_plus
+
+log = logging.getLogger(__name__)
 
 
 def _inverse_permutation(perm: list[int]) -> list[int]:
@@ -53,6 +56,18 @@ def _to_internal_volume(
     return vol_t.permute(internal_perm).contiguous()
 
 
+def _select_device_like_gpu_resampler(device: str | None) -> str:
+    """
+    Mirror gpu_ants_like_resampler device-selection behavior.
+
+    - default device string is "cuda"
+    - if explicit/default device is "cuda" but CUDA is unavailable, fall back to "cpu"
+    - otherwise pass through device as-is
+    """
+    requested = "cuda" if device is None else str(device)
+    return requested if (requested != "cuda" or torch.cuda.is_available()) else "cpu"
+
+
 class PreloadedPyHyscoApplier:
     """
     Reusable PyHySCO fieldmap applier for fixed geometry.
@@ -84,6 +99,7 @@ class PreloadedPyHyscoApplier:
         if polarity < 0:
             b = -b
         self.fieldmap_internal = b.contiguous()
+        self.device = str(self.data_obj.device)
 
     def apply_volume(self, volume_xyz: np.ndarray) -> np.ndarray:
         """Apply cached fieldmap/correction objects to one 3D volume."""
@@ -131,8 +147,7 @@ def apply_pyhysco_fieldmap(
     dtype:
         Torch dtype.
     """
-    if device is None:
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = _select_device_like_gpu_resampler(device)
 
     epi_img = nib.load(str(epi_path))
     epi = np.asarray(epi_img.dataobj)
@@ -158,9 +173,16 @@ def apply_pyhysco_fieldmap(
             device=device,
             dtype=dtype,
         )
+        log.info(
+            "Applying PyHySCO fieldmap on device=%s (cuda_available=%s, mps_available=%s)",
+            applier.device,
+            torch.cuda.is_available(),
+            torch.backends.mps.is_available(),
+        )
 
-        for t in range(epi_work.shape[-1]):
-            corrected[..., t] = applier.apply_volume(epi_work[..., t])
+        with torch.inference_mode():
+            for t in range(epi_work.shape[-1]):
+                corrected[..., t] = applier.apply_volume(epi_work[..., t])
     finally:
         proto_path.unlink(missing_ok=True)
 
