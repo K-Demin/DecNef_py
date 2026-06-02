@@ -6,13 +6,12 @@ The refactor introduces a **two-stage engine**:
 
 1. `compute_stage(scan)`
    - Runs in worker pool.
-   - Performs DICOM conversion, unwarp, worker-local motion correction, and heavy transforms.
-   - Produces `ResultEnvelope` with all per-scan artifacts.
+   - Performs DICOM conversion only.
+   - Produces `ResultEnvelope` with the converted raw NIfTI and timing metadata.
 
 2. `commit_stage(scan)`
    - Runs under a single ordered commit cursor.
-   - Applies all stateful operations in deterministic scan order.
-   - Handles FD/DVARS histories, censor+1 propagation, regressor side-effects, status logging, and score publication.
+   - Applies all stateful operations in deterministic scan order: RTPSpy motion correction, FD/DVARS histories, fieldmap unwarp, nuisance regression, space transforms, status logging, and score publication.
 
 ## Ordered commit invariants
 
@@ -39,6 +38,7 @@ incoming DICOM
     |
     v
  priority queue -> worker pool -> compute_stage(scan) -> ResultEnvelope
+                                (DICOM -> raw NIfTI)
                                        |
                                        v
                                  reorder_buffer[scan]
@@ -49,5 +49,5 @@ incoming DICOM
                                        v
                                  commit_stage(scan)
                                        |
-                       ordered writes + score/regression side-effects
+                    MC -> fieldmap unwarp -> regression/transform/score
 ```

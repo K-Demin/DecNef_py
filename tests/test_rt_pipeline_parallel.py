@@ -180,10 +180,10 @@ def test_commit_stage_fd_dvars_and_regression_progression(tmp_path):
     cfg = type("C", (), {})()
     called = {}
 
-    def fake_process_volume(cfg_obj, handler_obj, dicom_path, volume_idx, unwarped_nii=None, volume_timestamp=None):
+    def fake_process_volume(cfg_obj, handler_obj, dicom_path, volume_idx, raw_nii=None, volume_timestamp=None):
         called["dicom_path"] = dicom_path
         called["volume_idx"] = volume_idx
-        called["unwarped_nii"] = unwarped_nii
+        called["raw_nii"] = raw_nii
         called["volume_timestamp"] = volume_timestamp
         return True
 
@@ -196,11 +196,11 @@ def test_commit_stage_fd_dvars_and_regression_progression(tmp_path):
             dicom_path=Path("4.dcm"),
             volume_timestamp=123.45,
             success=True,
-            unwarped_nii=Path("u.nii"),
+            raw_nii=Path("raw.nii"),
         )
         assert rt_pipeline.commit_stage(cfg, handler, env) is True
     finally:
         rt_pipeline.process_volume = orig
 
     assert called["volume_idx"] == 7
-    assert called["unwarped_nii"] == Path("u.nii")
+    assert called["raw_nii"] == Path("raw.nii")

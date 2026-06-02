@@ -1151,11 +1151,11 @@ def _load_mask_in_epi_space(
         print(f"  ROI {roi}: mask is not in EPI space and epi2t1_Composite.h5 not found; cannot warp.")
         return None, None
 
-    # Use the already-saved tSNR 3D as reference grid for warping
-    # (we ensure it exists below in process_dataset)
-    epi_ref = run_dir.parent.parent / "func" / "trans" / "rt_ref_epi.nii"
+    # epi2t1_Composite.h5 is estimated from the unwarped mean EPI, so
+    # T1->EPI ROI back-warps must use that same unwarped reference grid.
+    epi_ref = run_dir.parent.parent / "func" / "trans" / "epi_unwarped_mean.nii"
     if not epi_ref.exists():
-        epi_ref = run_dir.parent.parent / "func" / "trans" / "epi_unwarped_mean.nii"
+        epi_ref = run_dir.parent.parent / "func" / "trans" / "epi_unwarped_mean.nii.gz"
 
     warped_path = roi_out_dir / "roi_in_epi.nii.gz"
     warped = warp_t1_mask_to_epi(
