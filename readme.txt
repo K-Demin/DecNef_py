@@ -166,7 +166,7 @@ Running the pipeline
         - func/run-XX/epi_first.nii
         - func/run-XX/epi_mc.nii
         - func/run-XX/motion.1D
-        - func/run-XX/epi_unwarped.nii.gz
+        - func/run-XX/epi_unwarped.nii
         - func/run-XX/epi_brain.nii.gz
         - func/run-XX/epi_mask.nii.gz
         - func/run-XX/epi_unwarped_mean.nii.gz

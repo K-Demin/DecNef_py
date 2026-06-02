@@ -1783,6 +1783,9 @@ def process_volume(
                 log.error(f"[FMAP] Failed unwarp for MC volume {mc_nii}")
                 return False
         mc_unwarped_img = nib.load(str(mc_unwarped_nii))
+    if cfg.enable_original_score and not mc_unwarped_nii.exists():
+        nib.save(mc_unwarped_img, str(mc_unwarped_nii))
+        mc_unwarped_img.set_filename(str(mc_unwarped_nii))
     log_step("FMAP", volume_idx, start_t=uw_t0)
 
     # ---------- 2d) Motion regression (RTPS_py) ----------
