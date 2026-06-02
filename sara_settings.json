@@ -3,7 +3,7 @@
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
   "_comment_timing": "Acquisition timing/model settings. analysis_space: epi (native EPI), t1 (EPI->T1), or mni (EPI->T1->MNI). voxel_norm_ref_volumes controls normalization reference length in both regression and no-regression modes.",
   "TR": 1,
-  "analysis_space": "mni",
+  "analysis_space": "t1",
   "skip_first_trs": 10,
   "voxel_norm_ref_volumes": 30,
   "mot_reg": "mot6",
@@ -36,8 +36,14 @@
   "_comment_runtime": "Pipeline robustness/performance settings.",
   "max_workers": 2,
   "max_retries": 3,
+  "_comment_truncate": "This uses only the voxels allowed in EPI for transformations",
+  "truncate_t1_to_epi_fov": true,
+  "truncate_t1_padding_vox": 2,
   "_comment_fieldmap": "Fieldmap correction settings for realtime unwarping (PyHySCO PED is derived from epi_phase_encoding).",
   "fieldmap_method": "pyhysco",
   "epi_phase_encoding": "PA",
-  "save_intermediate_unwarped": true
+  "_comment_resampler": "New way to apply transforms using our own written CUDE script",
+  "use_gpu_resampler": true,
+  "gpu_resampler_device": "cuda"
+
 }

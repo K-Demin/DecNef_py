@@ -365,7 +365,7 @@ class FMRIRealtimePreprocessor:
         self._skullstrip_epi(epi_unwarped, epi_brain, epi_mask)
 
         # 5) Build means from unwarped outputs used for registration
-        epi_mean = run_dir / "epi_unwarped_mean.nii"
+        epi_mean = run_dir / "epi_unwarped_mean.nii.gz"
         epi_mask_mean = run_dir / "epi_mask_mean.nii"
         if not epi_mean.exists():
             run(["fslmaths", str(epi_unwarped), "-Tmean", str(epi_mean)])
@@ -453,7 +453,7 @@ class FMRIRealtimePreprocessor:
             export OMP_NUM_THREADS=$(nproc)
             antsApplyTransforms -d 3 \
               -e 3 \
-              -i {epi_4d} \
+              -i {epi_4d} \     
               -o {out} \
               -r {PA_mean} \
               -t {warp} \

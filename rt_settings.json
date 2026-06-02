@@ -40,5 +40,8 @@
   "truncate_t1_padding_vox": 2,
   "_comment_fieldmap": "Fieldmap correction settings for realtime unwarping (PyHySCO PED is derived from epi_phase_encoding).",
   "fieldmap_method": "pyhysco",
-  "epi_phase_encoding": "PA"
+  "epi_phase_encoding": "PA",
+    "_comment_resampler": "New way to apply transforms using our own written CUDE script",
+  "use_gpu_resampler": true,
+  "gpu_resampler_device": "cuda"
 }

@@ -497,7 +497,7 @@ class RTSessionConfig:
         """
         Global real-time reference EPI (set by offline preprocessor).
         """
-        return self.day_root / "func" / "trans" / "epi_unwarped_mean.nii"
+        return self.day_root / "func" / "trans" / "epi_unwarped_mean.nii.gz"
 
     @property
     def rt_ref_mask(self) -> Path:
@@ -1461,7 +1461,9 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
                 "dcm2niix",
                 "-z", "n",  # no gzip
                 "-s", "y",
+                "-a", "y",
                 "-b", "n",
+                "-v", "0",
                 "-f", f"vol_{volume_idx:05d}",
                 "-o", str(raw_dir),
                 str(dicom_path),

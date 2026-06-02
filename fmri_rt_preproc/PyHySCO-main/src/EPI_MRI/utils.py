@@ -9,6 +9,7 @@ from scipy.io import loadmat
 import nibabel as nib
 
 
+
 def load_data(im1, im2=None, phase_encoding_direction=1, n=None, device='cpu', dtype=torch.float64):
 	"""
 	Load original pair of images and return along with relevant parameters.
@@ -80,7 +81,8 @@ def load_data(im1, im2=None, phase_encoding_direction=1, n=None, device='cpu', d
 
 	else:
 		file_type_2 = im1.split('.')[-1]
-		if file_type_1 != 'gz' or file_type_2 != 'gz':
+		#if file_type_1 != 'gz' and file_type_2 != 'gz':
+		if file_type_1 not in ('gz', 'nii') or file_type_2 not in ('gz', 'nii'):
 			raise TypeError("file type(s) not supported")
 
 		if phase_encoding_direction < 1 or phase_encoding_direction > 2:
