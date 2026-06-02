@@ -51,10 +51,8 @@ class FMRIRealtimePreprocessor:
         self.epi_phase_encoding = str(getattr(cfg, "epi_phase_encoding", "PA")).upper()
 
         # Day-level references made from the first preprocessed run.
-        self.rt_distorted_motion_ref_epi = self.trans_dir / "rt_motion_ref_epi.nii"
-        self.rt_distorted_motion_ref_mask = self.trans_dir / "rt_motion_ref_mask.nii"
-        self.legacy_rt_distorted_motion_ref_epi = self.trans_dir / "rt_ref_epi.nii"
-        self.legacy_rt_distorted_motion_ref_mask = self.trans_dir / "rt_ref_epi_mask.nii"
+        self.rt_distorted_motion_ref_epi = self.trans_dir / "rt_ref_epi.nii"
+        self.rt_distorted_motion_ref_mask = self.trans_dir / "rt_ref_epi_mask.nii"
         self.rt_unwarped_analysis_ref_epi = prefer_uncompressed_nifti(self.trans_dir / "epi_unwarped_mean.nii")
         self.rt_unwarped_analysis_ref_mask = self.trans_dir / "epi_mask_mean.nii"
 
@@ -477,9 +475,7 @@ class FMRIRealtimePreprocessor:
         return prefer_uncompressed_nifti(self.fmap_dir / "pyhysco-EstFieldMap.nii")
 
     def _distorted_motion_ref_for_unwarp(self) -> Path:
-        if self.rt_distorted_motion_ref_epi.exists():
-            return self.rt_distorted_motion_ref_epi
-        return self.legacy_rt_distorted_motion_ref_epi
+        return self.rt_distorted_motion_ref_epi
 
     def _preferred_ants_unwarp_inputs(self) -> tuple[Path, Path, Path]:
         if self.epi_phase_encoding == "AP":

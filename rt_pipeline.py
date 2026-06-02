@@ -498,9 +498,6 @@ class RTSessionConfig:
         Distorted-space real-time reference used for online RTPSpy motion correction.
         Created offline from the MC-first mean EPI.
         """
-        new_ref = self.trans_dir / "rt_motion_ref_epi.nii"
-        if new_ref.exists():
-            return new_ref
         return self.trans_dir / "rt_ref_epi.nii"
 
     @property
@@ -508,9 +505,6 @@ class RTSessionConfig:
         """
         Brain mask in the distorted motion-reference grid.
         """
-        new_mask = self.trans_dir / "rt_motion_ref_mask.nii"
-        if new_mask.exists():
-            return new_mask
         return self.trans_dir / "rt_ref_epi_mask.nii"
 
     @property
@@ -1067,7 +1061,7 @@ class DICOMHandler(FileSystemEventHandler):
             raise FileNotFoundError(
                 f"RT reference EPI not found at {ref_epi}. "
                 f"Run the offline preprocessing pipeline first so "
-                f"rt_motion_ref_epi.nii is created in {self.cfg.trans_dir}."
+                f"rt_ref_epi.nii is created in {self.cfg.trans_dir}."
             )
         self.volreg.set_ref_vol(str(ref_epi))
         self.ref_set = True
