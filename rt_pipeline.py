@@ -493,19 +493,43 @@ class RTSessionConfig:
         return d
 
     @property
+    def rt_motion_ref_epi(self) -> Path:
+        """
+        Distorted-space real-time reference used for online RTPSpy motion correction.
+        Created offline from the MC-first mean EPI.
+        """
+        return self.trans_dir / "rt_ref_epi.nii"
+
+    @property
+    def rt_motion_ref_mask(self) -> Path:
+        """
+        Brain mask in the distorted motion-reference grid.
+        """
+        return self.trans_dir / "rt_ref_epi_mask.nii"
+
+    @property
+    def rt_unwarped_ref_epi(self) -> Path:
+        """
+        Unwarped EPI reference used for EPI->T1/MNI transform grids.
+        """
+        return _prefer_uncompressed_nifti(self.trans_dir / "epi_unwarped_mean.nii")
+
+    @property
+    def rt_unwarped_ref_mask(self) -> Path:
+        """
+        Brain mask in the unwarped EPI reference grid.
+        """
+        return self.trans_dir / "epi_mask_mean.nii"
+
+    @property
     def rt_ref_epi(self) -> Path:
-        """
-        Global real-time reference EPI (set by offline preprocessor).
-        """
-        return self.day_root / "func" / "trans" / "epi_unwarped_mean.nii.gz"
+        """Backward-compatible alias for the unwarped RT reference."""
+        return self.rt_unwarped_ref_epi
 
     @property
     def rt_ref_mask(self) -> Path:
-        """
-        Optional mask for the RT reference (not strictly needed here,
-        but kept for completeness / future use).
-        """
-        return self.day_root / "func" / "trans" / "epi_mask_mean.nii"
+        """Backward-compatible alias for the unwarped RT reference mask."""
+        return self.rt_unwarped_ref_mask
 
 
 def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
@@ -540,7 +564,8 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
         ]
         out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_mni"
 
-    missing = [p for p in [fixed_ref, *transforms, cfg.rt_ref_epi] if not p.exists()]
+    moving_ref = cfg.rt_unwarped_ref_epi
+    missing = [p for p in [fixed_ref, *transforms, moving_ref] if not p.exists()]
     if missing:
         log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
         return None
@@ -551,7 +576,7 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     if not grid_path.exists():
         log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
         grid_path = precompute_sampling_grid(
-            moving_ref=cfg.rt_ref_epi,
+            moving_ref=moving_ref,
             fixed_ref=fixed_ref,
             transforms=transforms,
             out_dir=out_dir,
@@ -578,8 +603,8 @@ def _build_pyhysco_applier(
     if not pyhysco_field.exists():
         log.warning("[FMAP] Preloaded PyHySCO disabled: missing fieldmap at %s", pyhysco_field)
         return None
-    if not cfg.rt_ref_epi.exists():
-        log.warning("[FMAP] Preloaded PyHySCO disabled: missing rt_ref_epi at %s", cfg.rt_ref_epi)
+    if not prototype_vol_path.exists():
+        log.warning("[FMAP] Preloaded PyHySCO disabled: missing prototype volume at %s", prototype_vol_path)
         return None
 
     epi_pe = str(getattr(REGRESSOR_SETTINGS, "epi_phase_encoding", "PA")).upper()
@@ -606,7 +631,7 @@ def _build_pyhysco_applier(
 
 
 def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHyscoApplier]:
-    return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_ref_epi)
+    return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_motion_ref_epi)
 
 
 def _same_grid(a_path: Path, b_path: Path) -> bool:
@@ -994,14 +1019,14 @@ class DICOMHandler(FileSystemEventHandler):
         self.volreg.ignore_init = 0
         self.volreg.save_proc = False
 
-        # --- NEW: reference is the global offline EPI mean ---
+        # --- RT motion correction reference: distorted/MC-first mean EPI ---
         self.ref_set = False
-        ref_epi = self.cfg.rt_ref_epi
+        ref_epi = self.cfg.rt_motion_ref_epi
         if not ref_epi.exists():
             raise FileNotFoundError(
                 f"RT reference EPI not found at {ref_epi}. "
                 f"Run the offline preprocessing pipeline first so "
-                f"rt_ref_epi.nii is created in {self.cfg.day_root / 'func'}."
+                f"rt_ref_epi.nii is created in {self.cfg.trans_dir}."
             )
         self.volreg.set_ref_vol(str(ref_epi))
         self.ref_set = True
@@ -1021,10 +1046,10 @@ class DICOMHandler(FileSystemEventHandler):
         self.last_dvars_val = float("nan")
         self.last_dvars_z = float("nan")
 
-        # --- NEW: load mask for DVARS (use cfg.rt_ref_mask) ---
+        # --- NEW: load distorted-space mask for DVARS on MC volumes ---
         self.dvars_mask = None
         if REGRESSOR_SETTINGS.enable_dvars_censor_reg:
-            mpath = cfg.rt_ref_mask
+            mpath = cfg.rt_motion_ref_mask
             if not mpath.exists():
                 log.warning(f"[DVARS] Mask missing at {mpath}; DVARS censor disabled.")
             else:
@@ -1043,7 +1068,7 @@ class DICOMHandler(FileSystemEventHandler):
                 return None
             return path
 
-        gs = resolve_mask("GS", cfg.rt_ref_mask, REGRESSOR_SETTINGS.use_gs)
+        gs = resolve_mask("GS", cfg.rt_unwarped_ref_mask, REGRESSOR_SETTINGS.use_gs)
         wm = resolve_mask("WM", cfg.rt_wm_mask, REGRESSOR_SETTINGS.use_wm)
         vent = resolve_mask("Vent", cfg.rt_vent_mask, REGRESSOR_SETTINGS.use_vent)
 
@@ -1108,9 +1133,9 @@ class DICOMHandler(FileSystemEventHandler):
                     )
 
         if REGRESSOR_SETTINGS.enable_motion_regression:
-            reg_mask = cfg.rt_ref_mask if cfg.rt_ref_mask.exists() else None
+            reg_mask = cfg.rt_unwarped_ref_mask if cfg.rt_unwarped_ref_mask.exists() else None
             if reg_mask is None:
-                log.warning("[REG] Regression mask missing at %s; using non-zero voxels from first volume.", cfg.rt_ref_mask)
+                log.warning("[REG] Regression mask missing at %s; using non-zero voxels from first volume.", cfg.rt_unwarped_ref_mask)
             self.motion_regressor = MotionRegressor(
                 self.volreg,
                 reg_mask=reg_mask,
@@ -1132,12 +1157,12 @@ class DICOMHandler(FileSystemEventHandler):
             self.motion_regressor = None
 
         norm_mask = None
-        if cfg.rt_ref_mask.exists():
-            norm_mask = np.asanyarray(nib.load(str(cfg.rt_ref_mask)).dataobj) > 0.5
+        if cfg.rt_unwarped_ref_mask.exists():
+            norm_mask = np.asanyarray(nib.load(str(cfg.rt_unwarped_ref_mask)).dataobj) > 0.5
         else:
             log.warning(
                 "[REG] Voxel normalization mask missing at %s; using Y-mean nonzero mask only.",
-                cfg.rt_ref_mask,
+                cfg.rt_unwarped_ref_mask,
             )
         self.voxel_normalizer = RTPStyleVoxelNormalizer(
             ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
@@ -2028,10 +2053,8 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
         warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1Warp.nii")
         ref_img = _prefer_uncompressed_nifti(fmap_dir / "AP_mean.nii")
 
-    # NOTE:
-    # Keep unwarping in the native AP/PA fieldmap reference space
-    # (AP_mean/PA_mean). The resulting volume is then motion-corrected to
-    # cfg.rt_ref_epi in the next stage.
+    # NOTE: this fallback expects the input to already be motion-corrected.
+    # The ANTs path writes into the AP/PA fieldmap reference grid.
 
     if not warp.exists() or not affine.exists():
         log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
