@@ -219,13 +219,13 @@ class FMRIRealtimePreprocessor:
 
     def _prepare_fieldmap(self, epi_ref: Path):
         """
-        Build a day-level AP/PA fieldmap in the first-run EPI grid.
+        Build a day-level AP/PA fieldmap in the RT motion-reference grid.
 
         AP/PA volumes are first motion-corrected within each short fieldmap
-        series and averaged. The AP/PA mean pair is then moved into the first
-        BOLD EPI grid with one shared rigid transform before estimating the
-        distortion field. Online BOLD volumes are motion-corrected into this
-        same grid before the fieldmap is applied.
+        series and averaged. The AP/PA mean pair is then moved into the RT
+        motion-reference grid with one shared rigid transform before estimating
+        the distortion field. If rt_ref_epi.nii already exists from a previous
+        run, that file defines the grid; otherwise we use this run's first EPI.
         """
         ensure_dir(self.fmap_dir)
         ap = self.cfg.ap_file
@@ -251,13 +251,14 @@ class FMRIRealtimePreprocessor:
         ap_mean = self.fmap_dir / "AP_mean.nii"
         pa_mean = self.fmap_dir / "PA_mean.nii"
 
-        ap_mean_epi, pa_mean_epi = self._align_fieldmap_means_to_epi(ap_mean, pa_mean, epi_ref)
+        fieldmap_ref = self.rt_distorted_motion_ref_epi if self.rt_distorted_motion_ref_epi.exists() else epi_ref
+        ap_mean_epi, pa_mean_epi = self._align_fieldmap_means_to_epi(ap_mean, pa_mean, fieldmap_ref)
 
         if self.fieldmap_method == "pyhysco":
             self._run_ap_pa_pyhysco(ap_mean_epi, pa_mean_epi, output_stem="pyhysco_epi")
         elif self.fieldmap_method == "ants":
             ap2pa_warp = self.fmap_dir / "AP2PA_epi_Warped.nii"
-            if not ap2pa_warp.exists():
+            if not ap2pa_warp.exists() or not self._same_grid(ap2pa_warp, pa_mean_epi):
                 self._run_ap_pa_ants(ap_mean_epi, pa_mean_epi, output_prefix_name="AP2PA_epi_")
         else:
             raise ValueError(
@@ -274,8 +275,8 @@ class FMRIRealtimePreprocessor:
         same_pe_mean = ap_mean if self.epi_phase_encoding == "AP" else pa_mean
         same_pe_epi = ap_epi if self.epi_phase_encoding == "AP" else pa_epi
 
-        if not mat.exists() or not same_pe_epi.exists():
-            print(f"-> Aligning {same_pe_mean.name} to first EPI for fieldmap grid")
+        if not mat.exists() or not same_pe_epi.exists() or not self._same_grid(same_pe_epi, epi_ref):
+            print(f"-> Aligning {same_pe_mean.name} to RT motion-reference grid")
             run([
                 "flirt",
                 "-in", str(same_pe_mean),
@@ -287,7 +288,7 @@ class FMRIRealtimePreprocessor:
             ], env=fsl_env)
 
         for src, dst in ((ap_mean, ap_epi), (pa_mean, pa_epi)):
-            if dst.exists():
+            if dst.exists() and self._same_grid(dst, epi_ref):
                 continue
             run([
                 "flirt",
@@ -300,9 +301,20 @@ class FMRIRealtimePreprocessor:
 
         return ap_epi, pa_epi
 
+    def _same_grid(self, a_path: Path, b_path: Path) -> bool:
+        try:
+            a_img = nib.load(str(a_path))
+            b_img = nib.load(str(b_path))
+        except Exception:
+            return False
+        return (
+            a_img.shape[:3] == b_img.shape[:3]
+            and np.allclose(a_img.affine, b_img.affine, atol=1e-3)
+        )
+
     def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path, output_stem: str = "pyhysco"):
         pyhysco_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii"
-        if pyhysco_field.exists():
+        if pyhysco_field.exists() and self._same_grid(pyhysco_field, ap_mean):
             print("✓ PyHySCO fieldmap already exists — skipping")
             return
 
@@ -324,7 +336,7 @@ class FMRIRealtimePreprocessor:
             raise FileNotFoundError(
                 f"Expected PyHySCO fieldmap not found: {generated_field}"
             )
-        if generated_field.exists() and not pyhysco_field.exists():
+        if generated_field.exists():
             gunzip_python(generated_field)
 
     def _run_ap_pa_ants(self, ap_mean: Path, pa_mean: Path, output_prefix_name: str = "AP2PA_"):
@@ -583,13 +595,13 @@ class FMRIRealtimePreprocessor:
           epi_mask_mean       : mean over time of epi_mask
         """
 
-        # If already computed, skip
-        if epi_mean.exists() and epi_mask_mean.exists():
-            return
-
         # Output paths (KEEP EXACT OLD NAMING)
         mc_epi = epi_4d.with_name("epi_mc.nii")
         motion_1d = epi_4d.with_name("motion.1D")
+
+        # If already computed, skip
+        if epi_mean.exists() and epi_mask_mean.exists() and mc_epi.exists() and motion_1d.exists():
+            return
 
         # ------------------------------------------------------------------
         #                LOAD INPUT EPI (4D)
