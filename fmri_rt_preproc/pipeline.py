@@ -54,6 +54,8 @@ class FMRIRealtimePreprocessor:
         # This will be set from the FIRST run we preprocess.
         self.rt_ref_epi = self.func_dir / "trans" / "rt_ref_epi.nii"
         self.rt_ref_mask = self.func_dir / "trans" / "rt_ref_epi_mask.nii"
+        self.rt_unwarped_ref_epi = prefer_uncompressed_nifti(self.func_dir / "trans" / "epi_unwarped_mean.nii")
+        self.rt_unwarped_ref_mask = self.func_dir / "trans" / "epi_mask_mean.nii"
 
     # ---------- Top-level entry points ----------
 
@@ -453,7 +455,7 @@ class FMRIRealtimePreprocessor:
             export OMP_NUM_THREADS=$(nproc)
             antsApplyTransforms -d 3 \
               -e 3 \
-              -i {epi_4d} \     
+              -i {epi_4d} \
               -o {out} \
               -r {PA_mean} \
               -t {warp} \
@@ -668,20 +670,20 @@ class FMRIRealtimePreprocessor:
         Assumes:
           - FastSurfer outputs exist in anat/fastsurfer/<sid>/mri/
           - epi2t1 transforms exist in func/trans/ (from _register_epi_to_t1)
-          - rt_ref_epi and rt_ref_mask exist (from _maybe_set_rt_reference)
+          - unwarped EPI reference/mask exist (from _unwarp_epi + mean)
         """
         ensure_dir(self.trans_dir)
 
         # -------------------------
         # 0) References (EPI grid)
         # -------------------------
-        if not self.rt_ref_epi.exists():
-            raise FileNotFoundError(f"rt_ref_epi missing: {self.rt_ref_epi}")
-        if not self.rt_ref_mask.exists():
-            raise FileNotFoundError(f"rt_ref_mask missing: {self.rt_ref_mask}")
+        if not self.rt_unwarped_ref_epi.exists():
+            raise FileNotFoundError(f"Unwarped RT reference missing: {self.rt_unwarped_ref_epi}")
+        if not self.rt_unwarped_ref_mask.exists():
+            raise FileNotFoundError(f"Unwarped RT mask missing: {self.rt_unwarped_ref_mask}")
 
-        epi_ref = self.rt_ref_epi
-        epi_brainmask = self.rt_ref_mask  # already EPI-space brain mask
+        epi_ref = self.rt_unwarped_ref_epi
+        epi_brainmask = self.rt_unwarped_ref_mask
         fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
 
         # GS regressor uses the EPI brain mask directly.
