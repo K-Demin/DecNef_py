@@ -19,6 +19,9 @@ def gunzip_python(gz_path):
     gz_path = Path(gz_path)
     out_path = gz_path.with_suffix("")  # removes .gz → gives .nii
 
+    if out_path.exists() and out_path.stat().st_mtime >= gz_path.stat().st_mtime:
+        return out_path
+
     with gzip.open(gz_path, "rb") as f_in, open(out_path, "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
 
@@ -219,87 +222,85 @@ class FMRIRealtimePreprocessor:
 
     def _prepare_fieldmap(self, epi_ref: Path):
         """
-        Build a day-level AP/PA fieldmap in the RT motion-reference grid.
+        Build a day-level AP/PA fieldmap in the RT motion-reference pose/grid.
 
-        AP/PA volumes are first motion-corrected within each short fieldmap
-        series and averaged. The AP/PA mean pair is then moved into the RT
-        motion-reference grid with one shared rigid transform before estimating
-        the distortion field. If rt_ref_epi.nii already exists from a previous
-        run, that file defines the grid; otherwise we use this run's first EPI.
+        AP and PA volumes are motion-corrected to the same rt_ref_epi.nii that
+        online BOLD volumes use. The corrected AP/PA series are then averaged
+        and passed to PyHySCO/ANTs.
         """
         ensure_dir(self.fmap_dir)
         ap = self.cfg.ap_file
         pa = self.cfg.pa_file
-        ap_mc_gz = self.fmap_dir / "AP_mc.nii.gz"
-        pa_mc_gz = self.fmap_dir / "PA_mc.nii.gz"
-        ap_mean_gz = self.fmap_dir / "AP_mean.nii.gz"
-        pa_mean_gz = self.fmap_dir / "PA_mean.nii.gz"
-
-        if not ap_mc_gz.exists():
-            run(["mcflirt", "-in", str(ap), "-out", str(ap_mc_gz), "-refvol", "0"])
-        if not pa_mc_gz.exists():
-            run(["mcflirt", "-in", str(pa), "-out", str(pa_mc_gz), "-refvol", "0"])
-
-        if not ap_mean_gz.exists():
-            run(["fslmaths", str(ap_mc_gz), "-Tmean", str(ap_mean_gz)])
-        if not pa_mean_gz.exists():
-            run(["fslmaths", str(pa_mc_gz), "-Tmean", str(pa_mean_gz)])
-
-        gunzip_python(ap_mean_gz)
-        gunzip_python(pa_mean_gz)
-
-        ap_mean = self.fmap_dir / "AP_mean.nii"
-        pa_mean = self.fmap_dir / "PA_mean.nii"
-
         fieldmap_ref = self.rt_distorted_motion_ref_epi if self.rt_distorted_motion_ref_epi.exists() else epi_ref
-        ap_mean_epi, pa_mean_epi = self._align_fieldmap_means_to_epi(ap_mean, pa_mean, fieldmap_ref)
+        ap_mean_ref, pa_mean_ref = self._motion_correct_fieldmaps_to_ref(ap, pa, fieldmap_ref)
 
         if self.fieldmap_method == "pyhysco":
-            self._run_ap_pa_pyhysco(ap_mean_epi, pa_mean_epi, output_stem="pyhysco_epi")
+            self._run_ap_pa_pyhysco(ap_mean_ref, pa_mean_ref, output_stem="pyhysco_epi")
         elif self.fieldmap_method == "ants":
             ap2pa_warp = self.fmap_dir / "AP2PA_epi_Warped.nii"
-            if not ap2pa_warp.exists() or not self._same_grid(ap2pa_warp, pa_mean_epi):
-                self._run_ap_pa_ants(ap_mean_epi, pa_mean_epi, output_prefix_name="AP2PA_epi_")
+            if not self._is_current_grid_output(ap2pa_warp, pa_mean_ref, [ap_mean_ref, pa_mean_ref]):
+                self._run_ap_pa_ants(ap_mean_ref, pa_mean_ref, output_prefix_name="AP2PA_epi_")
         else:
             raise ValueError(
                 f"Unknown fieldmap_method={self.fieldmap_method}. Use 'pyhysco' or 'ants'."
             )
 
-    def _align_fieldmap_means_to_epi(self, ap_mean: Path, pa_mean: Path, epi_ref: Path) -> tuple[Path, Path]:
+    def _motion_correct_fieldmaps_to_ref(self, ap: Path, pa: Path, epi_ref: Path) -> tuple[Path, Path]:
         ensure_dir(self.fmap_dir)
-        fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
-        ap_epi = self.fmap_dir / "AP_mean_to_epi.nii"
-        pa_epi = self.fmap_dir / "PA_mean_to_epi.nii"
-        mat = self.fmap_dir / "fmap_to_epi.mat"
+        fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI_GZ")
+        ap_mc = self.fmap_dir / "AP_mc.nii.gz"
+        pa_mc = self.fmap_dir / "PA_mc.nii.gz"
+        ap_mean = self.fmap_dir / "AP_mean.nii.gz"
+        pa_mean = self.fmap_dir / "PA_mean.nii.gz"
+        force = not getattr(self, "_fieldmap_mc_to_ref_ready", False)
 
-        same_pe_mean = ap_mean if self.epi_phase_encoding == "AP" else pa_mean
-        same_pe_epi = ap_epi if self.epi_phase_encoding == "AP" else pa_epi
-
-        if not mat.exists() or not same_pe_epi.exists() or not self._same_grid(same_pe_epi, epi_ref):
-            print(f"-> Aligning {same_pe_mean.name} to RT motion-reference grid")
-            run([
-                "flirt",
-                "-in", str(same_pe_mean),
-                "-ref", str(epi_ref),
-                "-out", str(same_pe_epi),
-                "-omat", str(mat),
-                "-dof", "6",
-                "-cost", "normmi",
-            ], env=fsl_env)
-
-        for src, dst in ((ap_mean, ap_epi), (pa_mean, pa_epi)):
-            if dst.exists() and self._same_grid(dst, epi_ref):
+        for src, dst in ((ap, ap_mc), (pa, pa_mc)):
+            if not force and self._is_current_grid_output(dst, epi_ref, [src, epi_ref]):
                 continue
             run([
-                "flirt",
+                "mcflirt",
                 "-in", str(src),
-                "-ref", str(epi_ref),
-                "-applyxfm",
-                "-init", str(mat),
                 "-out", str(dst),
+                "-reffile", str(epi_ref),
             ], env=fsl_env)
+            if not self._same_grid(dst, epi_ref):
+                raise RuntimeError(
+                    f"{dst} is not in the same grid as RT motion reference {epi_ref}"
+                )
 
-        return ap_epi, pa_epi
+        for src, dst in ((ap_mc, ap_mean), (pa_mc, pa_mean)):
+            if not force and self._is_current_grid_output(dst, epi_ref, [src, epi_ref]):
+                continue
+            run(["fslmaths", str(src), "-Tmean", str(dst)], env=fsl_env)
+            if not self._same_grid(dst, epi_ref):
+                raise RuntimeError(
+                    f"{dst} is not in the same grid as RT motion reference {epi_ref}"
+                )
+
+        ap_mean_nii = gunzip_python(ap_mean)
+        pa_mean_nii = gunzip_python(pa_mean)
+        for out_path in (ap_mean_nii, pa_mean_nii):
+            if not self._same_grid(out_path, epi_ref):
+                raise RuntimeError(
+                    f"{out_path} is not in the same grid as RT motion reference {epi_ref}"
+                )
+        self._fieldmap_mc_to_ref_ready = True
+        return ap_mean_nii, pa_mean_nii
+
+    def _is_current_output(self, out_path: Path, inputs: list[Path]) -> bool:
+        if not out_path.exists():
+            return False
+        try:
+            out_mtime = out_path.stat().st_mtime
+            return all(out_mtime >= p.stat().st_mtime for p in inputs if p.exists())
+        except OSError:
+            return False
+
+    def _is_current_grid_output(self, out_path: Path, ref_path: Path, inputs: list[Path]) -> bool:
+        return (
+            self._is_current_output(out_path, inputs)
+            and self._same_grid(out_path, ref_path)
+        )
 
     def _same_grid(self, a_path: Path, b_path: Path) -> bool:
         try:
@@ -314,11 +315,15 @@ class FMRIRealtimePreprocessor:
 
     def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path, output_stem: str = "pyhysco"):
         pyhysco_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii"
-        if pyhysco_field.exists() and self._same_grid(pyhysco_field, ap_mean):
+        if self._is_current_grid_output(pyhysco_field, ap_mean, [ap_mean, pa_mean]):
             print("✓ PyHySCO fieldmap already exists — skipping")
             return
 
         pyhysco_prefix = self.fmap_dir / output_stem
+        generated_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii.gz"
+        for stale in (pyhysco_field, generated_field):
+            if stale.exists():
+                stale.unlink()
         pyhysco_src = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
         cmd = [
             "bash", "-lc",
@@ -331,7 +336,6 @@ class FMRIRealtimePreprocessor:
         ]
         run(cmd)
 
-        generated_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii.gz"
         if not generated_field.exists() and not pyhysco_field.exists():
             raise FileNotFoundError(
                 f"Expected PyHySCO fieldmap not found: {generated_field}"
@@ -397,7 +401,6 @@ class FMRIRealtimePreprocessor:
         epi_4d = run_cfg.epi_file  # e.g. epi_4d.nii
         epi_first = run_dir / "epi_first.nii"
         self._extract_first_epi_volume(epi_4d, epi_first)
-        self._prepare_fieldmap(epi_first)
 
         # 1) Skullstrip raw EPI (for nuisance mask preparation during MC stats)
         epi_brain_raw = run_dir / "epi_brain_raw.nii"
@@ -417,6 +420,9 @@ class FMRIRealtimePreprocessor:
 
         # --- Set global RT MC reference from MC-first mean ---
         self._maybe_set_rt_reference(rt_mc_ref_mean, rt_mc_ref_mask_mean)
+
+        # 2.5) Prepare AP/PA fieldmap in the same RT motion-reference pose/grid
+        self._prepare_fieldmap(self.rt_distorted_motion_ref_epi)
 
         # 3) Apply AP/PA warp to motion-corrected 4D EPI
         epi_mc = epi_4d.with_name("epi_mc.nii")
@@ -510,8 +516,9 @@ class FMRIRealtimePreprocessor:
         """
         Apply AP->PA warp to a 4D EPI (fieldmap-style unwarping).
 
-        Prefers first-EPI-aligned AP2PA_epi_* or pyhysco_epi-* fieldmaps,
-        with fallback to legacy AP2PA_* / pyhysco-* files.
+        Prefers AP2PA_epi_* / pyhysco_epi-* fieldmaps. New outputs with those
+        names are built from AP/PA motion-corrected to rt_ref_epi.nii; legacy
+        AP2PA_* / pyhysco-* files remain as fallback.
         """
         if out.exists():
             return

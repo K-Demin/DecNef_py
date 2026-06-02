@@ -2087,8 +2087,9 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     warp, affine, ref_img = _resolve_ants_unwarp_inputs(cfg, fmap_dir, epi_pe)
 
     # NOTE: this fallback expects the input to already be motion-corrected.
-    # New AP2PA_epi_* transforms write into the distorted EPI motion-reference
-    # grid; legacy AP2PA_* transforms write into the AP/PA fieldmap grid.
+    # AP2PA_epi_* transforms are estimated from AP/PA already motion-corrected
+    # to rt_ref_epi.nii and write into the distorted EPI motion-reference grid.
+    # Legacy AP2PA_* transforms write into the AP/PA fieldmap grid.
 
     if not warp.exists() or not affine.exists():
         log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
