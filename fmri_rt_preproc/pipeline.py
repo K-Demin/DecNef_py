@@ -50,12 +50,13 @@ class FMRIRealtimePreprocessor:
         self.fieldmap_method = str(getattr(cfg, "fieldmap_method", "pyhysco")).lower()
         self.epi_phase_encoding = str(getattr(cfg, "epi_phase_encoding", "PA")).upper()
 
-        # --- NEW: global EPI reference for RT (per day) ---
-        # This will be set from the FIRST run we preprocess.
-        self.rt_ref_epi = self.func_dir / "trans" / "rt_ref_epi.nii"
-        self.rt_ref_mask = self.func_dir / "trans" / "rt_ref_epi_mask.nii"
-        self.rt_unwarped_ref_epi = prefer_uncompressed_nifti(self.func_dir / "trans" / "epi_unwarped_mean.nii")
-        self.rt_unwarped_ref_mask = self.func_dir / "trans" / "epi_mask_mean.nii"
+        # Day-level references made from the first preprocessed run.
+        self.rt_distorted_motion_ref_epi = self.trans_dir / "rt_motion_ref_epi.nii"
+        self.rt_distorted_motion_ref_mask = self.trans_dir / "rt_motion_ref_mask.nii"
+        self.legacy_rt_distorted_motion_ref_epi = self.trans_dir / "rt_ref_epi.nii"
+        self.legacy_rt_distorted_motion_ref_mask = self.trans_dir / "rt_ref_epi_mask.nii"
+        self.rt_unwarped_analysis_ref_epi = prefer_uncompressed_nifti(self.trans_dir / "epi_unwarped_mean.nii")
+        self.rt_unwarped_analysis_ref_mask = self.trans_dir / "epi_mask_mean.nii"
 
     # ---------- Top-level entry points ----------
 
@@ -64,7 +65,6 @@ class FMRIRealtimePreprocessor:
         ensure_dir(self.func_dir)
         ensure_dir(self.trans_dir)
         self._prepare_anat()
-        self._prepare_fieldmap()
         for run_cfg in self.cfg.runs:
             self._prepare_run(run_cfg)
 
@@ -219,7 +219,16 @@ class FMRIRealtimePreprocessor:
 
     # ---------- Fieldmap / AP-PA ----------
 
-    def _prepare_fieldmap(self):
+    def _prepare_fieldmap(self, epi_ref: Path):
+        """
+        Build a day-level AP/PA fieldmap in the first-run EPI grid.
+
+        AP/PA volumes are first motion-corrected within each short fieldmap
+        series and averaged. The AP/PA mean pair is then moved into the first
+        BOLD EPI grid with one shared rigid transform before estimating the
+        distortion field. Online BOLD volumes are motion-corrected into this
+        same grid before the fieldmap is applied.
+        """
         ensure_dir(self.fmap_dir)
         ap = self.cfg.ap_file
         pa = self.cfg.pa_file
@@ -244,24 +253,62 @@ class FMRIRealtimePreprocessor:
         ap_mean = self.fmap_dir / "AP_mean.nii"
         pa_mean = self.fmap_dir / "PA_mean.nii"
 
+        ap_mean_epi, pa_mean_epi = self._align_fieldmap_means_to_epi(ap_mean, pa_mean, epi_ref)
+
         if self.fieldmap_method == "pyhysco":
-            self._run_ap_pa_pyhysco(ap_mean, pa_mean)
+            self._run_ap_pa_pyhysco(ap_mean_epi, pa_mean_epi, output_stem="pyhysco_epi")
         elif self.fieldmap_method == "ants":
-            ap2pa_warp = self.fmap_dir / "AP2PA_Warped.nii"
+            ap2pa_warp = self.fmap_dir / "AP2PA_epi_Warped.nii"
             if not ap2pa_warp.exists():
-                self._run_ap_pa_ants(ap_mean, pa_mean)
+                self._run_ap_pa_ants(ap_mean_epi, pa_mean_epi, output_prefix_name="AP2PA_epi_")
         else:
             raise ValueError(
                 f"Unknown fieldmap_method={self.fieldmap_method}. Use 'pyhysco' or 'ants'."
             )
 
-    def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path):
-        pyhysco_field = self.fmap_dir / "pyhysco-EstFieldMap.nii"
+    def _align_fieldmap_means_to_epi(self, ap_mean: Path, pa_mean: Path, epi_ref: Path) -> tuple[Path, Path]:
+        ensure_dir(self.fmap_dir)
+        fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
+        ap_epi = self.fmap_dir / "AP_mean_to_epi.nii"
+        pa_epi = self.fmap_dir / "PA_mean_to_epi.nii"
+        mat = self.fmap_dir / "fmap_to_epi.mat"
+
+        same_pe_mean = ap_mean if self.epi_phase_encoding == "AP" else pa_mean
+        same_pe_epi = ap_epi if self.epi_phase_encoding == "AP" else pa_epi
+
+        if not mat.exists() or not same_pe_epi.exists():
+            print(f"-> Aligning {same_pe_mean.name} to first EPI for fieldmap grid")
+            run([
+                "flirt",
+                "-in", str(same_pe_mean),
+                "-ref", str(epi_ref),
+                "-out", str(same_pe_epi),
+                "-omat", str(mat),
+                "-dof", "6",
+                "-cost", "normmi",
+            ], env=fsl_env)
+
+        for src, dst in ((ap_mean, ap_epi), (pa_mean, pa_epi)):
+            if dst.exists():
+                continue
+            run([
+                "flirt",
+                "-in", str(src),
+                "-ref", str(epi_ref),
+                "-applyxfm",
+                "-init", str(mat),
+                "-out", str(dst),
+            ], env=fsl_env)
+
+        return ap_epi, pa_epi
+
+    def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path, output_stem: str = "pyhysco"):
+        pyhysco_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii"
         if pyhysco_field.exists():
             print("✓ PyHySCO fieldmap already exists — skipping")
             return
 
-        pyhysco_prefix = self.fmap_dir / "pyhysco"
+        pyhysco_prefix = self.fmap_dir / output_stem
         pyhysco_src = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
         cmd = [
             "bash", "-lc",
@@ -274,7 +321,7 @@ class FMRIRealtimePreprocessor:
         ]
         run(cmd)
 
-        generated_field = self.fmap_dir / "pyhysco-EstFieldMap.nii.gz"
+        generated_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii.gz"
         if not generated_field.exists() and not pyhysco_field.exists():
             raise FileNotFoundError(
                 f"Expected PyHySCO fieldmap not found: {generated_field}"
@@ -282,8 +329,10 @@ class FMRIRealtimePreprocessor:
         if generated_field.exists() and not pyhysco_field.exists():
             gunzip_python(generated_field)
 
-    def _run_ap_pa_ants(self, ap_mean: Path, pa_mean: Path):
-        out_prefix = self.fmap_dir / "AP2PA_"
+    def _run_ap_pa_ants(self, ap_mean: Path, pa_mean: Path, output_prefix_name: str = "AP2PA_"):
+        out_prefix = self.fmap_dir / output_prefix_name
+        warped = self.fmap_dir / f"{output_prefix_name}Warped.nii"
+        inverse_warped = self.fmap_dir / f"{output_prefix_name}InverseWarped.nii"
         cmd = [
             "bash", "-lc",
             # wrap in bash so we can export vars easily
@@ -295,7 +344,7 @@ class FMRIRealtimePreprocessor:
               --dimensionality 3 \
               --float 1 \
               --verbose 1 \
-              --output [{out_prefix}, {self.fmap_dir / 'AP2PA_Warped.nii'}, {self.fmap_dir / 'AP2PA_InverseWarped.nii'}] \
+              --output [{out_prefix}, {warped}, {inverse_warped}] \
               --interpolation Linear \
               --winsorize-image-intensities [0.005,0.995] \
               --use-histogram-matching 1 \
@@ -322,8 +371,8 @@ class FMRIRealtimePreprocessor:
         ]
         run(cmd)
         # unzip ANTs warps for faster repeated access during RT unwarping
-        forward_warp_path = self.fmap_dir / "AP2PA_1Warp.nii.gz"
-        inverse_warp_path = self.fmap_dir / "AP2PA_1InverseWarp.nii.gz"
+        forward_warp_path = self.fmap_dir / f"{output_prefix_name}1Warp.nii.gz"
+        inverse_warp_path = self.fmap_dir / f"{output_prefix_name}1InverseWarp.nii.gz"
         gunzip_python(forward_warp_path)
         gunzip_python(inverse_warp_path)
 
@@ -336,6 +385,9 @@ class FMRIRealtimePreprocessor:
 
         # 0) Input: 4D epi, already combined outside this script
         epi_4d = run_cfg.epi_file  # e.g. epi_4d.nii
+        epi_first = run_dir / "epi_first.nii"
+        self._extract_first_epi_volume(epi_4d, epi_first)
+        self._prepare_fieldmap(epi_first)
 
         # 1) Skullstrip raw EPI (for nuisance mask preparation during MC stats)
         epi_brain_raw = run_dir / "epi_brain_raw.nii"
@@ -346,7 +398,7 @@ class FMRIRealtimePreprocessor:
         rt_mc_ref_mean = run_dir / "epi_mc_mean.nii"
         rt_mc_ref_mask_mean = run_dir / "epi_mc_mask_mean.nii"
         self._motion_correct_and_mean(
-            epi_unwarped=epi_4d,
+            epi_4d=epi_4d,
             epi_mask=epi_mask_raw,
             epi_mean=rt_mc_ref_mean,
             epi_mask_mean=rt_mc_ref_mask_mean,
@@ -410,17 +462,53 @@ class FMRIRealtimePreprocessor:
                 bias_value=0.0,
             )
 
+    def _extract_first_epi_volume(self, epi_4d: Path, out: Path):
+        if out.exists():
+            return
+        img_4d = nib.load(str(epi_4d))
+        data_4d = np.asanyarray(img_4d.dataobj)
+        first_vol = data_4d[..., 0] if data_4d.ndim == 4 else data_4d
+        nib.save(nib.Nifti1Image(first_vol.astype(np.float32), img_4d.affine, img_4d.header), str(out))
+
+    def _preferred_pyhysco_fieldmap(self) -> Path:
+        aligned = prefer_uncompressed_nifti(self.fmap_dir / "pyhysco_epi-EstFieldMap.nii")
+        if aligned.exists():
+            return aligned
+        return prefer_uncompressed_nifti(self.fmap_dir / "pyhysco-EstFieldMap.nii")
+
+    def _distorted_motion_ref_for_unwarp(self) -> Path:
+        if self.rt_distorted_motion_ref_epi.exists():
+            return self.rt_distorted_motion_ref_epi
+        return self.legacy_rt_distorted_motion_ref_epi
+
+    def _preferred_ants_unwarp_inputs(self) -> tuple[Path, Path, Path]:
+        if self.epi_phase_encoding == "AP":
+            aligned_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_epi_1Warp.nii")
+            legacy_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1Warp.nii")
+            legacy_ref = self.fmap_dir / "AP_mean.nii"
+        else:
+            aligned_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_epi_1InverseWarp.nii")
+            legacy_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1InverseWarp.nii")
+            legacy_ref = self.fmap_dir / "PA_mean.nii"
+
+        aligned_affine = self.fmap_dir / "AP2PA_epi_0GenericAffine.mat"
+        if aligned_warp.exists() and aligned_affine.exists():
+            return aligned_warp, aligned_affine, self._distorted_motion_ref_for_unwarp()
+
+        legacy_affine = self.fmap_dir / "AP2PA_0GenericAffine.mat"
+        return legacy_warp, legacy_affine, legacy_ref
+
     def _unwarp_epi(self, epi_4d: Path, out: Path):
         """
         Apply AP->PA warp to a 4D EPI (fieldmap-style unwarping).
 
-        Uses the AP2PA_1Warp.nii + AP2PA_0GenericAffine.mat transforms
-        generated by _run_ap_pa_ants.
+        Prefers first-EPI-aligned AP2PA_epi_* or pyhysco_epi-* fieldmaps,
+        with fallback to legacy AP2PA_* / pyhysco-* files.
         """
         if out.exists():
             return
 
-        pyhysco_field = prefer_uncompressed_nifti(self.fmap_dir / "pyhysco-EstFieldMap.nii")
+        pyhysco_field = self._preferred_pyhysco_fieldmap()
         if self.fieldmap_method == "pyhysco" and pyhysco_field.exists():
             polarity = 1 if self.epi_phase_encoding == "AP" else -1
             print(f"→ Applying PyHySCO fieldmap to {epi_4d.name}")
@@ -432,12 +520,7 @@ class FMRIRealtimePreprocessor:
                 polarity=polarity,
             )
             return
-        warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1InverseWarp.nii")
-        affine = self.fmap_dir / "AP2PA_0GenericAffine.mat"
-        PA_mean = self.fmap_dir / "PA_mean.nii"
-        if self.epi_phase_encoding == "AP":
-            warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1Warp.nii")
-            PA_mean = self.fmap_dir / "AP_mean.nii"
+        warp, affine, ref_img = self._preferred_ants_unwarp_inputs()
 
         if not warp.exists() or not affine.exists():
             raise FileNotFoundError(
@@ -457,7 +540,7 @@ class FMRIRealtimePreprocessor:
               -e 3 \
               -i {epi_4d} \
               -o {out} \
-              -r {PA_mean} \
+              -r {ref_img} \
               -t {warp} \
               -t {affine} --float 1
             """
@@ -485,7 +568,7 @@ class FMRIRealtimePreprocessor:
 
     def _motion_correct_and_mean(
             self,
-            epi_unwarped: Path,
+            epi_4d: Path,
             epi_mask: Path,
             epi_mean: Path,
             epi_mask_mean: Path,
@@ -495,7 +578,7 @@ class FMRIRealtimePreprocessor:
         Motion correction using RTPSpy's RtpVolreg + temporal means.
 
         Inputs:
-          epi_unwarped : 4D EPI after AP/PA unwarping
+          epi_4d       : raw 4D EPI before AP/PA unwarping
           epi_mask     : EPI skullstrip mask from mri_synthstrip
         Outputs:
           epi_mc.nii      : motion-corrected EPI (subset of volumes)
@@ -509,13 +592,13 @@ class FMRIRealtimePreprocessor:
             return
 
         # Output paths (KEEP EXACT OLD NAMING)
-        mc_epi = epi_unwarped.with_name("epi_mc.nii")
-        motion_1d = epi_unwarped.with_name("motion.1D")
+        mc_epi = epi_4d.with_name("epi_mc.nii")
+        motion_1d = epi_4d.with_name("motion.1D")
 
         # ------------------------------------------------------------------
         #                LOAD INPUT EPI (4D)
         # ------------------------------------------------------------------
-        img_4d = nib.load(str(epi_unwarped))
+        img_4d = nib.load(str(epi_4d))
         data_4d = np.asanyarray(img_4d.dataobj)
         affine = img_4d.affine
         header = img_4d.header
@@ -539,7 +622,7 @@ class FMRIRealtimePreprocessor:
         vr.save_proc = False
 
         # Reference is the first volume
-        vr.set_ref_vol(f"{epi_unwarped}[0]")
+        vr.set_ref_vol(f"{epi_4d}[0]")
 
         # ------------------------------------------------------------------
         #                RUN MOTION CORRECTION VOLUME-BY-VOLUME
@@ -590,16 +673,19 @@ class FMRIRealtimePreprocessor:
         We use the first run's MC-first mean EPI as the reference
         for:
           - RT motion correction (RtpVolreg)
-          - epi→T1 registration anchor
+          - aligned fieldmap output grid
+          - distorted-space DVARS mask
+        EPI-to-T1 registration uses the unwarped mean EPI created later.
         """
-        if not self.rt_ref_epi.exists():
+        if not self.rt_distorted_motion_ref_epi.exists():
             print(f"→ Setting RT reference EPI to {epi_mean.name}")
             # Use Python copy so we don't assume 'cp' exists
             import shutil
-            shutil.copyfile(epi_mean, self.rt_ref_epi)
+            shutil.copyfile(epi_mean, self.rt_distorted_motion_ref_epi)
 
-            if epi_mask_mean.exists():
-                shutil.copyfile(epi_mask_mean, self.rt_ref_mask)
+        if epi_mask_mean.exists() and not self.rt_distorted_motion_ref_mask.exists():
+            import shutil
+            shutil.copyfile(epi_mask_mean, self.rt_distorted_motion_ref_mask)
 
 
     def _register_epi_to_t1(self, run_dir: Path, epi_mean: Path, epi_mask_mean: Path):
@@ -677,13 +763,13 @@ class FMRIRealtimePreprocessor:
         # -------------------------
         # 0) References (EPI grid)
         # -------------------------
-        if not self.rt_unwarped_ref_epi.exists():
-            raise FileNotFoundError(f"Unwarped RT reference missing: {self.rt_unwarped_ref_epi}")
-        if not self.rt_unwarped_ref_mask.exists():
-            raise FileNotFoundError(f"Unwarped RT mask missing: {self.rt_unwarped_ref_mask}")
+        if not self.rt_unwarped_analysis_ref_epi.exists():
+            raise FileNotFoundError(f"Unwarped RT reference missing: {self.rt_unwarped_analysis_ref_epi}")
+        if not self.rt_unwarped_analysis_ref_mask.exists():
+            raise FileNotFoundError(f"Unwarped RT mask missing: {self.rt_unwarped_analysis_ref_mask}")
 
-        epi_ref = self.rt_unwarped_ref_epi
-        epi_brainmask = self.rt_unwarped_ref_mask
+        epi_ref = self.rt_unwarped_analysis_ref_epi
+        epi_brainmask = self.rt_unwarped_analysis_ref_mask
         fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI")
 
         # GS regressor uses the EPI brain mask directly.

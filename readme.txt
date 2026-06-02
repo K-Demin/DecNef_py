@@ -154,9 +154,18 @@ Running the pipeline
    - Run SynthMorph:
         - anat/warp_T1_to_MNI_synth.nii.gz
         - anat/T1_warped_to_MNI_synth.nii.gz
-   - Compute AP_mean.nii.gz and PA_mean.nii.gz in fmap/
-   - Compute AP2PA_Warped.nii.gz and AP2PA_InverseWarped.nii.gz (AP->PA warp)
+   - Motion-correct the AP/PA fieldmap series internally and compute AP_mean.nii.gz and PA_mean.nii.gz in fmap/
+   - Align the AP/PA mean pair to the first BOLD EPI using one shared rigid transform:
+        - fmap/AP_mean_to_epi.nii
+        - fmap/PA_mean_to_epi.nii
+        - fmap/fmap_to_epi.mat
+   - Estimate the fieldmap on that first-EPI grid:
+        - PyHySCO: fmap/pyhysco_epi-EstFieldMap.nii
+        - ANTs fallback: fmap/AP2PA_epi_* transforms
    - For each run:
+        - func/run-XX/epi_first.nii
+        - func/run-XX/epi_mc.nii
+        - func/run-XX/motion.1D
         - func/run-XX/epi_unwarped.nii.gz
         - func/run-XX/epi_brain.nii.gz
         - func/run-XX/epi_mask.nii.gz
@@ -164,44 +173,43 @@ Running the pipeline
         - func/run-XX/epi2t1_* transforms (Warped, InverseWarped, Composite.h5)
         - func/run-XX/epi_in_MNI.nii.gz
         - optional: func/run-XX/qc_epi_in_MNI.png (if QC plotting is enabled)
+   - For realtime reuse, create day-level references in func/trans:
+        - rt_motion_ref_epi.nii and rt_motion_ref_mask.nii (distorted MC grid)
+        - epi_unwarped_mean.nii and epi_mask_mean.nii (unwarped analysis grid)
 
 
 Motion Correction
 -----------------
 
-The pipeline expects motion-corrected EPI to be provided by RTPSpy / AFNI's
-RTP_VOLREG.
+The preprocessing script now performs RTPSpy motion correction itself.
 
-For each func/run-XX:
+For each func/run-XX, the first EPI volume is used as the motion reference for
+offline preprocessing. The script writes func/run-XX/epi_mc.nii and motion.1D,
+then applies the first-EPI-aligned AP/PA fieldmap to the motion-corrected EPI.
+The unwarped result is averaged into func/run-XX/epi_unwarped_mean.nii.gz,
+which is the reference used for EPI-to-T1 registration and nuisance-mask grids.
 
-- The preprocessing script currently assumes a file:
-      func/run-XX/epi_mc.nii.gz
-  produced externally.
-
-- It then computes:
-      func/run-XX/epi_unwarped_mean.nii.gz
-  from epi_mc.nii.gz via fslmaths -Tmean.
-
-Integration with RTP_VOLREG can be added later as a small wrapper around
-AFNI / RTPSpy commands.
+For realtime, rt_pipeline.py uses func/trans/rt_motion_ref_epi.nii as the
+distorted-space RTPSpy motion reference. Each incoming volume is motion-corrected
+to that reference first, then the first-EPI-aligned fieldmap is applied. Regression,
+voxel normalization, EPI-to-T1/MNI transforms, and decoder scoring all operate on
+the unwarped analysis stream.
 
 
 Realtime / DecNef Usage
 -----------------------
 
-The idea is:
+The offline preprocessing prepares the anatomy, fieldmaps, references, masks,
+and transforms needed by rt_pipeline.py. During realtime:
 
-- Precompute all static transforms and masks using this pipeline.
-- A separate realtime worker (rt_worker.py) will:
-    - Load the epi->T1 composite transforms and T1->MNI warp.
-    - Load AP->PA warp if needed.
-    - For each new volume:
-        - Apply the transforms using antsApplyTransforms.
-        - Extract ROI / decoder signal in MNI space.
-
-For now, all realtime-specific code is out of scope; this pipeline prepares
-the anatomy, fieldmaps, and transforms so that realtime can run with minimal
-overhead.
+- compute_stage converts each incoming DICOM to a raw NIfTI.
+- commit_stage runs stateful processing in scan order:
+    - RTPSpy motion correction to rt_motion_ref_epi.nii
+    - fieldmap unwarp using pyhysco_epi-EstFieldMap.nii or AP2PA_epi_* transforms
+    - FD/DVARS censor bookkeeping
+    - nuisance regression and voxel normalization on the unwarped stream
+    - optional EPI->T1 or EPI->T1->MNI transform
+    - decoder scoring and score publication
 
 
 QC
@@ -275,10 +283,11 @@ Per-volume output folders (under `func/<run_id>/`)
 
 - `raw/`: raw incoming NIfTI volumes before RT motion correction.
 - `mc/`: motion-corrected volumes in native EPI space.
+- `unwarped/`: motion-corrected volumes after fieldmap unwarp, before nuisance regression.
 - `reg/`: nuisance-cleaned (and voxel-normalized) volumes in native EPI space; this is the source volume that is later warped when `analysis_space` is `t1` or `mni`.
 - `t1/` (only when `analysis_space = "t1"`):
   - `vol_XXXXX_t1.nii`: the `reg/` volume warped to T1/decoder space (used for denoised scoring).
-  - `vol_XXXXX_t1_orig.nii`: the `mc/` volume warped to T1/decoder space (used as the non-denoised comparison score).
+  - `vol_XXXXX_t1_orig.nii`: the `unwarped/` volume warped to T1/decoder space (used as the non-denoised comparison score).
 - `mni/` (only when `analysis_space = "mni"`): equivalent pair (`*_mni.nii` and `*_mni_orig.nii`) in MNI/decoder space.
 
 CLI flags still work and can override values for a single run.
