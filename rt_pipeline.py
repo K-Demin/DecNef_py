@@ -550,6 +550,13 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     )
 
 
+def resolve_t1_output_reference(cfg: RTSessionConfig) -> Path:
+    decoder_template = resolve_decoder_template(cfg)
+    if cfg.enable_scoring:
+        return decoder_template
+    return cfg.t1_reference_override or decoder_template
+
+
 def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     if not bool(getattr(REGRESSOR_SETTINGS, "use_gpu_resampler", False)):
         return None
@@ -562,8 +569,7 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     from gpu_ants_like_resampler import GpuAntsLikeResampler, precompute_sampling_grid
 
     if analysis_space == "t1":
-        decoder_template = resolve_decoder_template(cfg)
-        fixed_ref = cfg.t1_reference_override or decoder_template
+        fixed_ref = resolve_t1_output_reference(cfg)
         transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
         out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_t1"
     else:
@@ -780,8 +786,9 @@ def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]
     elif decoder_template.exists() and cfg.enable_scoring:
         log.warning(
             "[TRANS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
-            "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
+            "keeping decoder template as the scoring reference."
         )
+        return None
 
     return t1_trunc_path
 
@@ -1865,7 +1872,7 @@ def process_volume(
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
-        t1_ref = cfg.t1_reference_override or decoder_template
+        t1_ref = resolve_t1_output_reference(cfg)
 
         if not decoder_template.exists():
             log.error(f"Decoder template not found at {decoder_template}")
