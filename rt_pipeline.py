@@ -589,6 +589,44 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     grid_path_npz = out_dir / "sampling_grid.npz"
     grid_path_pt = out_dir / "sampling_grid.pt"
     grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
+    if grid_path.exists():
+        try:
+            fixed_img = nib.load(str(fixed_ref))
+            payload = GpuAntsLikeResampler._load_payload(grid_path)
+            cached_shape = tuple(int(v) for v in payload["fixed_shape"])
+            cached_affine = np.asarray(payload["fixed_affine"], dtype=np.float64)
+            if cached_shape != fixed_img.shape[:3] or not np.allclose(
+                cached_affine,
+                fixed_img.affine,
+                atol=1e-3,
+            ):
+                log.warning(
+                    "[GPU] Existing sampling grid does not match current fixed reference; "
+                    "recomputing %s",
+                    out_dir,
+                )
+                for stale in [
+                    grid_path_npz,
+                    grid_path_pt,
+                    out_dir / "coord_x_in_fixed.nii",
+                    out_dir / "coord_y_in_fixed.nii",
+                    out_dir / "coord_z_in_fixed.nii",
+                ]:
+                    if stale.exists():
+                        stale.unlink()
+                grid_path = grid_path_npz
+        except Exception as exc:
+            log.warning("[GPU] Could not validate existing sampling grid %s: %s", grid_path, exc)
+            for stale in [
+                grid_path_npz,
+                grid_path_pt,
+                out_dir / "coord_x_in_fixed.nii",
+                out_dir / "coord_y_in_fixed.nii",
+                out_dir / "coord_z_in_fixed.nii",
+            ]:
+                if stale.exists():
+                    stale.unlink()
+            grid_path = grid_path_npz
     if not grid_path.exists():
         log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
         grid_path = precompute_sampling_grid(
