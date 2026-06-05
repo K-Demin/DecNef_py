@@ -50,8 +50,6 @@ class RegressorSettings:
     pipeline_engine: str = "parallel_ordered"  # "parallel_ordered" or "legacy"
     commit_wait_timeout_s: float = 1.0
     skip_first_trs: int = 0
-    truncate_t1_to_epi_fov: bool = False
-    truncate_t1_padding_vox: int = 2
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
@@ -76,8 +74,6 @@ class RegressorSettings:
                 setattr(self, key, str(value).upper())
             elif key == "pyhysco_backend":
                 setattr(self, key, str(value).lower())
-            elif key == "truncate_t1_padding_vox":
-                setattr(self, key, max(0, int(value)))
             else:
                 setattr(self, key, value)
 
