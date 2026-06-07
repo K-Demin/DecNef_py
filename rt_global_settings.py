@@ -46,6 +46,7 @@ class RegressorSettings:
     biopac_poll_interval: float = 0.05
     biopac_timelag: bool = False
     max_workers: int = 6
+    rt_max_scan_length: int = 2000
     max_retries: int = 3
     pipeline_engine: str = "parallel_ordered"  # "parallel_ordered" or "legacy"
     commit_wait_timeout_s: float = 1.0
@@ -70,6 +71,8 @@ class RegressorSettings:
                 setattr(self, key, max(1, int(value)))
             elif key == "skip_first_trs":
                 setattr(self, key, max(0, int(value)))
+            elif key == "rt_max_scan_length":
+                setattr(self, key, max(1, int(value)))
             elif key == "fieldmap_method":
                 setattr(self, key, str(value).lower())
             elif key == "epi_phase_encoding":

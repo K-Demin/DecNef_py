@@ -18,21 +18,63 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 from pathlib import Path
 from typing import Iterable
 
-import nibabel as nib
 import numpy as np
 
+from rs_pca_runtime import (
+    build_pca_root,
+    build_run_dir,
+    load_decoder_artifacts,
+    score_pca_volume,
+)
 
-def _build_run_dir(base_data: Path, subj: str, day: str, run: str) -> Path:
-    sub_tag = subj if str(subj).startswith("sub-") else f"sub-{subj}"
-    day_tag = day if str(day).startswith("day") else f"day{day}"
-    run_tag = run if str(run).startswith("run") else f"run{run}"
-    return base_data / sub_tag / day_tag / "func" / run_tag
+
+def _find_3d_series(run_dir: Path, pca_input: str) -> list[Path]:
+    folders = {
+        "mc": ("mc", "_mc"),
+        "reg": ("reg", "_reg"),
+        "t1": ("t1", "_t1"),
+        "unwarped": ("unwarped", "_mc_uw"),
+    }
+    if pca_input not in folders:
+        return []
+    folder_name, suffix = folders[pca_input]
+    src_dir = run_dir / folder_name
+    if not src_dir.exists():
+        return []
+    return sorted(
+        [
+            p
+            for p in src_dir.iterdir()
+            if p.is_file()
+            and (p.name.endswith(".nii") or p.name.endswith(".nii.gz"))
+            and suffix in p.name
+        ]
+    )
+
+
+def _ensure_score_4d(run_dir: Path, pca_input: str) -> Path:
+    analysis_dir = run_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    out_path = analysis_dir / f"rs_4d_{pca_input}.nii.gz"
+    if out_path.exists():
+        return out_path
+
+    vols = _find_3d_series(run_dir, pca_input)
+    if not vols:
+        return out_path
+
+    cmd = ["fslmerge", "-t", str(out_path), *[str(v) for v in vols]]
+    subprocess.run(cmd, check=True)
+    return out_path
 
 
 def _load_4d(path: Path) -> np.ndarray:
+    import nibabel as nib
+
     img = nib.load(str(path))
     data = np.asarray(img.get_fdata(dtype=np.float32), dtype=np.float32)
     if data.ndim != 4:
@@ -44,80 +86,6 @@ def _iter_roi_dirs(pca_root: Path) -> Iterable[Path]:
     for d in sorted(pca_root.iterdir()):
         if d.is_dir() and (d / "decoder_metadata.json").exists():
             yield d
-
-
-def _load_decoder_artifacts(roi_dir: Path) -> dict:
-    bundle_path = roi_dir / "decoder_bundle.npz"
-    if bundle_path.exists():
-        z = np.load(bundle_path)
-        return {
-            "voxel_indices": z["voxel_indices"].astype(np.int64, copy=False),
-            "weights": z["weights"].astype(np.float32, copy=False),
-            "norm_mean": z["norm_mean"].astype(np.float32, copy=False),
-            "norm_std": z["norm_std"].astype(np.float32, copy=False),
-        }
-
-    return {
-        "voxel_indices": np.load(roi_dir / "decoder_voxel_indices.npy").astype(np.int64, copy=False),
-        "weights": np.load(roi_dir / "decoder_weights.npy").astype(np.float32, copy=False),
-        "norm_mean": np.load(roi_dir / "decoder_norm_mean.npy").astype(np.float32, copy=False),
-        "norm_std": np.load(roi_dir / "decoder_norm_std.npy").astype(np.float32, copy=False),
-    }
-
-
-def _score_one_vol(
-    volume_3d: np.ndarray,
-    voxel_indices: np.ndarray,
-    weights: np.ndarray,
-    norm_mean: np.ndarray,
-    norm_std: np.ndarray,
-    normalization: str,
-) -> np.ndarray:
-    flat = volume_3d.reshape(-1).astype(np.float32, copy=False)
-    x = flat[voxel_indices]
-
-    if normalization == "zscore":
-        safe_std = np.where(norm_std == 0, 1.0, norm_std)
-        x = (x - norm_mean) / safe_std
-    elif normalization == "demean":
-        x = x - norm_mean
-    elif normalization == "none":
-        pass
-    else:
-        raise ValueError(f"Unknown normalization: {normalization}")
-
-    return (weights @ x).astype(np.float32, copy=False)
-
-
-def _cosine_one_vol(
-    volume_3d: np.ndarray,
-    voxel_indices: np.ndarray,
-    weights: np.ndarray,
-    norm_mean: np.ndarray,
-    norm_std: np.ndarray,
-    normalization: str,
-) -> np.ndarray:
-    flat = volume_3d.reshape(-1).astype(np.float32, copy=False)
-    x = flat[voxel_indices]
-
-    if normalization == "zscore":
-        safe_std = np.where(norm_std == 0, 1.0, norm_std)
-        x = (x - norm_mean) / safe_std
-    elif normalization == "demean":
-        x = x - norm_mean
-    elif normalization == "none":
-        pass
-    else:
-        raise ValueError(f"Unknown normalization: {normalization}")
-
-    x_norm = float(np.linalg.norm(x))
-    if x_norm == 0:
-        return np.zeros((weights.shape[0],), dtype=np.float32)
-
-    w_norm = np.linalg.norm(weights, axis=1)
-    w_norm_safe = np.where(w_norm == 0, 1.0, w_norm)
-    sims = (weights @ x) / (w_norm_safe * x_norm)
-    return sims.astype(np.float32, copy=False)
 
 
 def _load_reference_stats(reference_csv: Path, columns: list[str]) -> dict[str, dict[str, float]]:
@@ -153,13 +121,65 @@ def _load_reference_stats(reference_csv: Path, columns: list[str]) -> dict[str, 
     return stats
 
 
+def _write_reference_stats(
+    *,
+    scores_csv: Path,
+    columns: list[str],
+    out_path: Path,
+    metadata: dict,
+) -> None:
+    values: dict[str, list[float]] = {c: [] for c in columns}
+    with scores_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for column in columns:
+                try:
+                    value = float(row[column])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if np.isfinite(value):
+                    values[column].append(value)
+
+    payload = {"metadata": metadata, "columns": {}}
+    for column, buf in values.items():
+        arr = np.asarray(buf, dtype=float)
+        if arr.size < 2:
+            continue
+        payload["columns"][column] = {
+            "mean": float(arr.mean()),
+            "std": float(arr.std()),
+            "n": int(arr.size),
+            "p05": float(np.percentile(arr, 5)),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+        }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score all PCA ROIs for an RS run")
     parser.add_argument("--subj", required=True)
     parser.add_argument("--day", required=True)
     parser.add_argument("--run", required=True)
     parser.add_argument("--base-data", type=Path, default=Path(__file__).resolve().parent / "data")
-    parser.add_argument("--pca-input", choices=["auto", "mc", "reg"], default="reg")
+    parser.add_argument("--pca-input", choices=["auto", "mc", "reg", "t1"], default="reg")
+    parser.add_argument(
+        "--decoder-run",
+        default=None,
+        help="Run whose PCA decoder bundles should be used. Defaults to --run.",
+    )
+    parser.add_argument(
+        "--decoder-day",
+        default=None,
+        help="Day/session whose PCA decoder bundles should be used. Defaults to --day.",
+    )
+    parser.add_argument(
+        "--decoder-pca-root",
+        type=Path,
+        default=None,
+        help="Explicit PCA decoder root containing ROI decoder folders.",
+    )
     parser.add_argument(
         "--normalization",
         choices=["zscore", "demean", "none"],
@@ -185,20 +205,46 @@ def main() -> None:
         help="Reference scores CSV (same columns as output) used when --post-normalization=zscore.",
     )
     parser.add_argument("--input-4d", type=Path, default=None, help="Optional explicit 4D volume to score.")
+    parser.add_argument(
+        "--reference-stats-out",
+        type=Path,
+        default=None,
+        help="Write daily RS reference stats JSON for PCA feedback normalization.",
+    )
+    parser.add_argument(
+        "--write-reference-stats",
+        action="store_true",
+        help="Write reference stats to the default score output folder.",
+    )
     args = parser.parse_args()
     if args.post_normalization == "zscore" and args.reference_scores_csv is None:
         raise ValueError("--reference-scores-csv is required when --post-normalization=zscore")
 
-    run_dir = _build_run_dir(args.base_data, args.subj, args.day, args.run)
+    run_dir = build_run_dir(args.base_data, args.subj, args.day, args.run)
     day_dir = run_dir.parent.parent
-    pca_root = day_dir / "PCA" / run_dir.name / f"pca_{args.pca_input}"
-    if not pca_root.exists():
-        raise FileNotFoundError(f"PCA directory not found: {pca_root}")
+    score_root = build_pca_root(day_dir, run_dir.name, args.pca_input)
+    decoder_run = args.decoder_run or args.run
+    decoder_day = args.decoder_day or args.day
+    if args.decoder_pca_root is not None:
+        decoder_pca_root = args.decoder_pca_root
+    else:
+        decoder_run_dir = build_run_dir(args.base_data, args.subj, decoder_day, decoder_run)
+        decoder_day_dir = decoder_run_dir.parent.parent
+        decoder_pca_root = build_pca_root(
+            decoder_day_dir,
+            decoder_run_dir.name,
+            args.pca_input,
+        )
+    if not decoder_pca_root.exists():
+        raise FileNotFoundError(f"PCA decoder directory not found: {decoder_pca_root}")
 
     if args.input_4d is not None:
         score_4d_path = args.input_4d
     else:
-        score_4d_path = run_dir / "analysis" / f"rs_4d_{args.pca_input}.nii.gz"
+        if args.pca_input == "auto":
+            score_4d_path = run_dir / "analysis" / "rs_4d_auto.nii.gz"
+        else:
+            score_4d_path = _ensure_score_4d(run_dir, args.pca_input)
         if not score_4d_path.exists() and args.pca_input == "auto":
             for candidate in [run_dir / "analysis" / "rs_4d_reg.nii.gz", run_dir / "analysis" / "rs_4d_mc.nii.gz"]:
                 if candidate.exists():
@@ -212,25 +258,27 @@ def main() -> None:
     n_trs = data_4d.shape[3]
 
     roi_decoders: dict[str, dict] = {}
-    for roi_dir in _iter_roi_dirs(pca_root):
+    for roi_dir in _iter_roi_dirs(decoder_pca_root):
         roi = roi_dir.name
-        roi_decoders[roi] = _load_decoder_artifacts(roi_dir)
+        roi_decoders[roi] = load_decoder_artifacts(roi_dir)
 
     if not roi_decoders:
-        raise RuntimeError(f"No ROI decoder folders found under {pca_root}")
+        raise RuntimeError(f"No ROI decoder folders found under {decoder_pca_root}")
 
     pc_counts = {roi: dec["weights"].shape[0] for roi, dec in roi_decoders.items()}
     max_pcs = max(pc_counts.values())
 
-    out_csv = pca_root / "scores_pca_all_rois.csv"
+    score_root.mkdir(parents=True, exist_ok=True)
+    out_csv = score_root / "scores_pca_all_rois.csv"
     fieldnames = ["tr"]
     for roi in sorted(roi_decoders):
         for pc in range(1, max_pcs + 1):
             fieldnames.append(f"{roi}_PC{pc:02d}")
+    score_columns = fieldnames[1:]
     reference_stats: dict[str, dict[str, float]] | None = None
     if args.post_normalization == "zscore":
-        reference_stats = _load_reference_stats(args.reference_scores_csv, fieldnames[1:])
-        for key in fieldnames[1:]:
+        reference_stats = _load_reference_stats(args.reference_scores_csv, score_columns)
+        for key in score_columns:
             fieldnames.append(f"{key}_z")
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -242,29 +290,19 @@ def main() -> None:
             row = {"tr": tr + 1}
             for roi in sorted(roi_decoders):
                 dec = roi_decoders[roi]
-                if args.score_metric == "projection":
-                    pcs = _score_one_vol(
-                        vol,
-                        dec["voxel_indices"],
-                        dec["weights"],
-                        dec["norm_mean"],
-                        dec["norm_std"],
-                        normalization=args.normalization,
-                    )
-                else:
-                    pcs = _cosine_one_vol(
-                        vol,
-                        dec["voxel_indices"],
-                        dec["weights"],
-                        dec["norm_mean"],
-                        dec["norm_std"],
-                        normalization=args.normalization,
-                    )
+                pcs = score_pca_volume(
+                    vol,
+                    dec,
+                    normalization=args.normalization,
+                    score_metric=args.score_metric,
+                )
                 for idx in range(max_pcs):
                     key = f"{roi}_PC{idx + 1:02d}"
                     row[key] = float(pcs[idx]) if idx < pcs.shape[0] else ""
                     if reference_stats is not None and row[key] != "":
-                        row[f"{key}_z"] = (float(row[key]) - reference_stats[key]["mean"]) / reference_stats[key]["std"]
+                        row[f"{key}_z"] = (
+                            float(row[key]) - reference_stats[key]["mean"]
+                        ) / reference_stats[key]["std"]
                     elif reference_stats is not None:
                         row[f"{key}_z"] = ""
             writer.writerow(row)
@@ -273,7 +311,10 @@ def main() -> None:
         "subj": args.subj,
         "day": args.day,
         "run": args.run,
-        "pca_root": str(pca_root),
+        "score_root": str(score_root),
+        "decoder_day": decoder_day,
+        "decoder_run": decoder_run,
+        "decoder_pca_root": str(decoder_pca_root),
         "input_4d": str(score_4d_path),
         "normalization": args.normalization,
         "score_metric": args.score_metric,
@@ -284,8 +325,22 @@ def main() -> None:
         "pc_counts": pc_counts,
         "scores_csv": str(out_csv),
     }
-    with open(pca_root / "scores_pca_all_rois_metadata.json", "w", encoding="utf-8") as f:
+    with open(score_root / "scores_pca_all_rois_metadata.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    stats_out = args.reference_stats_out
+    if stats_out is None and args.write_reference_stats:
+        stats_out = score_root / "pca_reference_stats.json"
+    if stats_out is not None:
+        _write_reference_stats(
+            scores_csv=out_csv,
+            columns=score_columns,
+            out_path=stats_out,
+            metadata=summary,
+        )
+        summary["reference_stats_json"] = str(stats_out)
+        with open(score_root / "scores_pca_all_rois_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
 
     print(f"Saved PCA ROI scores: {out_csv}")
 

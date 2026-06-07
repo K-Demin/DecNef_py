@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 
 from rt_global_settings import load_regressor_settings
+import rs_pca_runtime as pca_rt
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("rs_realtime_parallel")
@@ -175,7 +176,7 @@ def _run_prep_surface_rois(base_data: Path, sub: str, day: str) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _run_pca_prep(base_data: Path, sub: str, day: str, run: str) -> None:
+def _run_pca_prep(base_data: Path, sub: str, day: str, run: str, pca_input: str) -> None:
     cmd = [
         sys.executable,
         str(Path(__file__).resolve().parent / "roi_rs_pca_decoder_prep.py"),
@@ -187,8 +188,53 @@ def _run_pca_prep(base_data: Path, sub: str, day: str, run: str) -> None:
         run,
         "--base-data",
         str(base_data),
+        "--pca-input",
+        pca_input,
     ]
     log.info("Running PCA prep: %s", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+def _run_pca_score(
+    *,
+    base_data: Path,
+    sub: str,
+    day: str,
+    run: str,
+    decoder_day: Optional[str],
+    decoder_run: Optional[str],
+    pca_input: str,
+    normalization: str,
+    score_metric: str,
+    reference_stats_out: Optional[Path],
+) -> None:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve().parent / "rs_pca_score_all_rois.py"),
+        "--subj",
+        sub,
+        "--day",
+        day,
+        "--run",
+        run,
+        "--base-data",
+        str(base_data),
+        "--pca-input",
+        pca_input,
+        "--normalization",
+        normalization,
+        "--score-metric",
+        score_metric,
+    ]
+    if decoder_day is not None:
+        cmd += ["--decoder-day", decoder_day]
+    if decoder_run is not None:
+        cmd += ["--decoder-run", decoder_run]
+    if reference_stats_out is not None:
+        cmd += ["--reference-stats-out", str(reference_stats_out)]
+    else:
+        cmd += ["--write-reference-stats"]
+    log.info("Running PCA score/reference stats: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
@@ -430,6 +476,63 @@ def main() -> None:
         help="Run roi_rs_pca_decoder_prep.py after the run completes.",
     )
     parser.add_argument(
+        "--pca-score",
+        action="store_true",
+        help="Score this RS run with existing PCA decoders after the run completes.",
+    )
+    parser.add_argument(
+        "--pca-day",
+        default=None,
+        help="Day/session whose PCA decoder bundles should be used for --pca-score.",
+    )
+    parser.add_argument(
+        "--pca-run",
+        default=None,
+        help="Run whose PCA decoder bundles should be used for --pca-score.",
+    )
+    parser.add_argument(
+        "--pca-input",
+        choices=["auto", "mc", "reg", "t1"],
+        default="t1",
+        help="PCA input/output mode used for PCA prep and scoring.",
+    )
+    parser.add_argument(
+        "--pca-space",
+        choices=["epi", "t1", "mni"],
+        default="t1",
+        help="rt_pipeline output space to create for PCA workflows.",
+    )
+    parser.add_argument(
+        "--pca-reference-image",
+        type=Path,
+        default=None,
+        help="Explicit reference image/grid for PCA-space transforms.",
+    )
+    parser.add_argument(
+        "--pca-reference-resolution",
+        choices=["epi", "t1"],
+        default="epi",
+        help="Default PCA T1 reference resolution when --pca-reference-image is not provided.",
+    )
+    parser.add_argument(
+        "--pca-reference-stats-out",
+        type=Path,
+        default=None,
+        help="Output JSON for daily PCA reference stats.",
+    )
+    parser.add_argument(
+        "--pca-normalization",
+        choices=["zscore", "demean", "none"],
+        default="zscore",
+        help="Voxel normalization before PCA projection.",
+    )
+    parser.add_argument(
+        "--pca-score-metric",
+        choices=["projection", "cosine"],
+        default="projection",
+        help="PCA score metric for daily RS reference scoring.",
+    )
+    parser.add_argument(
         "--biopac-enable",
         action="store_true",
         help="Enable BIOPAC RetroTS regressors via TCP/file input.",
@@ -520,6 +623,12 @@ def main() -> None:
         default=1,
         help="Maximum parallel processing workers for DICOM handling.",
     )
+    parser.add_argument(
+        "--rt-max-scan-length",
+        type=int,
+        default=None,
+        help="Maximum TR count preallocated by RTPSpy regression.",
+    )
 
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
@@ -553,6 +662,8 @@ def main() -> None:
 
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
+    pca_workflow = args.pca_prep or args.pca_score
+    pca_reference_image = None
 
     ctx = mp.get_context("spawn")
     score_queue = ctx.Queue(maxsize=100)
@@ -625,6 +736,15 @@ def main() -> None:
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, args.sub, args.day)
+        if pca_workflow and args.pca_space in {"t1", "mni"}:
+            subject_root = base_data / f"sub-{args.sub}"
+            trans_dir = subject_root / args.day / "func" / "trans"
+            pca_reference_image = pca_rt.ensure_pca_t1_reference(
+                subject_root,
+                trans_dir,
+                args.pca_reference_image,
+                resolution=args.pca_reference_resolution,
+            )
 
         decoder_selected = bool(args.decoder_template)
         enable_scoring = decoder_selected and not args.no_score
@@ -639,7 +759,11 @@ def main() -> None:
             run=args.run,
             incoming_root=incoming_root,
             base_data=base_data,
-            decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+            decoder_template=(
+                Path(args.decoder_template)
+                if args.decoder_template
+                else pca_reference_image
+            ),
             enable_scoring=enable_scoring,
         )
 
@@ -667,6 +791,11 @@ def main() -> None:
                 "biopac_poll_interval": args.biopac_poll,
             }
         )
+        if args.rt_max_scan_length is not None:
+            settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
+        if pca_workflow:
+            settings_payload["analysis_space"] = args.pca_space
+            settings_payload["truncate_t1_to_epi_fov"] = False
 
         pipeline_process = ctx.Process(
             target=_run_pipeline_with_settings,
@@ -683,7 +812,20 @@ def main() -> None:
             _plot_qc(cfg.rt_work_dir)
 
         if args.pca_prep:
-            _run_pca_prep(base_data, args.sub, args.day, args.run)
+            _run_pca_prep(base_data, args.sub, args.day, args.run, args.pca_input)
+        if args.pca_score:
+            _run_pca_score(
+                base_data=base_data,
+                sub=args.sub,
+                day=args.day,
+                run=args.run,
+                decoder_day=args.pca_day,
+                decoder_run=args.pca_run,
+                pca_input=args.pca_input,
+                normalization=args.pca_normalization,
+                score_metric=args.pca_score_metric,
+                reference_stats_out=args.pca_reference_stats_out,
+            )
     finally:
         fixation_stop.set()
         fixation_process.join(timeout=5)

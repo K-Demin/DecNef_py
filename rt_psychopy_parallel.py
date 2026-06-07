@@ -17,6 +17,7 @@ from typing import Optional
 import numpy as np
 
 from rt_global_settings import load_regressor_settings
+import rs_pca_runtime as pca_rt
 
 
 log = logging.getLogger(__name__)
@@ -144,33 +145,58 @@ def _write_run_assignment(run_path: Path, condition: Condition, schedule_path: P
         json.dump(payload, f, indent=2)
 
 
+def _write_pca_run_assignment(
+    run_path: Path,
+    condition: pca_rt.PCACondition,
+    public_schedule_path: Path,
+) -> None:
+    public_payload = {
+        "condition_id": condition.condition_id,
+        "symbol": condition.symbol,
+        "schedule_path": str(public_schedule_path),
+    }
+    run_path.mkdir(parents=True, exist_ok=True)
+    with open(run_path / "condition_assignment.json", "w", encoding="utf-8") as f:
+        json.dump(public_payload, f, indent=2)
+
+
 def _append_condition_score(csv_path: Path, message: dict, condition: Condition) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
+    fieldnames = [
+        "volume_idx",
+        "timestamp",
+        "score_raw",
+        "feedback_score",
+        "score_z",
+        "raw_component_score",
+        "directed_score",
+        "condition_id",
+        "roi",
+        "pc",
+        "direction",
+        "symbol",
+    ]
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not exists:
-            writer.writerow(
-                [
-                    "volume_idx",
-                    "timestamp",
-                    "score_raw",
-                    "condition_id",
-                    "roi",
-                    "direction",
-                    "symbol",
-                ]
-            )
+            writer.writeheader()
+        blind_condition = bool(message.get("blind_condition", False))
         writer.writerow(
-            [
-                message.get("volume_idx"),
-                message.get("timestamp"),
-                message.get("score_raw"),
-                condition.condition_id,
-                condition.roi,
-                condition.direction,
-                condition.symbol,
-            ]
+            {
+                "volume_idx": message.get("volume_idx"),
+                "timestamp": message.get("timestamp"),
+                "score_raw": message.get("score_raw"),
+                "feedback_score": message.get("feedback_score"),
+                "score_z": message.get("score_z"),
+                "raw_component_score": message.get("raw_component_score"),
+                "directed_score": message.get("directed_score"),
+                "condition_id": condition.condition_id,
+                "roi": "" if blind_condition else getattr(condition, "roi", ""),
+                "pc": "" if blind_condition else getattr(condition, "pc", ""),
+                "direction": "" if blind_condition else getattr(condition, "direction", ""),
+                "symbol": condition.symbol,
+            }
         )
 
 
@@ -439,9 +465,9 @@ def run_psychopy_presentation(
         if not scores:
             score_line.vertices = [(origin_x, origin_y), (origin_x, origin_y)]
             if reg_ready_seen:
-                last_score_text.text = "Waiting for scores…"
+                last_score_text.text = "Waiting for scores..."
             else:
-                last_score_text.text = "Waiting for regression…"
+                last_score_text.text = "Waiting for regression..."
             needs_redraw = True
             return
 
@@ -490,8 +516,12 @@ def run_psychopy_presentation(
                                 "estimated_trigger_timestamp": f"{estimated_trigger_timestamp:.6f}",
                                 "watchdog_timestamp": f"{float(watchdog_timestamp):.6f}",
                                 "analysis_timestamp": f"{float(analysis_timestamp):.6f}",
-                                "trigger_to_watchdog_s": f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}",
-                                "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
+                                "trigger_to_watchdog_s": (
+                                    f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}"
+                                ),
+                                "watchdog_to_analysis_s": (
+                                    f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}"
+                                ),
                             },
                         )
 
@@ -658,6 +688,12 @@ def main() -> None:
 
     )
     parser.add_argument(
+        "--duration-min",
+        type=float,
+        default=None,
+        help="Stop after this many minutes, using TR from settings. Ignored if --max-trs is set.",
+    )
+    parser.add_argument(
         "--rs",
         dest="reference_score_run",
         help="Reference run ID for z-scoring (uses scores.csv from that run).",
@@ -671,9 +707,108 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--pca-day",
+        default=None,
+        help="Day/session whose PCA decoder bundles should be used. Defaults to --day.",
+    )
+    parser.add_argument(
+        "--pca-run",
+        default=None,
+        help="Run whose PCA decoder bundles should be used. Defaults to --run.",
+    )
+    parser.add_argument(
+        "--pca-root",
+        type=Path,
+        default=None,
+        help="Explicit PCA decoder root containing ROI folders.",
+    )
+    parser.add_argument(
+        "--pca-input",
+        choices=["auto", "mc", "reg", "t1"],
+        default="t1",
+        help="PCA decoder/output mode folder name.",
+    )
+    parser.add_argument(
+        "--pca-space",
+        choices=["epi", "t1", "mni"],
+        default="t1",
+        help="rt_pipeline output space to create for PCA feedback.",
+    )
+    parser.add_argument(
+        "--pca-reference-image",
+        type=Path,
+        default=None,
+        help="Explicit reference image/grid for PCA-space transforms.",
+    )
+    parser.add_argument(
+        "--pca-reference-resolution",
+        choices=["epi", "t1"],
+        default="epi",
+        help="Default PCA T1 reference resolution when --pca-reference-image is not provided.",
+    )
+    parser.add_argument(
+        "--pca-reference-stats",
+        type=Path,
+        default=None,
+        help="Daily RS reference stats JSON from rs_pca_score_all_rois.py.",
+    )
+    parser.add_argument(
+        "--pca-volume-kind",
+        choices=["reg", "mc", "unwarped", "t1", "mni"],
+        default=None,
+        help="Realtime volume folder to score with PCA.",
+    )
+    parser.add_argument(
+        "--pca-target-pc",
+        default="PC01",
+        help="PC to modulate for each ROI condition.",
+    )
+    parser.add_argument(
+        "--pca-normalization",
+        choices=["zscore", "demean", "none"],
+        default="zscore",
+        help="Voxel normalization before PCA projection.",
+    )
+    parser.add_argument(
+        "--pca-score-metric",
+        choices=["projection", "cosine"],
+        default="projection",
+        help="PCA score metric used for realtime feedback.",
+    )
+    parser.add_argument(
+        "--pca-poll-interval",
+        type=float,
+        default=0.05,
+        help="Seconds between checks for newly processed realtime volumes.",
+    )
+    parser.add_argument(
+        "--condition-index",
+        type=int,
+        default=None,
+        help="1-based condition index for this NF run. Defaults to numeric --run.",
+    )
+    parser.add_argument(
+        "--condition-private-key",
+        type=Path,
+        default=None,
+        help="Private A-F to ROI/direction mapping. Keep hidden from subject/experimenter.",
+    )
+    parser.add_argument(
+        "--condition-public-schedule",
+        type=Path,
+        default=None,
+        help="Blinded A-F schedule shown/recorded for the run.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         help="Maximum parallel processing workers for DICOM handling.",
+    )
+    parser.add_argument(
+        "--rt-max-scan-length",
+        type=int,
+        default=None,
+        help="Maximum TR count preallocated by RTPSpy regression.",
     )
     parser.add_argument(
         "--settings-file",
@@ -686,14 +821,33 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    max_trs = args.max_trs
+    if max_trs is None and args.duration_min is not None:
+        max_trs = int(round((float(args.duration_min) * 60.0) / float(REGRESSOR_SETTINGS.TR)))
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
+    base_data = Path(args.base_data)
+    subject_root = base_data / f"sub-{args.sub}"
+    trans_dir = subject_root / args.day / "func" / "trans"
+    pca_reference_image = None
+    if args.pca_mode and args.pca_space in {"t1", "mni"}:
+        pca_reference_image = pca_rt.ensure_pca_t1_reference(
+            subject_root,
+            trans_dir,
+            args.pca_reference_image,
+            resolution=args.pca_reference_resolution,
+        )
+    cfg_decoder_template = (
+        pca_reference_image
+        if args.pca_mode and pca_reference_image is not None
+        else Path(args.decoder_template) if args.decoder_template else None
+    )
     cfg = RTSessionConfig(
         subject=args.sub,
         day=args.day,
         run=args.run,
         incoming_root=Path(args.incoming_root),
-        base_data=Path(args.base_data),
-        decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        base_data=base_data,
+        decoder_template=cfg_decoder_template,
         reference_score_run=None if args.pca_mode else args.reference_score_run,
         enable_scoring=not args.pca_mode,
     )
@@ -716,48 +870,136 @@ def main() -> None:
             "biopac_poll_interval": args.biopac_poll,
         }
     )
+    if args.rt_max_scan_length is not None:
+        settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
+    if args.pca_mode:
+        settings_payload["analysis_space"] = args.pca_space
+        settings_payload["truncate_t1_to_epi_fov"] = False
+    pca_volume_kind = args.pca_volume_kind
+    if args.pca_mode and pca_volume_kind is None:
+        pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
 
     roi_labels = _parse_csv_list(args.roi_labels)
     direction_labels = _parse_csv_list(args.direction_labels)
     symbols = _parse_csv_list(args.condition_symbols)
     symbol_seed = args.symbol_seed
-    if symbol_seed is None:
+    if symbol_seed is None and not args.pca_mode:
         try:
             symbol_seed = int(args.sub)
         except ValueError:
             symbol_seed = None
-    symbols = _shuffle_symbols(symbols, symbol_seed)
-    conditions = _build_conditions(roi_labels, direction_labels, symbols)
-    schedule_path = cfg.subject_root / "condition_schedule.json"
-    schedule = _load_or_create_schedule(
-        schedule_path,
-        conditions,
-        seed=args.condition_seed,
-        symbol_seed=symbol_seed,
-    )
-    condition = _condition_for_run(schedule, args.run)
     run_dir = cfg.rt_work_dir
-    _write_run_assignment(run_dir, condition, schedule_path)
+    pca_day = None
+    pca_run = None
+    pca_root = None
+    if args.pca_mode:
+        private_key_path = args.condition_private_key or (
+            cfg.subject_root / "pca_condition_key_private.json"
+        )
+        public_schedule_path = args.condition_public_schedule or (
+            cfg.subject_root / "pca_condition_schedule_public.json"
+        )
+        schedule = pca_rt.load_or_create_condition_schedule(
+            private_path=private_key_path,
+            public_path=public_schedule_path,
+            roi_labels=roi_labels,
+            direction_labels=direction_labels,
+            symbols=symbols,
+            target_pc=args.pca_target_pc,
+            condition_seed=args.condition_seed,
+            symbol_seed=symbol_seed,
+        )
+        if args.condition_index is not None:
+            condition_index = args.condition_index
+        else:
+            try:
+                condition_index = int(args.run)
+            except ValueError:
+                condition_index = 1
+        condition = pca_rt.condition_for_index(schedule, condition_index)
+        _write_pca_run_assignment(
+            run_dir,
+            condition,
+            public_schedule_path,
+        )
+        pca_run = args.pca_run or args.run
+        pca_day = args.pca_day or args.day
+        pca_run_dir = pca_rt.build_run_dir(base_data, args.sub, pca_day, pca_run)
+        pca_day_dir = pca_run_dir.parent.parent
+        pca_root = args.pca_root or pca_rt.build_pca_root(
+            pca_day_dir,
+            pca_run_dir.name,
+            args.pca_input,
+        )
+        if not pca_root.exists():
+            raise FileNotFoundError(f"PCA decoder root not found: {pca_root}")
+    else:
+        symbols = _shuffle_symbols(symbols, symbol_seed)
+        conditions = _build_conditions(roi_labels, direction_labels, symbols)
+        schedule_path = cfg.subject_root / "condition_schedule.json"
+        schedule = _load_or_create_schedule(
+            schedule_path,
+            conditions,
+            seed=args.condition_seed,
+            symbol_seed=symbol_seed,
+        )
+        condition = _condition_for_run(schedule, args.run)
+        _write_run_assignment(run_dir, condition, schedule_path)
     condition_scores_path = run_dir / "scores_with_conditions.csv"
+
+    condition_payload = {
+        "condition_id": condition.condition_id,
+        "symbol": condition.symbol,
+    }
+    if not args.pca_mode:
+        condition_payload.update(
+            {
+                "roi": condition.roi,
+                "direction": condition.direction,
+            }
+        )
 
     _merge_session_metadata(
         run_dir,
         {
             "psychopy": {
                 "max_points": args.max_points,
+                "max_trs": max_trs,
+                "duration_min": args.duration_min,
                 "roi_labels": roi_labels,
                 "direction_labels": direction_labels,
                 "condition_symbols": symbols,
                 "condition_seed": args.condition_seed,
                 "symbol_seed": symbol_seed,
-                "condition_schedule": str(schedule_path),
-                "condition_assignment": {
-                    "condition_id": condition.condition_id,
-                    "roi": condition.roi,
-                    "direction": condition.direction,
-                    "symbol": condition.symbol,
-                },
+                "condition_schedule": str(
+                    public_schedule_path if args.pca_mode else schedule_path
+                ),
+                "condition_assignment": condition_payload,
                 "pca_mode": args.pca_mode,
+                "pca_decoder": {
+                    "day": pca_day,
+                    "run": pca_run,
+                    "root": str(pca_root) if pca_root else None,
+                    "input": args.pca_input,
+                    "space": args.pca_space,
+                    "reference_image": (
+                        str(pca_reference_image)
+                        if pca_reference_image
+                        else None
+                    ),
+                    "reference_resolution": args.pca_reference_resolution,
+                    "volume_kind": pca_volume_kind,
+                    "target_pc": args.pca_target_pc,
+                    "normalization": args.pca_normalization,
+                    "score_metric": args.pca_score_metric,
+                    "reference_stats": (
+                        str(args.pca_reference_stats)
+                        if args.pca_reference_stats
+                        else None
+                    ),
+                }
+                if args.pca_mode
+                else None,
             }
         },
     )
@@ -801,6 +1043,26 @@ def main() -> None:
         args=(cfg, score_queue, settings_payload),
     )
     pipeline_process.start()
+    pca_stop = ctx.Event()
+    pca_process = None
+    if args.pca_mode:
+        pca_process = ctx.Process(
+            target=pca_rt.run_realtime_pca_scorer,
+            kwargs={
+                "run_dir": run_dir,
+                "pca_root": pca_root,
+                "condition": condition,
+                "score_queue": score_queue,
+                "stop_event": pca_stop,
+                "reference_stats_path": args.pca_reference_stats,
+                "volume_kind": pca_volume_kind,
+                "normalization": args.pca_normalization,
+                "score_metric": args.pca_score_metric,
+                "max_trs": max_trs,
+                "poll_interval": args.pca_poll_interval,
+            },
+        )
+        pca_process.start()
 
     try:
         run_psychopy_presentation(
@@ -808,9 +1070,14 @@ def main() -> None:
             args.max_points,
             condition,
             condition_scores_path,
-            args.max_trs,
+            max_trs,
         )
     finally:
+        pca_stop.set()
+        if pca_process is not None:
+            if pca_process.is_alive():
+                pca_process.terminate()
+            pca_process.join(timeout=5)
         if pipeline_process.is_alive():
             pipeline_process.terminate()
         pipeline_process.join(timeout=5)
