@@ -115,6 +115,10 @@ def _elapsed(start: float) -> str:
     return f"{time.perf_counter() - start:.1f}s"
 
 
+def _parse_csv_list(value: str) -> list[str]:
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
 def score_components(volume_3d: np.ndarray, voxel_indices: np.ndarray, weights: np.ndarray, normalize: Optional[str] = None, norm_mean: Optional[np.ndarray] = None, norm_std: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Apply decoder weights to a single 3D EPI volume.
@@ -443,6 +447,27 @@ def _discover_roi_masks(search_dirs: Sequence[Path], roi_names: Sequence[str]) -
     return roi_masks
 
 
+def _print_roi_search_report(search_dirs: Sequence[Path], roi_names: Sequence[str], roi_masks: dict) -> None:
+    print("[ROI] Search report:", flush=True)
+    print("  expected ROIs:", ", ".join(roi_names), flush=True)
+    for d in search_dirs:
+        exists = d.exists()
+        if not exists:
+            print(f"  {d} : missing", flush=True)
+            continue
+        paths = _list_imaging_files(d)
+        print(f"  {d} : {len(paths)} imaging files", flush=True)
+        if paths:
+            for p in sorted(paths)[:12]:
+                print(f"    - {p.name}", flush=True)
+            if len(paths) > 12:
+                print(f"    ... {len(paths) - 12} more", flush=True)
+    if roi_masks:
+        print("  matched ROI masks:", flush=True)
+        for roi in roi_names:
+            print(f"    {roi}: {roi_masks.get(roi, 'NOT FOUND')}", flush=True)
+
+
 def _discover_optional_mask(search_dirs: Sequence[Path], name_keywords: Sequence[str]) -> Optional[Path]:
     all_paths: List[Path] = []
     for d in search_dirs:
@@ -694,9 +719,38 @@ def process_dataset(
     roi_search_dirs: Optional[Sequence[Path]] = None,
     mask_search_dirs: Optional[Sequence[Path]] = None,
     out_root: Optional[Path] = None,
-) -> None:
+) -> bool:
     dataset_t0 = time.perf_counter()
     print(f"\nProcessing dataset: {run_dir}", flush=True)
+    roi_dirs = list(roi_search_dirs or [run_dir])
+    mask_dirs = list(mask_search_dirs or roi_dirs)
+    out_root = out_root or run_dir / "PCA"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.perf_counter()
+    _log("[ROI] Discovering masks before loading RS data")
+    roi_masks = _discover_roi_masks(roi_dirs, roi_names)
+    _print_roi_search_report(roi_dirs, roi_names, roi_masks)
+    if not roi_masks:
+        summary = {
+            "status": "no_roi_masks_found",
+            "roi_names": list(roi_names),
+            "roi_search_dirs": [str(p) for p in roi_dirs],
+            "mask_search_dirs": [str(p) for p in mask_dirs],
+        }
+        with open(out_root / "roi_discovery_metadata.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(
+            "No ROI masks found; skipping PCA before expensive 4D load. "
+            f"Search metadata saved to {out_root / 'roi_discovery_metadata.json'}",
+            flush=True,
+        )
+        return False
+    _log(f"[ROI] Discovery done in {_elapsed(t0)}")
+
+    brain_mask_path = _discover_optional_mask(mask_dirs, ["brainmask", "mask_brain", "brain_mask"])
+    gm_mask_path = _discover_optional_mask(mask_dirs, ["gm_mask", "gmmask", "ribbon", "gm"])
+
     pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir, PCA_INPUT_MODE)
     tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
     print("[DEBUG PCA INPUT]")
@@ -760,20 +814,6 @@ def process_dataset(
     if motion_mat is not None and N_SKIP_START > 0:
         motion_mat = motion_mat[N_SKIP_START:, :]
 
-
-    roi_dirs = list(roi_search_dirs or [run_dir])
-    mask_dirs = list(mask_search_dirs or roi_dirs)
-
-    brain_mask_path = _discover_optional_mask(mask_dirs, ["brainmask", "mask_brain", "brain_mask"])
-    gm_mask_path = _discover_optional_mask(mask_dirs, ["gm_mask", "gmmask", "ribbon", "gm"])
-
-    roi_masks = _discover_roi_masks(roi_dirs, roi_names)
-    if not roi_masks:
-        print("No ROI masks found; skipping dataset.")
-        return
-
-    out_root = out_root or run_dir / "PCA"
-    out_root.mkdir(parents=True, exist_ok=True)
     _save_nifti_like(tsnr_img, tsnr_map, out_root / "tsnr_full.nii.gz")
 
     brain_mask, brain_affine = _load_optional_mask(brain_mask_path)
@@ -1083,6 +1123,7 @@ def process_dataset(
             ])
     print(f"QC summary saved to {qc_path}")
     print(f"Dataset finished in {_elapsed(dataset_t0)}", flush=True)
+    return True
 
 
 def _build_run_dir(base_data: Path, subj: str, day: str, run: str) -> Path:
@@ -1350,8 +1391,15 @@ def make_qc_plots(out_root: Path):
     import numpy as np
     import nibabel as nib
 
+    if not out_root.exists():
+        print(f"[QC] Output folder does not exist; skipping plots: {out_root}")
+        return
+
     plot_t0 = time.perf_counter()
     roi_dirs = sorted([p for p in out_root.iterdir() if p.is_dir()])
+    if not roi_dirs:
+        print(f"[QC] No ROI output folders under {out_root}; skipping plots.")
+        return
     print(f"[QC] Building plots for {len(roi_dirs)} ROI folders", flush=True)
     for idx, roi_dir in enumerate(roi_dirs, start=1):
         roi_t0 = time.perf_counter()
@@ -1464,6 +1512,25 @@ def main():
         help="Root data directory containing sub-*/day/func/run folders (default: ./data)",
     )
     parser.add_argument(
+        "--roi-names",
+        default=None,
+        help="Comma-separated ROI names to search for. Defaults to ROI_NAMES in the script.",
+    )
+    parser.add_argument(
+        "--roi-search-dir",
+        type=Path,
+        action="append",
+        default=None,
+        help="Directory to search recursively for ROI masks. Can be repeated.",
+    )
+    parser.add_argument(
+        "--mask-search-dir",
+        type=Path,
+        action="append",
+        default=None,
+        help="Directory to search recursively for optional brain/GM masks. Can be repeated.",
+    )
+    parser.add_argument(
         "--pca-svd-solver",
         choices=["randomized", "auto", "full"],
         default=None,
@@ -1491,8 +1558,10 @@ def main():
     )
     args = parser.parse_args()
 
-    global PCA_INPUT_MODE, PCA_SVD_SOLVER, COMPRESS_DECODER_BUNDLE
+    global ROI_NAMES, PCA_INPUT_MODE, PCA_SVD_SOLVER, COMPRESS_DECODER_BUNDLE
     global SAVE_COMPONENT_MAPS, MAKE_QC_PLOTS, VERBOSE
+    if args.roi_names is not None:
+        ROI_NAMES = _parse_csv_list(args.roi_names)
     if args.pca_input is not None:
         PCA_INPUT_MODE = args.pca_input
     if args.pca_svd_solver is not None:
@@ -1516,20 +1585,23 @@ def main():
 
     try:
         anat_dir = subj_dir / "anat"  # sub-00085/anat
-        roi_search_dirs = [anat_dir]  # ONLY subject anatomy
+        roi_search_dirs = args.roi_search_dir or [anat_dir]
+        mask_search_dirs = args.mask_search_dir or [run_dir, day_dir]
         if SEPARATE_OUTPUTS_BY_MODE:
             out_root = day_dir / "PCA" / run_dir.name / f"pca_{PCA_INPUT_MODE}"
         else:
             out_root = day_dir / "PCA" / run_dir.name
-        process_dataset(
+        processed = process_dataset(
             run_dir,
             ROI_NAMES,
             roi_search_dirs=roi_search_dirs,
-            mask_search_dirs=[run_dir, day_dir],  # masks (if any) can still be searched near run
+            mask_search_dirs=mask_search_dirs,
             out_root=out_root,
         )
-        if MAKE_QC_PLOTS:
+        if processed and MAKE_QC_PLOTS:
             make_qc_plots(out_root)
+        elif not processed:
+            print("Skipping QC plots because no ROI PCA outputs were created.")
         else:
             print("Skipping QC plots (--no-qc-plots).")
     except Exception as e:
