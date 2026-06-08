@@ -154,12 +154,13 @@ Running the pipeline
    - Run SynthMorph:
         - anat/warp_T1_to_MNI_synth.nii.gz
         - anat/T1_warped_to_MNI_synth.nii.gz
-   - Motion-correct the AP/PA fieldmap series internally and compute AP_mean.nii.gz and PA_mean.nii.gz in fmap/
-   - Align the AP/PA mean pair to the first BOLD EPI using one shared rigid transform:
-        - fmap/AP_mean_to_epi.nii
-        - fmap/PA_mean_to_epi.nii
-        - fmap/fmap_to_epi.mat
-   - Estimate the fieldmap on that first-EPI grid:
+   - Motion-correct the AP/PA fieldmap series to func/trans/rt_ref_epi.nii
+     using MCFLIRT -reffile, then average them:
+        - fmap/AP_mc.nii.gz
+        - fmap/PA_mc.nii.gz
+        - fmap/AP_mean.nii
+        - fmap/PA_mean.nii
+   - Estimate the fieldmap on that same RT motion-reference grid:
         - PyHySCO: fmap/pyhysco_epi-EstFieldMap.nii
         - ANTs fallback: fmap/AP2PA_epi_* transforms
    - For each run:
@@ -183,17 +184,19 @@ Motion Correction
 
 The preprocessing script now performs RTPSpy motion correction itself.
 
-For each func/run-XX, the first EPI volume is used as the motion reference for
-offline preprocessing. The script writes func/run-XX/epi_mc.nii and motion.1D,
-then applies the first-EPI-aligned AP/PA fieldmap to the motion-corrected EPI.
-The unwarped result is averaged into func/run-XX/epi_unwarped_mean.nii.gz,
-which is the reference used for EPI-to-T1 registration and nuisance-mask grids.
+For each func/run-XX, the script writes func/run-XX/epi_mc.nii and motion.1D.
+The first run establishes func/trans/rt_ref_epi.nii, the distorted-space motion
+reference used for both AP/PA fieldmap preparation and realtime volumes. AP and
+PA are motion-corrected to that same reference, averaged, and used to estimate
+the fieldmap. The fieldmap is then applied to the motion-corrected EPI. The
+unwarped result is averaged into func/run-XX/epi_unwarped_mean.nii.gz, which is
+the reference used for EPI-to-T1 registration and nuisance-mask grids.
 
 For realtime, rt_pipeline.py uses func/trans/rt_ref_epi.nii as the
 distorted-space RTPSpy motion reference. Each incoming volume is motion-corrected
-to that reference first, then the first-EPI-aligned fieldmap is applied. Regression,
-voxel normalization, EPI-to-T1/MNI transforms, and decoder scoring all operate on
-the unwarped analysis stream.
+to that reference first, then the rt_ref_epi-aligned fieldmap is applied.
+Regression, voxel normalization, EPI-to-T1/MNI transforms, and decoder scoring
+all operate on the unwarped analysis stream.
 
 
 Realtime / DecNef Usage

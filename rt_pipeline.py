@@ -422,7 +422,6 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
-    t1_reference_override: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -519,7 +518,7 @@ class RTSessionConfig:
         """
         Brain mask in the unwarped EPI reference grid.
         """
-        return self.trans_dir / "epi_mask_mean.nii"
+        return _prefer_uncompressed_nifti(self.trans_dir / "epi_mask_mean.nii")
 
     @property
     def rt_motion_ref_epi(self) -> Path:
@@ -562,8 +561,7 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     from gpu_ants_like_resampler import GpuAntsLikeResampler, precompute_sampling_grid
 
     if analysis_space == "t1":
-        decoder_template = resolve_decoder_template(cfg)
-        fixed_ref = cfg.t1_reference_override or decoder_template
+        fixed_ref = resolve_decoder_template(cfg)
         transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
         out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_t1"
     else:
@@ -583,6 +581,44 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     grid_path_npz = out_dir / "sampling_grid.npz"
     grid_path_pt = out_dir / "sampling_grid.pt"
     grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
+    if grid_path.exists():
+        try:
+            fixed_img = nib.load(str(fixed_ref))
+            payload = GpuAntsLikeResampler._load_payload(grid_path)
+            cached_shape = tuple(int(v) for v in payload["fixed_shape"])
+            cached_affine = np.asarray(payload["fixed_affine"], dtype=np.float64)
+            if cached_shape != fixed_img.shape[:3] or not np.allclose(
+                cached_affine,
+                fixed_img.affine,
+                atol=1e-3,
+            ):
+                log.warning(
+                    "[GPU] Existing sampling grid does not match current fixed reference; "
+                    "recomputing %s",
+                    out_dir,
+                )
+                for stale in [
+                    grid_path_npz,
+                    grid_path_pt,
+                    out_dir / "coord_x_in_fixed.nii",
+                    out_dir / "coord_y_in_fixed.nii",
+                    out_dir / "coord_z_in_fixed.nii",
+                ]:
+                    if stale.exists():
+                        stale.unlink()
+                grid_path = grid_path_npz
+        except Exception as exc:
+            log.warning("[GPU] Could not validate existing sampling grid %s: %s", grid_path, exc)
+            for stale in [
+                grid_path_npz,
+                grid_path_pt,
+                out_dir / "coord_x_in_fixed.nii",
+                out_dir / "coord_y_in_fixed.nii",
+                out_dir / "coord_z_in_fixed.nii",
+            ]:
+                if stale.exists():
+                    stale.unlink()
+            grid_path = grid_path_npz
     if not grid_path.exists():
         log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
         grid_path = precompute_sampling_grid(
@@ -669,18 +705,6 @@ def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHysc
     return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_distorted_motion_ref_epi)
 
 
-def _same_grid(a_path: Path, b_path: Path) -> bool:
-    try:
-        a_img = nib.load(str(a_path))
-        b_img = nib.load(str(b_path))
-    except Exception:
-        return False
-    return (
-        a_img.shape == b_img.shape
-        and np.allclose(a_img.affine, b_img.affine, atol=1e-3)
-    )
-
-
 def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
     """Prefer .nii, but transparently fall back to .nii.gz when needed."""
     if path_nii.exists():
@@ -689,101 +713,6 @@ def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
     if gz.exists():
         return gz
     return path_nii
-
-
-def maybe_prepare_truncated_t1_reference(cfg: RTSessionConfig) -> Optional[Path]:
-    """
-    Optionally crop T1-space reference to EPI coverage (in native T1 resolution).
-
-    Steps:
-      1) Warp epi_mask_mean -> T1 with epi2t1 transform (nearest-neighbor)
-      2) Compute bounding box of nonzero voxels + padding
-      3) Save cropped T1_N4 reference for fast per-volume EPI->T1 warps
-      4) If decoder template is on the same T1 grid, crop it with the same bbox
-         so scoring remains shape-compatible.
-    """
-    if not REGRESSOR_SETTINGS.truncate_t1_to_epi_fov:
-        return None
-
-    epi_mask = cfg.trans_dir / "epi_mask_mean.nii"
-    epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
-    t1_n4 = cfg.subject_root / "anat" / "T1_N4.nii"
-    if not t1_n4.exists():
-        t1_n4 = cfg.subject_root / "anat" / "T1.nii.gz"
-
-    if not (epi_mask.exists() and epi2t1.exists() and t1_n4.exists()):
-        log.warning(
-            "[TRANS] Cannot truncate T1 FOV (missing epi mask / transform / T1). "
-            "Using full T1 reference."
-        )
-        return None
-
-    pad = int(REGRESSOR_SETTINGS.truncate_t1_padding_vox)
-    trunc_dir = cfg.trans_dir / "truncated_t1_refs"
-    trunc_dir.mkdir(parents=True, exist_ok=True)
-    warped_mask_t1 = trunc_dir / "epi_mask_mean_in_t1.nii"
-    t1_trunc_path = trunc_dir / f"T1_N4_epi_fov_pad{pad}.nii"
-
-    warped_mask_t1_existing = _prefer_uncompressed_nifti(warped_mask_t1)
-    if not warped_mask_t1_existing.exists():
-        run(
-            [
-                "antsApplyTransforms",
-                "-d", "3",
-                "-i", str(epi_mask),
-                "-r", str(t1_n4),
-                "-o", str(warped_mask_t1),
-                "-t", str(epi2t1),
-                "-n", "NearestNeighbor",
-                "--float", "1",
-            ]
-        )
-
-    warped_mask_t1_existing = _prefer_uncompressed_nifti(warped_mask_t1)
-    try:
-        mask_img = nib.load(str(warped_mask_t1_existing))
-        mask_arr = np.asanyarray(mask_img.dataobj)
-    except Exception as exc:
-        log.warning("[TRANS] Could not read warped EPI mask %s: %s", warped_mask_t1_existing, exc)
-        return None
-
-    nz = np.argwhere(np.isfinite(mask_arr) & (mask_arr > 0))
-    if nz.size == 0:
-        log.warning("[TRANS] Warped EPI mask in T1 has zero support; using full T1 reference.")
-        return None
-
-    mins = np.maximum(nz.min(axis=0) - pad, 0)
-    maxs = np.minimum(nz.max(axis=0) + pad + 1, np.array(mask_arr.shape))
-    x0, y0, z0 = mins.tolist()
-    x1, y1, z1 = maxs.tolist()
-
-    if not t1_trunc_path.exists():
-        t1_img = nib.load(str(t1_n4))
-        t1_trunc = t1_img.slicer[x0:x1, y0:y1, z0:z1]
-        nib.save(t1_trunc, str(t1_trunc_path))
-        log.info(
-            "[TRANS] Truncated T1 reference saved: %s (%s -> %s)",
-            t1_trunc_path,
-            t1_img.shape,
-            t1_trunc.shape,
-        )
-
-    decoder_template = resolve_decoder_template(cfg)
-    if decoder_template.exists() and _same_grid(decoder_template, t1_n4):
-        decoder_trunc_path = trunc_dir / f"{decoder_template.stem}_epi_fov_pad{pad}.nii"
-        if not decoder_trunc_path.exists():
-            decoder_img = nib.load(str(decoder_template))
-            decoder_trunc = decoder_img.slicer[x0:x1, y0:y1, z0:z1]
-            nib.save(decoder_trunc, str(decoder_trunc_path))
-        cfg.decoder_template = decoder_trunc_path
-        log.info("[TRANS] Truncated decoder template saved: %s", decoder_trunc_path)
-    elif decoder_template.exists() and cfg.enable_scoring:
-        log.warning(
-            "[TRANS] T1 reference was truncated to EPI FOV but decoder template is not on T1 grid; "
-            "disable truncate_t1_to_epi_fov or provide a T1-grid decoder template."
-        )
-
-    return t1_trunc_path
 
 
 def resolve_decoder_roi_txt(cfg: RTSessionConfig) -> Optional[Path]:
@@ -1869,7 +1798,7 @@ def process_volume(
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
-        t1_ref = cfg.t1_reference_override or decoder_template
+        t1_ref = decoder_template
 
         if not decoder_template.exists():
             log.error(f"Decoder template not found at {decoder_template}")
@@ -2091,8 +2020,9 @@ def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
     warp, affine, ref_img = _resolve_ants_unwarp_inputs(cfg, fmap_dir, epi_pe)
 
     # NOTE: this fallback expects the input to already be motion-corrected.
-    # New AP2PA_epi_* transforms write into the distorted EPI motion-reference
-    # grid; legacy AP2PA_* transforms write into the AP/PA fieldmap grid.
+    # AP2PA_epi_* transforms are estimated from AP/PA already motion-corrected
+    # to rt_ref_epi.nii and write into the distorted EPI motion-reference grid.
+    # Legacy AP2PA_* transforms write into the AP/PA fieldmap grid.
 
     if not warp.exists() or not affine.exists():
         log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
@@ -2131,8 +2061,6 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         raise ValueError(
             "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
         )
-    t1_reference = maybe_prepare_truncated_t1_reference(cfg)
-    cfg.t1_reference_override = t1_reference
     decoder_template = resolve_decoder_template(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)

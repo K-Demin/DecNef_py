@@ -196,6 +196,38 @@ def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
     _log(f"[LOAD] shape={data.shape} dtype={data.dtype} done in {_elapsed(t0)}")
     return data, img.affine, img.header
 
+def compute_tsnr_streaming(nifti_path: Path, n_skip: int = 0):
+    img = nib.load(str(nifti_path))
+    shape = img.shape
+
+    if len(shape) != 4:
+        raise ValueError(f"Expected 4D NIfTI, got shape={shape}: {nifti_path}")
+
+    x, y, z, T = shape
+
+    sum_vol = np.zeros((x, y, z), dtype=np.float64)
+    sumsq_vol = np.zeros((x, y, z), dtype=np.float64)
+    n = 0
+
+    for t in range(n_skip, T):
+        vol = np.asarray(img.dataobj[..., t], dtype=np.float32)
+        sum_vol += vol
+        sumsq_vol += vol * vol
+        n += 1
+
+    mean_vol = sum_vol / max(n, 1)
+    var_vol = (sumsq_vol / max(n, 1)) - mean_vol ** 2
+    var_vol[var_vol < 0] = 0
+
+    std_vol = np.sqrt(var_vol)
+    tsnr_map = np.divide(
+        mean_vol,
+        np.where(std_vol == 0, np.inf, std_vol),
+    )
+    tsnr_map = np.nan_to_num(tsnr_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    return tsnr_map, img.affine, img.header, T, n
+
 
 def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Path]:
     """
@@ -633,6 +665,28 @@ def _corr_pc1_fd(pc1: np.ndarray, fd: np.ndarray) -> Optional[float]:
         return None
     return float(np.corrcoef(pc1, fd)[0, 1])
 
+def extract_roi_timeseries_streaming(
+    nifti_path: Path,
+    flat_indices: np.ndarray,
+    n_skip: int = 0,
+    keep: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    img = nib.load(str(nifti_path))
+    T = img.shape[3]
+
+    used_t = list(range(n_skip, T))
+    if keep is not None:
+        # keep is already after skip, same length as used_t
+        used_t = [t for t, k in zip(used_t, keep) if k]
+
+    roi_ts = np.empty((len(used_t), flat_indices.size), dtype=np.float32)
+
+    for i, t in enumerate(used_t):
+        vol = np.asarray(img.dataobj[..., t], dtype=np.float32)
+        roi_ts[i, :] = vol.reshape(-1)[flat_indices]
+
+    return roi_ts
+
 
 def process_dataset(
     run_dir: Path,
@@ -795,6 +849,7 @@ def process_dataset(
 
         if fd_vec is not None and FD_THRESH is not None:
             keep = fd_vec <= FD_THRESH
+
             if np.sum(keep) < 30:
                 print(f"  Warning: FD censoring leaves only {np.sum(keep)} TRs; skipping PCA.")
                 t_used = int(np.sum(keep))
@@ -812,10 +867,23 @@ def process_dataset(
                     )
                 )
                 continue
-            roi_ts = roi_ts[keep, :]
+
+            roi_ts = extract_roi_timeseries_streaming(
+                pca_rs_path,
+                flat_indices,
+                n_skip=N_SKIP_START,
+                keep=keep,
+            )
             fd_used = fd_vec[keep]
             tr_used = tr_idx[keep]
         else:
+            keep = None
+            roi_ts = extract_roi_timeseries_streaming(
+                pca_rs_path,
+                flat_indices,
+                n_skip=N_SKIP_START,
+                keep=None,
+            )
             fd_used = None
             tr_used = tr_idx[:roi_ts.shape[0]]
 
