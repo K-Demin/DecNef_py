@@ -36,7 +36,8 @@ SEED = 0
 #   "auto" : current behavior (prefer reg/, else mc/, else anything)
 #   "mc"   : force motion-corrected only (avoid regressed/denoised)
 #   "reg"  : force regressed/denoised only (prefer reg/)
-PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg"
+#   "t1"   : force T1-space realtime outputs
+PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg", "t1"
 SEPARATE_OUTPUTS_BY_MODE = True  # True => write outputs under .../PCA/<run>/pca_<mode>/
 
 N_SKIP_START = 25
@@ -184,20 +185,23 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
     Deterministic:
       - PCA input: depends on pca_mode (mc/reg/auto)
       - tSNR input: always from mc if possible
-      - builds analysis/rs_4d_mc.nii.gz from mc/ and analysis/rs_4d_reg.nii.gz from reg/
+      - builds analysis/rs_4d_mc.nii.gz from mc/, analysis/rs_4d_reg.nii.gz from reg/,
+        and analysis/rs_4d_t1.nii.gz from t1/ when requested
         (from 3D series if needed)
     """
     pca_mode = (pca_mode or "auto").lower()
-    if pca_mode not in ("auto", "mc", "reg"):
+    if pca_mode not in ("auto", "mc", "reg", "t1"):
         pca_mode = "auto"
 
     mc_dir = run_dir / "mc"
     reg_dir = run_dir / "reg"
+    t1_dir = run_dir / "t1"
     out_dir = run_dir / FSLMERGE_OUTDIR_NAME
     out_dir.mkdir(parents=True, exist_ok=True)
 
     merged_mc = out_dir / f"{PREFER_MERGED_BASENAME}_mc.nii.gz"
     merged_reg = out_dir / f"{PREFER_MERGED_BASENAME}_reg.nii.gz"
+    merged_t1 = out_dir / f"{PREFER_MERGED_BASENAME}_t1.nii.gz"
 
     def ensure_4d_from_dir(src_dir: Path, out_4d: Path, tag: str) -> Optional[Path]:
         """
@@ -240,6 +244,9 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
     # --- ensure reg 4D (for PCA in reg/auto) ---
     reg_4d = ensure_4d_from_dir(reg_dir, merged_reg, "reg")
 
+    # --- ensure t1 4D only when requested ---
+    t1_4d = ensure_4d_from_dir(t1_dir, merged_t1, "t1") if pca_mode == "t1" else None
+
     # --- choose PCA input deterministically ---
     if pca_mode == "mc":
         if mc_4d is None:
@@ -249,6 +256,10 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
         if reg_4d is None:
             raise FileNotFoundError("PCA_INPUT_MODE=reg but no reg 4D (or 3D series) found.")
         pca_rs = reg_4d
+    elif pca_mode == "t1":
+        if t1_4d is None:
+            raise FileNotFoundError("PCA_INPUT_MODE=t1 but no t1 4D (or 3D series) found.")
+        pca_rs = t1_4d
     else:
         # auto: prefer reg, else mc
         if reg_4d is not None:
@@ -259,7 +270,9 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
             raise FileNotFoundError("No mc or reg 4D found/built for auto mode.")
 
     # --- choose tSNR input deterministically (prefer mc) ---
-    if mc_4d is not None:
+    if pca_mode == "t1":
+        tsnr_rs = pca_rs
+    elif mc_4d is not None:
         tsnr_rs = mc_4d
     else:
         # fallback: if no mc exists, use PCA input (better than nothing)
@@ -522,6 +535,7 @@ def _prepare_roi(
     gm_mask: Optional[np.ndarray],
     output_dir: Path,
     run_dir: Path,  # <-- add this new argument
+    reference_space: str = "epi",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
     roi_mask, roi_affine = _load_mask_in_epi_space(
@@ -531,9 +545,12 @@ def _prepare_roi(
         tsnr_img_3d=reference_img,
         run_dir=run_dir,
         roi_out_dir=output_dir,
+        reference_space=reference_space,
     )
     if roi_mask is None:
-        raise ValueError(f"ROI {roi} could not be loaded/warped into EPI space: {roi_mask_path}")
+        raise ValueError(
+            f"ROI {roi} could not be loaded into {reference_space} space: {roi_mask_path}"
+        )
 
     if roi_affine is not None and not _affine_close(roi_affine, reference_img.affine):
         print(f"  Warning: ROI {roi} affine differs from RS affine; proceeding with caution.")
@@ -698,6 +715,7 @@ def process_dataset(
             gm_mask,
             roi_dir,
             run_dir,
+            reference_space=PCA_INPUT_MODE,
         )
 
         vox_orig = int(np.sum(roi_original_mask))
@@ -1135,15 +1153,24 @@ def _load_mask_in_epi_space(
     tsnr_img_3d: nib.Nifti1Image,
     run_dir: Path,
     roi_out_dir: Path,
+    reference_space: str = "epi",
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Returns (mask_bool_3d, affine) in EPI space.
-    If roi_mask_path is not in EPI space, tries to warp it using inverse epi2t1_Composite.h5.
+    Returns (mask_bool_3d, affine) in the current PCA reference space.
+    For EPI-like PCA inputs, T1 masks can be inverse-warped to EPI.
+    For T1 PCA inputs, masks must already match the T1 PCA grid.
     """
     # First try direct load
     data, aff, _ = _load_nifti(roi_mask_path)
     if data.shape == tsnr_map_3d.shape:
         return (data > 0), aff
+
+    if reference_space.lower() == "t1":
+        print(
+            f"  ROI {roi}: mask shape {data.shape} does not match "
+            f"T1 PCA shape {tsnr_map_3d.shape}; skipping."
+        )
+        return None, None
 
     # Try warp T1->EPI using inverse of epi2t1 composite
     comp = _find_epi2t1_composite(run_dir)
@@ -1280,9 +1307,12 @@ def main():
     parser.add_argument("-run", required=True, help="Run ID within the day (e.g., 1 or run-01)")
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg"],
+        choices=["auto", "mc", "reg", "t1"],
         default=None,
-        help="PCA input selection: auto (prefer reg), mc (force mc), reg (force reg). Overrides PCA_INPUT_MODE.",
+        help=(
+            "PCA input selection: auto (prefer reg), mc, reg, or t1. "
+            "Overrides PCA_INPUT_MODE."
+        ),
     )
     parser.add_argument(
         "--base-data",

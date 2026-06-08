@@ -854,6 +854,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
                 "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
                 "analysis_space": REGRESSOR_SETTINGS.analysis_space,
                 "voxel_norm_ref_volumes": REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+                "rt_max_scan_length": REGRESSOR_SETTINGS.rt_max_scan_length,
                 "pipeline_engine": REGRESSOR_SETTINGS.pipeline_engine,
                 "commit_wait_timeout_s": REGRESSOR_SETTINGS.commit_wait_timeout_s,
             },
@@ -979,7 +980,10 @@ class DICOMHandler(FileSystemEventHandler):
         )
 
         # --- RTPSpy Volreg ---
-        self.volreg = RtpVolreg(regmode='heptic')
+        self.volreg = RtpVolreg(
+            regmode='heptic',
+            max_scan_length=REGRESSOR_SETTINGS.rt_max_scan_length,
+        )
         self.volreg.ignore_init = 0
         self.volreg.save_proc = False
 
@@ -1109,7 +1113,7 @@ class DICOMHandler(FileSystemEventHandler):
                 mot_reg=REGRESSOR_SETTINGS.mot_reg,
                 max_poly_order=REGRESSOR_SETTINGS.max_poly_order,
                 TR=REGRESSOR_SETTINGS.TR,
-                max_scan_length=1000,  # or your typical max TR count for a run
+                max_scan_length=REGRESSOR_SETTINGS.rt_max_scan_length,
                 norm_ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
                 enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
                 enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
@@ -2328,6 +2332,12 @@ def main():
         help="Maximum parallel processing workers for DICOM handling.",
     )
     parser.add_argument(
+        "--rt-max-scan-length",
+        type=int,
+        default=REGRESSOR_SETTINGS.rt_max_scan_length,
+        help="Maximum TR count preallocated by RTPSpy regression.",
+    )
+    parser.add_argument(
         "--pipeline-engine",
         choices=["parallel_ordered", "legacy"],
         default=REGRESSOR_SETTINGS.pipeline_engine,
@@ -2370,6 +2380,7 @@ def main():
     REGRESSOR_SETTINGS.analysis_space = args.analysis_space
     REGRESSOR_SETTINGS.voxel_norm_ref_volumes = max(1, int(args.voxel_norm_ref_volumes))
     REGRESSOR_SETTINGS.max_workers = args.max_workers
+    REGRESSOR_SETTINGS.rt_max_scan_length = max(1, int(args.rt_max_scan_length))
     REGRESSOR_SETTINGS.pipeline_engine = args.pipeline_engine
     REGRESSOR_SETTINGS.commit_wait_timeout_s = max(0.1, float(args.commit_wait_timeout_s))
     REGRESSOR_SETTINGS.max_retries = args.max_retries
