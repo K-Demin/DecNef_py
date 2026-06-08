@@ -53,6 +53,25 @@ def build_pca_root(day_dir: Path, run: str, pca_input: str) -> Path:
     return day_dir / "PCA" / run_name / f"pca_{pca_input}"
 
 
+def default_condition_paths(subject_root: Path) -> tuple[Path, Path]:
+    return (
+        Path(subject_root) / "pca_condition_key_private.json",
+        Path(subject_root) / "pca_condition_schedule_public.json",
+    )
+
+
+def build_reference_stats_path(
+    base_data: Path,
+    subj: str,
+    day: str,
+    run: str,
+    pca_input: str,
+) -> Path:
+    run_dir = build_run_dir(base_data, subj, day, run)
+    day_dir = run_dir.parent.parent
+    return build_pca_root(day_dir, run_dir.name, pca_input) / "pca_reference_stats.json"
+
+
 def _find_first_existing(paths: list[Path]) -> Optional[Path]:
     for path in paths:
         if path.exists():

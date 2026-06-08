@@ -753,6 +753,16 @@ def main() -> None:
         help="Daily RS reference stats JSON from rs_pca_score_all_rois.py.",
     )
     parser.add_argument(
+        "--pca-reference-day",
+        default=None,
+        help="Day/session of the daily RS stats run. Defaults to --day when --pca-reference-run is set.",
+    )
+    parser.add_argument(
+        "--pca-reference-run",
+        default=None,
+        help="Run whose daily RS PCA reference stats should be used for feedback.",
+    )
+    parser.add_argument(
         "--pca-volume-kind",
         choices=["reg", "mc", "unwarped", "t1", "mni"],
         default=None,
@@ -893,12 +903,11 @@ def main() -> None:
     pca_run = None
     pca_root = None
     if args.pca_mode:
-        private_key_path = args.condition_private_key or (
-            cfg.subject_root / "pca_condition_key_private.json"
+        default_private_key, default_public_schedule = pca_rt.default_condition_paths(
+            cfg.subject_root
         )
-        public_schedule_path = args.condition_public_schedule or (
-            cfg.subject_root / "pca_condition_schedule_public.json"
-        )
+        private_key_path = args.condition_private_key or default_private_key
+        public_schedule_path = args.condition_public_schedule or default_public_schedule
         schedule = pca_rt.load_or_create_condition_schedule(
             private_path=private_key_path,
             public_path=public_schedule_path,
@@ -946,6 +955,29 @@ def main() -> None:
         condition = _condition_for_run(schedule, args.run)
         _write_run_assignment(run_dir, condition, schedule_path)
     condition_scores_path = run_dir / "scores_with_conditions.csv"
+    reference_stats_path = args.pca_reference_stats
+    reference_stats_day = args.pca_reference_day
+    reference_stats_run = args.pca_reference_run
+    if args.pca_mode:
+        if reference_stats_run is not None:
+            reference_stats_day = reference_stats_day or args.day
+            reference_stats_path = pca_rt.build_reference_stats_path(
+                base_data,
+                args.sub,
+                reference_stats_day,
+                reference_stats_run,
+                args.pca_input,
+            )
+        elif reference_stats_day is not None and reference_stats_path is None:
+            raise ValueError(
+                "--pca-reference-day requires --pca-reference-run unless "
+                "--pca-reference-stats is provided explicitly."
+            )
+        if reference_stats_path is not None and not reference_stats_path.exists():
+            raise FileNotFoundError(
+                f"PCA daily RS reference stats not found: {reference_stats_path}. "
+                "Run rs_realtime_parallel.py with --pca-score for that daily RS run first."
+            )
 
     condition_payload = {
         "condition_id": condition.condition_id,
@@ -993,10 +1025,12 @@ def main() -> None:
                     "normalization": args.pca_normalization,
                     "score_metric": args.pca_score_metric,
                     "reference_stats": (
-                        str(args.pca_reference_stats)
-                        if args.pca_reference_stats
+                        str(reference_stats_path)
+                        if reference_stats_path
                         else None
                     ),
+                    "reference_stats_day": reference_stats_day,
+                    "reference_stats_run": reference_stats_run,
                 }
                 if args.pca_mode
                 else None,
@@ -1054,7 +1088,7 @@ def main() -> None:
                 "condition": condition,
                 "score_queue": score_queue,
                 "stop_event": pca_stop,
-                "reference_stats_path": args.pca_reference_stats,
+                "reference_stats_path": reference_stats_path,
                 "volume_kind": pca_volume_kind,
                 "normalization": args.pca_normalization,
                 "score_metric": args.pca_score_metric,
