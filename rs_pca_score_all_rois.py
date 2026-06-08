@@ -82,6 +82,116 @@ def _load_4d(path: Path) -> np.ndarray:
     return data
 
 
+def _load_regression_keep_mask(
+    run_dir: Path,
+    t_expected: int,
+    *,
+    drop_first_ready: bool = True,
+) -> tuple[np.ndarray | None, dict]:
+    status_path = run_dir / "regression_status_rt.csv"
+    meta = {
+        "source": "regression_status_rt.csv",
+        "path": str(status_path),
+        "drop_first_ready": drop_first_ready,
+    }
+    if not status_path.exists():
+        meta["status"] = "missing"
+        return None, meta
+
+    ready = np.zeros(t_expected, dtype=bool)
+    rows_seen = 0
+    try:
+        with status_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+                meta["status"] = "missing_columns"
+                meta["columns"] = reader.fieldnames or []
+                return None, meta
+            for row in reader:
+                try:
+                    volume_idx = int(row["volume_idx"])
+                    reg_ready = bool(int(row["reg_ready"]))
+                except (TypeError, ValueError):
+                    continue
+                rows_seen += 1
+                if 1 <= volume_idx <= t_expected:
+                    ready[volume_idx - 1] = reg_ready
+    except Exception as exc:
+        meta["status"] = "read_failed"
+        meta["error"] = str(exc)
+        return None, meta
+
+    ready_idx = np.flatnonzero(ready)
+    meta["rows_seen"] = rows_seen
+    meta["ready_count"] = int(ready_idx.size)
+    if ready_idx.size == 0:
+        meta["status"] = "no_ready_volumes"
+        return None, meta
+
+    first_ready_zero = int(ready_idx[0])
+    keep = ready.copy()
+    if drop_first_ready:
+        keep[: first_ready_zero + 1] = False
+    else:
+        keep[:first_ready_zero] = False
+
+    meta.update(
+        {
+            "status": "ok",
+            "first_reg_ready_volume": first_ready_zero + 1,
+            "excluded_through_volume": first_ready_zero + 1 if drop_first_ready else first_ready_zero,
+            "kept_count": int(np.sum(keep)),
+            "excluded_count": int(t_expected - np.sum(keep)),
+        }
+    )
+    return keep, meta
+
+
+def _requires_regression_ready_filter(pca_input: str, input_path: Path | None = None) -> bool:
+    mode = str(pca_input).lower()
+    if mode in {"reg", "t1"}:
+        return True
+    if input_path is None:
+        return False
+    name = input_path.name.lower()
+    parent = input_path.parent.name.lower()
+    return parent in {"reg", "t1"} or "_reg" in name or "_t1" in name
+
+
+def _score_keep_mask(
+    run_dir: Path,
+    t_expected: int,
+    pca_input: str,
+    *,
+    input_path: Path | None = None,
+    include_pre_regression: bool,
+) -> tuple[np.ndarray, dict]:
+    if not include_pre_regression and _requires_regression_ready_filter(pca_input, input_path):
+        keep, meta = _load_regression_keep_mask(run_dir, t_expected, drop_first_ready=True)
+        if keep is not None:
+            print(
+                "[REGREADY] Scoring "
+                f"{meta['kept_count']}/{t_expected} volumes; "
+                f"first reg_ready volume={meta['first_reg_ready_volume']}, "
+                f"excluded through volume={meta['excluded_through_volume']}",
+                flush=True,
+            )
+            return keep, meta
+        raise FileNotFoundError(
+            "Cannot safely score regressed/T1 PCA input without usable regression_status_rt.csv: "
+            f"{meta}"
+        )
+
+    keep = np.ones(t_expected, dtype=bool)
+    meta = {
+        "source": "all_volumes",
+        "include_pre_regression": include_pre_regression,
+        "kept_count": int(t_expected),
+        "excluded_count": 0,
+    }
+    return keep, meta
+
+
 def _iter_roi_dirs(pca_root: Path) -> Iterable[Path]:
     for d in sorted(pca_root.iterdir()):
         if d.is_dir() and (d / "decoder_metadata.json").exists():
@@ -216,6 +326,11 @@ def main() -> None:
         action="store_true",
         help="Write reference stats to the default score output folder.",
     )
+    parser.add_argument(
+        "--include-pre-regression-volumes",
+        action="store_true",
+        help="Do not exclude pre-regression and first reg_ready volumes for reg/t1 inputs.",
+    )
     args = parser.parse_args()
     if args.post_normalization == "zscore" and args.reference_scores_csv is None:
         raise ValueError("--reference-scores-csv is required when --post-normalization=zscore")
@@ -256,6 +371,19 @@ def main() -> None:
 
     data_4d = _load_4d(score_4d_path)
     n_trs = data_4d.shape[3]
+    score_keep, score_keep_meta = _score_keep_mask(
+        run_dir,
+        n_trs,
+        args.pca_input,
+        input_path=score_4d_path,
+        include_pre_regression=args.include_pre_regression_volumes,
+    )
+    score_tr_indices = np.flatnonzero(score_keep)
+    if score_tr_indices.size < 2:
+        raise ValueError(
+            "PCA scoring volume filter leaves fewer than 2 TRs "
+            f"({score_tr_indices.size}/{n_trs}): {score_keep_meta}"
+        )
 
     roi_decoders: dict[str, dict] = {}
     for roi_dir in _iter_roi_dirs(decoder_pca_root):
@@ -285,9 +413,9 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for tr in range(n_trs):
+        for tr in score_tr_indices:
             vol = data_4d[..., tr]
-            row = {"tr": tr + 1}
+            row = {"tr": int(tr) + 1}
             for roi in sorted(roi_decoders):
                 dec = roi_decoders[roi]
                 pcs = score_pca_volume(
@@ -320,7 +448,9 @@ def main() -> None:
         "score_metric": args.score_metric,
         "post_normalization": args.post_normalization,
         "reference_scores_csv": str(args.reference_scores_csv) if args.reference_scores_csv else None,
-        "n_trs": int(n_trs),
+        "n_trs": int(score_tr_indices.size),
+        "n_trs_original": int(n_trs),
+        "initial_volume_filter": score_keep_meta,
         "rois": sorted(roi_decoders.keys()),
         "pc_counts": pc_counts,
         "scores_csv": str(out_csv),

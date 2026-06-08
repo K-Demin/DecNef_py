@@ -569,6 +569,120 @@ def _discover_fd_vector(data_dir: Path, t_expected: int) -> Optional[np.ndarray]
         return None
 
 
+def _load_regression_keep_mask(
+    run_dir: Path,
+    t_expected: int,
+    *,
+    drop_first_ready: bool = True,
+) -> tuple[Optional[np.ndarray], dict]:
+    status_path = run_dir / "regression_status_rt.csv"
+    meta = {
+        "source": "regression_status_rt.csv",
+        "path": str(status_path),
+        "drop_first_ready": drop_first_ready,
+    }
+    if not status_path.exists():
+        meta["status"] = "missing"
+        return None, meta
+
+    ready = np.zeros(t_expected, dtype=bool)
+    rows_seen = 0
+    try:
+        with status_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+                meta["status"] = "missing_columns"
+                meta["columns"] = reader.fieldnames or []
+                return None, meta
+            for row in reader:
+                try:
+                    volume_idx = int(row["volume_idx"])
+                    reg_ready = bool(int(row["reg_ready"]))
+                except (TypeError, ValueError):
+                    continue
+                rows_seen += 1
+                if 1 <= volume_idx <= t_expected:
+                    ready[volume_idx - 1] = reg_ready
+    except Exception as exc:
+        meta["status"] = "read_failed"
+        meta["error"] = str(exc)
+        return None, meta
+
+    ready_idx = np.flatnonzero(ready)
+    meta["rows_seen"] = rows_seen
+    meta["ready_count"] = int(ready_idx.size)
+    if ready_idx.size == 0:
+        meta["status"] = "no_ready_volumes"
+        return None, meta
+
+    first_ready_zero = int(ready_idx[0])
+    keep = ready.copy()
+    if drop_first_ready:
+        keep[: first_ready_zero + 1] = False
+    else:
+        keep[:first_ready_zero] = False
+
+    meta.update(
+        {
+            "status": "ok",
+            "first_reg_ready_volume": first_ready_zero + 1,
+            "excluded_through_volume": first_ready_zero + 1 if drop_first_ready else first_ready_zero,
+            "kept_count": int(np.sum(keep)),
+            "excluded_count": int(t_expected - np.sum(keep)),
+        }
+    )
+    return keep, meta
+
+
+def _requires_regression_ready_filter(pca_input_mode: str, pca_rs_path: Optional[Path] = None) -> bool:
+    mode = str(pca_input_mode).lower()
+    if mode in {"reg", "t1"}:
+        return True
+    if pca_rs_path is None:
+        return False
+    name = pca_rs_path.name.lower()
+    parent = pca_rs_path.parent.name.lower()
+    return parent in {"reg", "t1"} or "_reg" in name or "_t1" in name
+
+
+def _initial_keep_mask(
+    run_dir: Path,
+    t_expected: int,
+    pca_input_mode: str,
+    pca_rs_path: Optional[Path] = None,
+) -> tuple[np.ndarray, dict]:
+    if _requires_regression_ready_filter(pca_input_mode, pca_rs_path):
+        keep, meta = _load_regression_keep_mask(run_dir, t_expected, drop_first_ready=True)
+        if keep is not None:
+            print(
+                "[REGREADY] Keeping "
+                f"{meta['kept_count']}/{t_expected} volumes; "
+                f"first reg_ready volume={meta['first_reg_ready_volume']}, "
+                f"excluded through volume={meta['excluded_through_volume']}",
+                flush=True,
+            )
+            return keep, meta
+        raise FileNotFoundError(
+            "Cannot safely use regressed/T1 PCA input without usable regression_status_rt.csv: "
+            f"{meta}"
+        )
+
+    keep = np.ones(t_expected, dtype=bool)
+    if N_SKIP_START > 0:
+        keep[: min(N_SKIP_START, t_expected)] = False
+    meta = {
+        "source": "N_SKIP_START",
+        "n_skip_start": int(N_SKIP_START),
+        "kept_count": int(np.sum(keep)),
+        "excluded_count": int(t_expected - np.sum(keep)),
+    }
+    print(
+        f"[SKIP] Keeping {meta['kept_count']}/{t_expected} volumes after N_SKIP_START={N_SKIP_START}",
+        flush=True,
+    )
+    return keep, meta
+
+
 
 def _affine_close(a1: np.ndarray, a2: np.ndarray, tol: float = 1e-3) -> bool:
     return np.allclose(a1, a2, atol=tol)
@@ -795,13 +909,23 @@ def process_dataset(
 
     same_rs_input = pca_rs_path.resolve() == tsnr_rs_path.resolve()
     t_all_full = tsnr_data.shape[3]
+    initial_keep, initial_keep_meta = _initial_keep_mask(
+        run_dir,
+        t_all_full,
+        PCA_INPUT_MODE,
+        pca_rs_path,
+    )
+    if int(np.sum(initial_keep)) < 30:
+        raise ValueError(
+            "Initial PCA volume filter leaves fewer than 30 TRs "
+            f"({int(np.sum(initial_keep))}/{t_all_full}): {initial_keep_meta}"
+        )
 
-    if N_SKIP_START > 0:
-        tsnr_data = tsnr_data[..., N_SKIP_START:]
+    tsnr_data = tsnr_data[..., initial_keep]
 
     t_all = tsnr_data.shape[3]
 
-    tr_idx = np.arange(1 + N_SKIP_START, 1 + N_SKIP_START + t_all)
+    tr_idx = np.flatnonzero(initial_keep) + 1
 
     t0 = time.perf_counter()
     _log(f"[tSNR] Computing map from {t_all} TRs")
@@ -823,10 +947,12 @@ def process_dataset(
         pca_affine = tsnr_affine
     else:
         pca_data, pca_affine, pca_hdr = _load_nifti(pca_rs_path)
-        if N_SKIP_START > 0:
-            if pca_data.shape[3] <= N_SKIP_START:
-                raise ValueError(f"Not enough TRs for PCA after skipping {N_SKIP_START}")
-            pca_data = pca_data[..., N_SKIP_START:]
+        if pca_data.shape[3] != t_all_full:
+            raise ValueError(
+                f"PCA RS and tSNR RS have different TR counts: "
+                f"PCA={pca_data.shape[3]}, tSNR={t_all_full}"
+            )
+        pca_data = pca_data[..., initial_keep]
         del tsnr_data
 
     if pca_data.shape[:3] != tsnr_map.shape:
@@ -837,12 +963,12 @@ def process_dataset(
     _log(f"[PCA INPUT] Keeping 4D data in memory for direct ROI extraction: shape={pca_data.shape}")
 
     fd_vec = _discover_fd_vector(run_dir, t_all_full)
-    if fd_vec is not None and N_SKIP_START > 0:
-        fd_vec = fd_vec[N_SKIP_START:]
+    if fd_vec is not None:
+        fd_vec = fd_vec[initial_keep]
     # --- motion (load full length, then apply same trimming/masking as PCA) ---
     motion_mat = _load_motion_1d(run_dir, t_all_full) if USE_MOTION_QC else None
-    if motion_mat is not None and N_SKIP_START > 0:
-        motion_mat = motion_mat[N_SKIP_START:, :]
+    if motion_mat is not None:
+        motion_mat = motion_mat[initial_keep, :]
 
     _save_nifti_like(tsnr_img, tsnr_map, out_root / "tsnr_full.nii.gz")
 
@@ -1092,8 +1218,11 @@ def process_dataset(
             "pca_svd_solver": PCA_SVD_SOLVER,
             "compress_decoder_bundle": COMPRESS_DECODER_BUNDLE,
             "save_component_maps": SAVE_COMPONENT_MAPS,
+            "initial_volume_filter": initial_keep_meta,
             "voxel_count": vox_selected,
             "t_original": t_all,
+            "t_original_full": t_all_full,
+            "t_after_initial_filter": t_all,
             "t_used": t_used,
             "motion_file": str(run_dir / "motion_rt.1D") if (run_dir / "motion_rt.1D").exists() else None,
             "pc_motion_qc": motion_qc,
