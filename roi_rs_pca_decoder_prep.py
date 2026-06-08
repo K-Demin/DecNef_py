@@ -834,11 +834,7 @@ def process_dataset(
     if not _affine_close(pca_affine, tsnr_affine):
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
 
-    t0 = time.perf_counter()
-    _log("[PCA INPUT] Creating flattened 2D view once")
-    pca_data_2d = pca_data.reshape(-1, pca_data.shape[3]).astype(np.float32, copy=False)
-    _log(f"[PCA INPUT] Flat shape={pca_data_2d.shape} done in {_elapsed(t0)}")
-    del pca_data
+    _log(f"[PCA INPUT] Keeping 4D data in memory for direct ROI extraction: shape={pca_data.shape}")
 
     fd_vec = _discover_fd_vector(run_dir, t_all_full)
     if fd_vec is not None and N_SKIP_START > 0:
@@ -917,13 +913,17 @@ def process_dataset(
 
         flat_indices = np.flatnonzero(selected_mask)
         t0 = time.perf_counter()
-        _log(f"    [ROI {roi}] Extracting {flat_indices.size} voxels x {pca_data_2d.shape[1]} TRs")
-        roi_ts = np.ascontiguousarray(pca_data_2d[flat_indices, :].T)
+        _log(f"    [ROI {roi}] Extracting {flat_indices.size} voxels x {pca_data.shape[3]} TRs")
+        roi_ts = np.ascontiguousarray(pca_data[selected_mask, :].T)
         _log(f"    [ROI {roi}] Extracted matrix {roi_ts.shape} in {_elapsed(t0)}")
 
         if fd_vec is not None and FD_THRESH is not None:
+            t0 = time.perf_counter()
             keep = fd_vec <= FD_THRESH
-
+            _log(
+                f"    [ROI {roi}] FD censoring keeps {int(np.sum(keep))}/{keep.size} TRs "
+                f"(threshold={FD_THRESH})"
+            )
             if np.sum(keep) < 30:
                 print(f"  Warning: FD censoring leaves only {np.sum(keep)} TRs; skipping PCA.")
                 t_used = int(np.sum(keep))
@@ -942,22 +942,12 @@ def process_dataset(
                 )
                 continue
 
-            roi_ts = extract_roi_timeseries_streaming(
-                pca_rs_path,
-                flat_indices,
-                n_skip=N_SKIP_START,
-                keep=keep,
-            )
+            roi_ts = np.ascontiguousarray(roi_ts[keep, :])
             fd_used = fd_vec[keep]
             tr_used = tr_idx[keep]
+            _log(f"    [ROI {roi}] FD censoring done in {_elapsed(t0)}")
         else:
             keep = None
-            roi_ts = extract_roi_timeseries_streaming(
-                pca_rs_path,
-                flat_indices,
-                n_skip=N_SKIP_START,
-                keep=None,
-            )
             fd_used = None
             tr_used = tr_idx[:roi_ts.shape[0]]
 
@@ -996,6 +986,8 @@ def process_dataset(
                 print(
                     "Warning: motion regression requested but motion/roi_ts alignment failed; skipping motion regression.")
 
+        t0 = time.perf_counter()
+        _log(f"    [ROI {roi}] Normalizing voxel timeseries (zscore={USE_ZSCORE})")
         if USE_ZSCORE:
             mean_vox = np.mean(roi_ts, axis=0)
             std_vox = np.std(roi_ts, axis=0)
@@ -1006,6 +998,7 @@ def process_dataset(
             std_vox = np.std(roi_ts, axis=0)
             roi_ts_proc = roi_ts - mean_vox
             std_safe = np.where(std_vox == 0, 1.0, std_vox)
+        _log(f"    [ROI {roi}] Normalization done in {_elapsed(t0)}")
 
         t0 = time.perf_counter()
         _log(
