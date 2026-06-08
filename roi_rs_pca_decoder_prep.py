@@ -56,6 +56,11 @@ AUTO_FSLMERGE_4D = True
 FSLMERGE_OUTDIR_NAME = "analysis"  # where to write the merged 4D under run_dir
 PREFER_MERGED_BASENAME = "rs_4d"   # filename stem: rs_4d_mc.nii.gz / rs_4d_reg.nii.gz
 USE_MOTION_QC = True              # load motion_rt.1D and compute PC1 motion corr
+PCA_SVD_SOLVER = "randomized"     # much faster than auto/full for small n_components
+COMPRESS_DECODER_BUNDLE = False   # np.savez is much faster; np.load reads both forms
+SAVE_COMPONENT_MAPS = True        # PC*.nii.gz maps are useful but slow on large grids
+MAKE_QC_PLOTS = True              # PNG plotting is useful but can be disabled for speed
+VERBOSE = True
 
 # ----------------------
 
@@ -66,13 +71,13 @@ from dataclasses import dataclass
 from importlib import util
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
+import time
 
 import nibabel as nib
 import numpy as np
 import re
 import subprocess
 from pathlib import Path
-import matplotlib.pyplot as plt
 
 @dataclass
 class DiscoveredInputs:
@@ -100,6 +105,15 @@ class QCRow:
 # -----------------------------------------------------------------------------
 # Utility helpers
 # -----------------------------------------------------------------------------
+
+def _log(message: str) -> None:
+    if VERBOSE:
+        print(message, flush=True)
+
+
+def _elapsed(start: float) -> str:
+    return f"{time.perf_counter() - start:.1f}s"
+
 
 def score_components(volume_3d: np.ndarray, voxel_indices: np.ndarray, weights: np.ndarray, normalize: Optional[str] = None, norm_mean: Optional[np.ndarray] = None, norm_std: Optional[np.ndarray] = None) -> np.ndarray:
     """
@@ -174,11 +188,12 @@ def _rs_priority_for_tsnr(path: Path) -> Tuple[int, int, int]:
     return (dir_score, 0 if has_pre else 1, 1 if has_denoise else 0)
 
 
-def _load_nifti(path: Path, load_data: bool = True):
+def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
+    t0 = time.perf_counter()
+    _log(f"[LOAD] {path}")
     img = nib.load(str(path))
-    if not load_data:
-        return img, img.affine, img.header
-    data = np.asarray(img.dataobj, dtype=np.float32)
+    data = img.get_fdata(dtype=np.float32)
+    _log(f"[LOAD] shape={data.shape} dtype={data.dtype} done in {_elapsed(t0)}")
     return data, img.affine, img.header
 
 def compute_tsnr_streaming(nifti_path: Path, n_skip: int = 0):
@@ -525,7 +540,13 @@ def _save_nifti_like(reference: nib.Nifti1Image, data: np.ndarray, path: Path):
     nib.save(img, str(path))
 
 
-def _compute_pca(data: np.ndarray, n_components: int, random_state: int, use_sklearn: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _compute_pca(
+    data: np.ndarray,
+    n_components: int,
+    random_state: int,
+    use_sklearn: bool,
+    svd_solver: str = "randomized",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     data: (T, V)
     Returns components (n_components, V), explained_ratio (n_components,), timecourses (T, n_components)
@@ -537,7 +558,11 @@ def _compute_pca(data: np.ndarray, n_components: int, random_state: int, use_skl
     if use_sklearn:
         from sklearn.decomposition import PCA  # type: ignore
 
-        pca = PCA(n_components=n_components, svd_solver="auto", random_state=random_state)
+        pca = PCA(
+            n_components=n_components,
+            svd_solver=svd_solver,
+            random_state=random_state,
+        )
         timecourses = pca.fit_transform(data)
         components = pca.components_
         explained = pca.explained_variance_ratio_
@@ -670,25 +695,62 @@ def process_dataset(
     mask_search_dirs: Optional[Sequence[Path]] = None,
     out_root: Optional[Path] = None,
 ) -> None:
-    print(f"\nProcessing dataset: {run_dir}")
+    dataset_t0 = time.perf_counter()
+    print(f"\nProcessing dataset: {run_dir}", flush=True)
     pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir, PCA_INPUT_MODE)
-    tsnr_map, tsnr_affine, tsnr_hdr, t_all_full, t_all = compute_tsnr_streaming(
-        tsnr_rs_path,
-        n_skip=N_SKIP_START,
-    )
+    tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
+    print("[DEBUG PCA INPUT]")
+    print("  pca_rs_path =", pca_rs_path)
+    print("  tsnr_rs_path =", tsnr_rs_path)
+    print("  pca_rs inode =", pca_rs_path.stat().st_ino)
+    print("  tsnr inode  =", tsnr_rs_path.stat().st_ino)
+
+    same_rs_input = pca_rs_path.resolve() == tsnr_rs_path.resolve()
+    t_all_full = tsnr_data.shape[3]
+
+    if N_SKIP_START > 0:
+        tsnr_data = tsnr_data[..., N_SKIP_START:]
+
+    t_all = tsnr_data.shape[3]
 
     tr_idx = np.arange(1 + N_SKIP_START, 1 + N_SKIP_START + t_all)
 
+    t0 = time.perf_counter()
+    _log(f"[tSNR] Computing map from {t_all} TRs")
+    tsnr_mean = np.mean(tsnr_data, axis=3)
+    tsnr_std = np.std(tsnr_data, axis=3)
+    tsnr_map = np.divide(
+        tsnr_mean,
+        np.where(tsnr_std == 0, np.inf, tsnr_std),
+    )
+    tsnr_map = np.nan_to_num(tsnr_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    del tsnr_mean, tsnr_std
+    _log(f"[tSNR] Done in {_elapsed(t0)}")
+
     tsnr_img = nib.Nifti1Image(tsnr_map, tsnr_affine, tsnr_hdr)
 
-    pca_img = nib.load(str(pca_rs_path))
-    pca_affine = pca_img.affine
-    pca_hdr = pca_img.header
+    if same_rs_input:
+        _log("[LOAD] PCA and tSNR use the same 4D file; reusing loaded data")
+        pca_data = tsnr_data
+        pca_affine = tsnr_affine
+    else:
+        pca_data, pca_affine, pca_hdr = _load_nifti(pca_rs_path)
+        if N_SKIP_START > 0:
+            if pca_data.shape[3] <= N_SKIP_START:
+                raise ValueError(f"Not enough TRs for PCA after skipping {N_SKIP_START}")
+            pca_data = pca_data[..., N_SKIP_START:]
+        del tsnr_data
 
-    if pca_img.shape[:3] != tsnr_map.shape:
+    if pca_data.shape[:3] != tsnr_map.shape:
         raise ValueError("Spatial dimensions of PCA RS and tSNR RS differ")
     if not _affine_close(pca_affine, tsnr_affine):
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
+
+    t0 = time.perf_counter()
+    _log("[PCA INPUT] Creating flattened 2D view once")
+    pca_data_2d = pca_data.reshape(-1, pca_data.shape[3]).astype(np.float32, copy=False)
+    _log(f"[PCA INPUT] Flat shape={pca_data_2d.shape} done in {_elapsed(t0)}")
+    del pca_data
 
     fd_vec = _discover_fd_vector(run_dir, t_all_full)
     if fd_vec is not None and N_SKIP_START > 0:
@@ -736,7 +798,7 @@ def process_dataset(
     qc_rows: List[QCRow] = []
     use_sklearn = util.find_spec("sklearn") is not None
 
-    for roi in roi_names:
+    for roi_idx, roi in enumerate(roi_names, start=1):
         if roi not in roi_masks:
             print(f"ROI {roi} not found; skipping.")
             continue
@@ -744,7 +806,8 @@ def process_dataset(
         roi_dir = out_root / roi
         roi_dir.mkdir(exist_ok=True)
 
-        print(f"  ROI: {roi} | mask: {roi_path}")
+        roi_t0 = time.perf_counter()
+        print(f"  ROI {roi_idx}/{len(roi_names)}: {roi} | mask: {roi_path}", flush=True)
         selected_mask, tsnr_selected, tsnr_in_roi, roi_original_mask, combined_mask = _prepare_roi(
             roi,
             roi_path,
@@ -779,6 +842,10 @@ def process_dataset(
             continue
 
         flat_indices = np.flatnonzero(selected_mask)
+        t0 = time.perf_counter()
+        _log(f"    [ROI {roi}] Extracting {flat_indices.size} voxels x {pca_data_2d.shape[1]} TRs")
+        roi_ts = np.ascontiguousarray(pca_data_2d[flat_indices, :].T)
+        _log(f"    [ROI {roi}] Extracted matrix {roi_ts.shape} in {_elapsed(t0)}")
 
         if fd_vec is not None and FD_THRESH is not None:
             keep = fd_vec <= FD_THRESH
@@ -866,12 +933,19 @@ def process_dataset(
             roi_ts_proc = roi_ts - mean_vox
             std_safe = np.where(std_vox == 0, 1.0, std_vox)
 
+        t0 = time.perf_counter()
+        _log(
+            f"    [ROI {roi}] PCA solver={PCA_SVD_SOLVER} "
+            f"components={N_COMPONENTS} matrix={roi_ts_proc.shape}"
+        )
         components, explained, timecourses = _compute_pca(
             roi_ts_proc,
             N_COMPONENTS,
             SEED,
             use_sklearn,
+            PCA_SVD_SOLVER,
         )
+        _log(f"    [ROI {roi}] PCA done in {_elapsed(t0)}")
 
         if timecourses.shape[0] == 0:
             print(f"  Warning: PCA failed for ROI {roi}; skipping outputs.")
@@ -905,6 +979,8 @@ def process_dataset(
         motion_qc = _pc_motion_qc(timecourses, motion_used) if USE_MOTION_QC else None
 
         # Save outputs (same naming/layout across ROIs for downstream scoring scripts)
+        t0 = time.perf_counter()
+        _log(f"    [ROI {roi}] Saving decoder outputs")
         np.save(roi_dir / "pca_explained.npy", explained)
         np.save(roi_dir / "pca_timecourses.npy", timecourses)
         np.save(roi_dir / "decoder_voxel_indices.npy", flat_indices)
@@ -912,22 +988,26 @@ def process_dataset(
         np.save(roi_dir / "decoder_norm_mean.npy", mean_vox.astype(np.float32))
         np.save(roi_dir / "decoder_norm_std.npy", std_safe.astype(np.float32))
         # Single-file bundle for robust loading (keeps all arrays in one consistent container).
-        np.savez_compressed(
-            roi_dir / "decoder_bundle.npz",
-            voxel_indices=flat_indices.astype(np.int64, copy=False),
-            weights=components.astype(np.float32, copy=False),
-            norm_mean=mean_vox.astype(np.float32, copy=False),
-            norm_std=std_safe.astype(np.float32, copy=False),
-            explained=explained.astype(np.float32, copy=False),
-            timecourses=timecourses.astype(np.float32, copy=False),
-        )
+        bundle_payload = {
+            "voxel_indices": flat_indices.astype(np.int64, copy=False),
+            "weights": components.astype(np.float32, copy=False),
+            "norm_mean": mean_vox.astype(np.float32, copy=False),
+            "norm_std": std_safe.astype(np.float32, copy=False),
+            "explained": explained.astype(np.float32, copy=False),
+            "timecourses": timecourses.astype(np.float32, copy=False),
+        }
+        if COMPRESS_DECODER_BUNDLE:
+            np.savez_compressed(roi_dir / "decoder_bundle.npz", **bundle_payload)
+        else:
+            np.savez(roi_dir / "decoder_bundle.npz", **bundle_payload)
 
         reference_img = tsnr_img
-        for i in range(components.shape[0]):
-            comp_map = np.zeros(selected_mask.shape, dtype=np.float32)
-            comp_map[selected_mask] = components[i]
-            comp_path = roi_dir / f"PC{i+1:02d}.nii.gz"
-            _save_nifti_like(reference_img, comp_map, comp_path)
+        if SAVE_COMPONENT_MAPS:
+            for i in range(components.shape[0]):
+                comp_map = np.zeros(selected_mask.shape, dtype=np.float32)
+                comp_map[selected_mask] = components[i]
+                comp_path = roi_dir / f"PC{i+1:02d}.nii.gz"
+                _save_nifti_like(reference_img, comp_map, comp_path)
 
         metadata = {
             "roi": roi,
@@ -942,6 +1022,9 @@ def process_dataset(
             "use_zscore": USE_ZSCORE,
             "min_neighbors": MIN_NEIGHBORS,
             "pca_input_mode": PCA_INPUT_MODE,
+            "pca_svd_solver": PCA_SVD_SOLVER,
+            "compress_decoder_bundle": COMPRESS_DECODER_BUNDLE,
+            "save_component_maps": SAVE_COMPONENT_MAPS,
             "voxel_count": vox_selected,
             "t_original": t_all,
             "t_used": t_used,
@@ -954,6 +1037,7 @@ def process_dataset(
         }
         with open(roi_dir / "decoder_metadata.json", "w") as f:
             json.dump(metadata, f, indent=2)
+        _log(f"    [ROI {roi}] Saved outputs in {_elapsed(t0)}")
 
         qc_rows.append(
             QCRow(
@@ -968,6 +1052,7 @@ def process_dataset(
                 pc_corr,
             )
         )
+        _log(f"  ROI {roi_idx}/{len(roi_names)} finished in {_elapsed(roi_t0)}")
 
     # Write QC CSV
     qc_path = out_root / "qc_summary.csv"
@@ -997,6 +1082,7 @@ def process_dataset(
                 "" if row.pc1_fd_corr is None else f"{row.pc1_fd_corr:.4f}",
             ])
     print(f"QC summary saved to {qc_path}")
+    print(f"Dataset finished in {_elapsed(dataset_t0)}", flush=True)
 
 
 def _build_run_dir(base_data: Path, subj: str, day: str, run: str) -> Path:
@@ -1264,8 +1350,13 @@ def make_qc_plots(out_root: Path):
     import numpy as np
     import nibabel as nib
 
-    for roi_dir in sorted([p for p in out_root.iterdir() if p.is_dir()]):
+    plot_t0 = time.perf_counter()
+    roi_dirs = sorted([p for p in out_root.iterdir() if p.is_dir()])
+    print(f"[QC] Building plots for {len(roi_dirs)} ROI folders", flush=True)
+    for idx, roi_dir in enumerate(roi_dirs, start=1):
+        roi_t0 = time.perf_counter()
         roi = roi_dir.name
+        _log(f"[QC] {idx}/{len(roi_dirs)} {roi}")
         # required files
         p_expl = roi_dir / "pca_explained.npy"
         p_tc   = roi_dir / "pca_timecourses.npy"
@@ -1305,9 +1396,9 @@ def make_qc_plots(out_root: Path):
         plt.close()
 
         # ---------- tSNR distributions ----------
-        tsnr = nib.load(str(p_tsnr)).get_fdata()
-        roi_mask = nib.load(str(p_roi)).get_fdata() > 0
-        sel_mask = nib.load(str(p_sel)).get_fdata() > 0
+        tsnr = nib.load(str(p_tsnr)).get_fdata(dtype=np.float32)
+        roi_mask = nib.load(str(p_roi)).get_fdata(dtype=np.float32) > 0
+        sel_mask = nib.load(str(p_sel)).get_fdata(dtype=np.float32) > 0
 
         tsnr_vals = tsnr[roi_mask]
         sel_vals  = tsnr[sel_mask]
@@ -1346,8 +1437,9 @@ def make_qc_plots(out_root: Path):
         plt.tight_layout()
         plt.savefig(roi_dir / "qc_tsnr_roi_vs_selected.png", dpi=200)
         plt.close()
+        _log(f"[QC] {roi} plots done in {_elapsed(roi_t0)}")
 
-    print(f"[QC] Saved plots under: {out_root}")
+    print(f"[QC] Saved plots under: {out_root} in {_elapsed(plot_t0)}")
 
 
 
@@ -1371,11 +1463,48 @@ def main():
         type=Path,
         help="Root data directory containing sub-*/day/func/run folders (default: ./data)",
     )
+    parser.add_argument(
+        "--pca-svd-solver",
+        choices=["randomized", "auto", "full"],
+        default=None,
+        help="sklearn PCA SVD solver. randomized is fastest for small n_components.",
+    )
+    parser.add_argument(
+        "--compress-bundle",
+        action="store_true",
+        help="Use slower compressed decoder_bundle.npz output.",
+    )
+    parser.add_argument(
+        "--no-component-maps",
+        action="store_true",
+        help="Skip writing PC*.nii.gz maps; decoder bundles and masks are still saved.",
+    )
+    parser.add_argument(
+        "--no-qc-plots",
+        action="store_true",
+        help="Skip PNG QC plots after PCA.",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce progress logging.",
+    )
     args = parser.parse_args()
 
-    global PCA_INPUT_MODE
+    global PCA_INPUT_MODE, PCA_SVD_SOLVER, COMPRESS_DECODER_BUNDLE
+    global SAVE_COMPONENT_MAPS, MAKE_QC_PLOTS, VERBOSE
     if args.pca_input is not None:
         PCA_INPUT_MODE = args.pca_input
+    if args.pca_svd_solver is not None:
+        PCA_SVD_SOLVER = args.pca_svd_solver
+    if args.compress_bundle:
+        COMPRESS_DECODER_BUNDLE = True
+    if args.no_component_maps:
+        SAVE_COMPONENT_MAPS = False
+    if args.no_qc_plots:
+        MAKE_QC_PLOTS = False
+    if args.quiet:
+        VERBOSE = False
 
     run_dir = _build_run_dir(Path(args.base_data), args.subj, args.day, args.run)
     day_dir = run_dir.parent.parent  # .../day/func/run -> day
@@ -1399,7 +1528,10 @@ def main():
             mask_search_dirs=[run_dir, day_dir],  # masks (if any) can still be searched near run
             out_root=out_root,
         )
-        make_qc_plots(out_root)
+        if MAKE_QC_PLOTS:
+            make_qc_plots(out_root)
+        else:
+            print("Skipping QC plots (--no-qc-plots).")
     except Exception as e:
         print(f"Error processing {run_dir}: {e}")
         raise
@@ -1434,8 +1566,11 @@ def _run_fslmerge(vols: List[Path], out_4d: Path) -> bool:
         return False
     out_4d.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["fslmerge", "-t", str(out_4d)] + [str(v) for v in vols]
+    t0 = time.perf_counter()
+    print(f"[FSLMERGE] {len(vols)} volumes -> {out_4d}", flush=True)
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print(f"[FSLMERGE] Done in {_elapsed(t0)}", flush=True)
         return True
     except FileNotFoundError:
         print("Warning: fslmerge not found in PATH. Install FSL or disable AUTO_FSLMERGE_4D.")
