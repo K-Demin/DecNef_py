@@ -174,10 +174,44 @@ def _rs_priority_for_tsnr(path: Path) -> Tuple[int, int, int]:
     return (dir_score, 0 if has_pre else 1, 1 if has_denoise else 0)
 
 
-def _load_nifti(path: Path) -> Tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
+def _load_nifti(path: Path, load_data: bool = True):
     img = nib.load(str(path))
-    data = np.asanyarray(img.get_fdata(), dtype=np.float32)
+    if not load_data:
+        return img, img.affine, img.header
+    data = np.asarray(img.dataobj, dtype=np.float32)
     return data, img.affine, img.header
+
+def compute_tsnr_streaming(nifti_path: Path, n_skip: int = 0):
+    img = nib.load(str(nifti_path))
+    shape = img.shape
+
+    if len(shape) != 4:
+        raise ValueError(f"Expected 4D NIfTI, got shape={shape}: {nifti_path}")
+
+    x, y, z, T = shape
+
+    sum_vol = np.zeros((x, y, z), dtype=np.float64)
+    sumsq_vol = np.zeros((x, y, z), dtype=np.float64)
+    n = 0
+
+    for t in range(n_skip, T):
+        vol = np.asarray(img.dataobj[..., t], dtype=np.float32)
+        sum_vol += vol
+        sumsq_vol += vol * vol
+        n += 1
+
+    mean_vol = sum_vol / max(n, 1)
+    var_vol = (sumsq_vol / max(n, 1)) - mean_vol ** 2
+    var_vol[var_vol < 0] = 0
+
+    std_vol = np.sqrt(var_vol)
+    tsnr_map = np.divide(
+        mean_vol,
+        np.where(std_vol == 0, np.inf, std_vol),
+    )
+    tsnr_map = np.nan_to_num(tsnr_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    return tsnr_map, img.affine, img.header, T, n
 
 
 def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Path]:
@@ -606,6 +640,28 @@ def _corr_pc1_fd(pc1: np.ndarray, fd: np.ndarray) -> Optional[float]:
         return None
     return float(np.corrcoef(pc1, fd)[0, 1])
 
+def extract_roi_timeseries_streaming(
+    nifti_path: Path,
+    flat_indices: np.ndarray,
+    n_skip: int = 0,
+    keep: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    img = nib.load(str(nifti_path))
+    T = img.shape[3]
+
+    used_t = list(range(n_skip, T))
+    if keep is not None:
+        # keep is already after skip, same length as used_t
+        used_t = [t for t, k in zip(used_t, keep) if k]
+
+    roi_ts = np.empty((len(used_t), flat_indices.size), dtype=np.float32)
+
+    for i, t in enumerate(used_t):
+        vol = np.asarray(img.dataobj[..., t], dtype=np.float32)
+        roi_ts[i, :] = vol.reshape(-1)[flat_indices]
+
+    return roi_ts
+
 
 def process_dataset(
     run_dir: Path,
@@ -616,40 +672,23 @@ def process_dataset(
 ) -> None:
     print(f"\nProcessing dataset: {run_dir}")
     pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir, PCA_INPUT_MODE)
-    tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
-    print("[DEBUG PCA INPUT]")
-    print("  pca_rs_path =", pca_rs_path)
-    print("  tsnr_rs_path =", tsnr_rs_path)
-    print("  pca_rs inode =", pca_rs_path.stat().st_ino)
-    print("  tsnr inode  =", tsnr_rs_path.stat().st_ino)
-
-    t_all_full = tsnr_data.shape[3]  # <-- ORIGINAL length (660)
-
-    if N_SKIP_START > 0:
-        tsnr_data = tsnr_data[..., N_SKIP_START:]
-
-    t_all = tsnr_data.shape[3]  # <-- USED length (650)
+    tsnr_map, tsnr_affine, tsnr_hdr, t_all_full, t_all = compute_tsnr_streaming(
+        tsnr_rs_path,
+        n_skip=N_SKIP_START,
+    )
 
     tr_idx = np.arange(1 + N_SKIP_START, 1 + N_SKIP_START + t_all)
 
-    tsnr_map = np.divide(
-        np.mean(tsnr_data, axis=3),
-        np.where(np.std(tsnr_data, axis=3) == 0, np.inf, np.std(tsnr_data, axis=3)),
-    )
-    tsnr_map = np.nan_to_num(tsnr_map, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
     tsnr_img = nib.Nifti1Image(tsnr_map, tsnr_affine, tsnr_hdr)
 
-    pca_data, pca_affine, pca_hdr = _load_nifti(pca_rs_path)
-    if pca_data.shape[:3] != tsnr_map.shape:
+    pca_img = nib.load(str(pca_rs_path))
+    pca_affine = pca_img.affine
+    pca_hdr = pca_img.header
+
+    if pca_img.shape[:3] != tsnr_map.shape:
         raise ValueError("Spatial dimensions of PCA RS and tSNR RS differ")
     if not _affine_close(pca_affine, tsnr_affine):
         print("Warning: PCA RS affine differs from tSNR RS affine; proceeding with PCA input affine.")
-
-    if N_SKIP_START > 0:
-        if pca_data.shape[3] <= N_SKIP_START:
-            raise ValueError(f"Not enough TRs for PCA after skipping {N_SKIP_START}")
-        pca_data = pca_data[..., N_SKIP_START:]
 
     fd_vec = _discover_fd_vector(run_dir, t_all_full)
     if fd_vec is not None and N_SKIP_START > 0:
@@ -740,11 +779,10 @@ def process_dataset(
             continue
 
         flat_indices = np.flatnonzero(selected_mask)
-        data_2d = pca_data.reshape(-1, pca_data.shape[3]).astype(np.float32)
-        roi_ts = data_2d[flat_indices].T  # (T, V)
 
         if fd_vec is not None and FD_THRESH is not None:
             keep = fd_vec <= FD_THRESH
+
             if np.sum(keep) < 30:
                 print(f"  Warning: FD censoring leaves only {np.sum(keep)} TRs; skipping PCA.")
                 t_used = int(np.sum(keep))
@@ -762,10 +800,23 @@ def process_dataset(
                     )
                 )
                 continue
-            roi_ts = roi_ts[keep, :]
+
+            roi_ts = extract_roi_timeseries_streaming(
+                pca_rs_path,
+                flat_indices,
+                n_skip=N_SKIP_START,
+                keep=keep,
+            )
             fd_used = fd_vec[keep]
             tr_used = tr_idx[keep]
         else:
+            keep = None
+            roi_ts = extract_roi_timeseries_streaming(
+                pca_rs_path,
+                flat_indices,
+                n_skip=N_SKIP_START,
+                keep=None,
+            )
             fd_used = None
             tr_used = tr_idx[:roi_ts.shape[0]]
 
