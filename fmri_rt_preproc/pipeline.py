@@ -57,7 +57,9 @@ class FMRIRealtimePreprocessor:
         self.rt_distorted_motion_ref_epi = self.trans_dir / "rt_ref_epi.nii"
         self.rt_distorted_motion_ref_mask = self.trans_dir / "rt_ref_epi_mask.nii"
         self.rt_unwarped_analysis_ref_epi = prefer_uncompressed_nifti(self.trans_dir / "epi_unwarped_mean.nii")
-        self.rt_unwarped_analysis_ref_mask = self.trans_dir / "epi_mask_mean.nii"
+        self.rt_unwarped_analysis_ref_mask = prefer_uncompressed_nifti(
+            self.trans_dir / "epi_mask_mean.nii"
+        )
 
     # ---------- Top-level entry points ----------
 

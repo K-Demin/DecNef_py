@@ -518,7 +518,7 @@ class RTSessionConfig:
         """
         Brain mask in the unwarped EPI reference grid.
         """
-        return self.trans_dir / "epi_mask_mean.nii"
+        return _prefer_uncompressed_nifti(self.trans_dir / "epi_mask_mean.nii")
 
     @property
     def rt_motion_ref_epi(self) -> Path:
