@@ -60,6 +60,7 @@ PCA_SVD_SOLVER = "randomized"     # much faster than auto/full for small n_compo
 COMPRESS_DECODER_BUNDLE = False   # np.savez is much faster; np.load reads both forms
 SAVE_COMPONENT_MAPS = True        # PC*.nii.gz maps are useful but slow on large grids
 MAKE_QC_PLOTS = True              # PNG plotting is useful but can be disabled for speed
+AUTO_MAKE_DKT_ROIS = True         # create ROI_LPFC/Sensorimotor/EVC from FastSurfer atlas if missing
 VERBOSE = True
 
 # ----------------------
@@ -468,6 +469,36 @@ def _print_roi_search_report(search_dirs: Sequence[Path], roi_names: Sequence[st
             print(f"    {roi}: {roi_masks.get(roi, 'NOT FOUND')}", flush=True)
 
 
+def _maybe_make_dkt_rois(run_dir: Path, roi_names: Sequence[str]) -> None:
+    requested = {r.lower() for r in roi_names}
+    if not requested.intersection({"lpfc", "sensorimotor", "evc"}):
+        return
+
+    try:
+        subj_dir = run_dir.parent.parent.parent
+        sid = subj_dir.name.replace("sub-", "", 1)
+        fs_subjects_dir = subj_dir / "anat" / "fastsurfer"
+        mri_dir = fs_subjects_dir / sid / "mri"
+        dkt_path = mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
+        expected = [
+            mri_dir / "ROI_LPFC.nii.gz",
+            mri_dir / "ROI_Sensorimotor.nii.gz",
+            mri_dir / "ROI_EVC.nii.gz",
+        ]
+        if not dkt_path.exists():
+            _log(f"[ROI] FastSurfer DKT atlas not found, cannot auto-create ROIs: {dkt_path}")
+            return
+        if all(p.exists() for p in expected):
+            return
+
+        print(f"[ROI] Creating DKT ROI masks from {dkt_path}", flush=True)
+        from fmri_rt_preproc.prep_surface_rois import make_dkt_rois
+
+        make_dkt_rois(sid=sid, fs_subjects_dir=fs_subjects_dir)
+    except Exception as exc:
+        print(f"Warning: failed to auto-create DKT ROI masks: {exc}", flush=True)
+
+
 def _discover_optional_mask(search_dirs: Sequence[Path], name_keywords: Sequence[str]) -> Optional[Path]:
     all_paths: List[Path] = []
     for d in search_dirs:
@@ -730,6 +761,9 @@ def process_dataset(
     t0 = time.perf_counter()
     _log("[ROI] Discovering masks before loading RS data")
     roi_masks = _discover_roi_masks(roi_dirs, roi_names)
+    if not roi_masks and AUTO_MAKE_DKT_ROIS:
+        _maybe_make_dkt_rois(run_dir, roi_names)
+        roi_masks = _discover_roi_masks(roi_dirs, roi_names)
     _print_roi_search_report(roi_dirs, roi_names, roi_masks)
     if not roi_masks:
         summary = {
@@ -1323,6 +1357,25 @@ def warp_t1_mask_to_epi(
     return out_roi_epi
 
 
+def resample_t1_mask_to_reference(
+    roi_t1_path: Path,
+    reference_img: nib.Nifti1Image,
+    out_roi_t1: Path,
+) -> Path:
+    out_roi_t1.parent.mkdir(parents=True, exist_ok=True)
+    if out_roi_t1.exists():
+        return out_roi_t1
+
+    from nibabel.processing import resample_from_to
+
+    src_img = nib.load(str(roi_t1_path))
+    ref = (reference_img.shape[:3], reference_img.affine)
+    resampled = resample_from_to(src_img, ref, order=0)
+    mask = (np.asanyarray(resampled.dataobj) > 0).astype(np.float32)
+    nib.save(nib.Nifti1Image(mask, reference_img.affine, reference_img.header), str(out_roi_t1))
+    return out_roi_t1
+
+
 
 def _load_mask_in_epi_space(
     roi: str,
@@ -1344,11 +1397,24 @@ def _load_mask_in_epi_space(
         return (data > 0), aff
 
     if reference_space.lower() == "t1":
+        out_t1 = roi_out_dir / "roi_in_t1.nii.gz"
         print(
-            f"  ROI {roi}: mask shape {data.shape} does not match "
-            f"T1 PCA shape {tsnr_map_3d.shape}; skipping."
+            f"  ROI {roi}: resampling mask {data.shape} -> "
+            f"T1 PCA grid {tsnr_map_3d.shape}"
         )
-        return None, None
+        resampled = resample_t1_mask_to_reference(
+            roi_t1_path=roi_mask_path,
+            reference_img=tsnr_img_3d,
+            out_roi_t1=out_t1,
+        )
+        rdata, raff, _ = _load_nifti(resampled)
+        if rdata.shape != tsnr_map_3d.shape:
+            print(f"  ROI {roi}: resampled mask shape {rdata.shape} still != T1 PCA shape {tsnr_map_3d.shape}; skipping.")
+            return None, None
+        if np.sum(rdata > 0) == 0:
+            print(f"  ROI {roi}: resampled mask has zero voxels; skipping.")
+            return None, None
+        return (rdata > 0), raff
 
     # Try warp T1->EPI using inverse of epi2t1 composite
     comp = _find_epi2t1_composite(run_dir)
@@ -1409,7 +1475,12 @@ def make_qc_plots(out_root: Path):
         p_expl = roi_dir / "pca_explained.npy"
         p_tc   = roi_dir / "pca_timecourses.npy"
         p_tsnr = roi_dir / "roi_tsnr_in_roi.nii.gz"
-        p_roi  = roi_dir / "roi_in_epi.nii.gz"
+        roi_candidates = [
+            roi_dir / "roi_in_t1.nii.gz",
+            roi_dir / "roi_in_epi.nii.gz",
+            roi_dir / "roi_original_mask.nii.gz",
+        ]
+        p_roi = next((p for p in roi_candidates if p.exists()), roi_candidates[-1])
         p_sel  = roi_dir / "roi_selected_mask.nii.gz"
 
         if not (p_expl.exists() and p_tc.exists() and p_tsnr.exists() and p_roi.exists() and p_sel.exists()):
@@ -1552,6 +1623,11 @@ def main():
         help="Skip PNG QC plots after PCA.",
     )
     parser.add_argument(
+        "--no-auto-dkt-rois",
+        action="store_true",
+        help="Do not create LPFC/Sensorimotor/EVC masks from FastSurfer DKT atlas automatically.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Reduce progress logging.",
@@ -1559,7 +1635,7 @@ def main():
     args = parser.parse_args()
 
     global ROI_NAMES, PCA_INPUT_MODE, PCA_SVD_SOLVER, COMPRESS_DECODER_BUNDLE
-    global SAVE_COMPONENT_MAPS, MAKE_QC_PLOTS, VERBOSE
+    global SAVE_COMPONENT_MAPS, MAKE_QC_PLOTS, AUTO_MAKE_DKT_ROIS, VERBOSE
     if args.roi_names is not None:
         ROI_NAMES = _parse_csv_list(args.roi_names)
     if args.pca_input is not None:
@@ -1572,6 +1648,8 @@ def main():
         SAVE_COMPONENT_MAPS = False
     if args.no_qc_plots:
         MAKE_QC_PLOTS = False
+    if args.no_auto_dkt_rois:
+        AUTO_MAKE_DKT_ROIS = False
     if args.quiet:
         VERBOSE = False
 
