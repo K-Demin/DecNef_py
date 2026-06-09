@@ -55,12 +55,8 @@ def _load_all_roi_decoders(pca_root: Path) -> dict[str, dict[str, np.ndarray]]:
     return decoders
 
 
-def _score_columns(pc_counts: dict[str, int]) -> list[str]:
-    columns: list[str] = []
-    for roi in sorted(pc_counts):
-        for pc in range(1, pc_counts[roi] + 1):
-            columns.append(f"{roi}_PC{pc:02d}")
-    return columns
+def _score_columns(decoders: dict[str, dict[str, np.ndarray]], score_label: str) -> list[str]:
+    return [f"{roi}_{score_label}" for roi in sorted(decoders)]
 
 
 def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
@@ -84,46 +80,6 @@ def _requires_regression_ready_filter(volume_kind: str) -> bool:
     return str(volume_kind).lower() in {"reg", "t1", "mni"}
 
 
-def _write_reference_stats(
-    *,
-    scores_csv: Path,
-    columns: list[str],
-    out_path: Path,
-    metadata: dict,
-) -> None:
-    values: dict[str, list[float]] = {c: [] for c in columns}
-    with scores_csv.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            for column in columns:
-                try:
-                    value = float(row[column])
-                except (TypeError, ValueError, KeyError):
-                    continue
-                if np.isfinite(value):
-                    values[column].append(value)
-
-    payload = {"metadata": metadata, "columns": {}}
-    for column, buf in values.items():
-        arr = np.asarray(buf, dtype=float)
-        if arr.size < 2:
-            raise ValueError(f"Reference column {column!r} has fewer than 2 valid samples")
-        std = float(arr.std())
-        if not np.isfinite(std) or std == 0.0:
-            raise ValueError(f"Reference column {column!r} has invalid std: {std}")
-        payload["columns"][column] = {
-            "mean": float(arr.mean()),
-            "std": std,
-            "n": int(arr.size),
-            "p05": float(np.percentile(arr, 5)),
-            "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
-        }
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-
-
 def run_realtime_all_roi_pca_scorer(
     *,
     run_dir: Path,
@@ -131,10 +87,13 @@ def run_realtime_all_roi_pca_scorer(
     score_root: Path,
     score_queue,
     stop_event,
-    reference_stats_out: Optional[Path],
     volume_kind: str,
+    score_label: str,
     normalization: str,
     score_metric: str,
+    target_pc: Optional[str],
+    top_pcs: str,
+    top_pc_variance: float,
     max_trs: Optional[int],
     poll_interval: float,
     metadata: dict,
@@ -143,7 +102,7 @@ def run_realtime_all_roi_pca_scorer(
 
     decoders = _load_all_roi_decoders(pca_root)
     pc_counts = {roi: int(dec["weights"].shape[0]) for roi, dec in decoders.items()}
-    score_columns = _score_columns(pc_counts)
+    score_columns = _score_columns(decoders, score_label)
     fieldnames = ["volume_idx", "timestamp", *score_columns]
 
     score_root.mkdir(parents=True, exist_ok=True)
@@ -209,14 +168,16 @@ def run_realtime_all_roi_pca_scorer(
                     "timestamp": time.time(),
                 }
                 for roi in sorted(decoders):
-                    scores = pca_rt.score_pca_volume(
+                    score = pca_rt.score_pca_scalar(
                         vol,
                         decoders[roi],
                         normalization=normalization,
                         score_metric=score_metric,
+                        target_pc=target_pc,
+                        top_pcs=top_pcs,
+                        top_pc_variance=top_pc_variance,
                     )
-                    for pc_idx, value in enumerate(scores, start=1):
-                        row[f"{roi}_PC{pc_idx:02d}"] = float(value)
+                    row[f"{roi}_{score_label}"] = float(score)
                 writer.writerow(row)
                 f.flush()
                 scored_count += 1
@@ -235,6 +196,10 @@ def run_realtime_all_roi_pca_scorer(
         "score_root": str(score_root),
         "pca_root": str(pca_root),
         "volume_kind": volume_kind,
+        "score_label": score_label,
+        "target_pc": target_pc,
+        "top_pcs": top_pcs,
+        "top_pc_variance": float(top_pc_variance),
         "normalization": normalization,
         "score_metric": score_metric,
         "n_scored": int(scored_count),
@@ -242,25 +207,23 @@ def run_realtime_all_roi_pca_scorer(
         "initial_volume_filter": filter_meta,
         "rois": sorted(decoders.keys()),
         "pc_counts": pc_counts,
+        "selected_pcs": {
+            roi: pca_rt.describe_top_pc_selection(
+                decoders[roi],
+                top_pcs=top_pcs,
+                top_pc_variance=top_pc_variance,
+            )
+            for roi in sorted(decoders)
+        },
+        "score_columns": score_columns,
         "scores_csv": str(out_csv),
     }
     with (score_root / "scores_pca_all_rois_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    stats_out = reference_stats_out or (score_root / "pca_reference_stats.json")
     if scored_count < 2:
-        raise ValueError(f"Need at least 2 scored TRs for PCA reference stats, got {scored_count}")
-    _write_reference_stats(
-        scores_csv=out_csv,
-        columns=score_columns,
-        out_path=stats_out,
-        metadata=summary,
-    )
-    summary["reference_stats_json"] = str(stats_out)
-    with (score_root / "scores_pca_all_rois_metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+        raise ValueError(f"Need at least 2 scored TRs for daily PCA scores, got {scored_count}")
     log.info("Saved realtime PCA ROI scores: %s", out_csv)
-    log.info("Saved realtime PCA reference stats: %s", stats_out)
 
 
 def _coalesce_sub(args) -> str:
@@ -352,13 +315,18 @@ def main() -> None:
         "--pca-reference-stats-out",
         type=Path,
         default=None,
-        help="Output JSON for daily PCA reference stats.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-volume-kind",
         choices=["reg", "mc", "unwarped", "t1", "mni"],
         default=None,
         help="Realtime volume folder to score. Defaults from --pca-space.",
+    )
+    parser.add_argument(
+        "--pca-target-pc",
+        default=None,
+        help="Legacy single PC to score when --pca-score-metric is projection/cosine.",
     )
     parser.add_argument(
         "--pca-normalization",
@@ -368,9 +336,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-score-metric",
-        choices=["projection", "cosine"],
-        default="projection",
-        help="PCA score metric.",
+        choices=sorted(pca_rt.ALL_SCORE_METRICS),
+        default="subspace_cosine",
+        help="PCA scalar score. Default is cosine closeness to the top-PC subspace.",
+    )
+    parser.add_argument(
+        "--pca-top-pcs",
+        default="auto",
+        help=(
+            "Top PCs for multi-PC metrics: auto uses a cumulative explained-variance "
+            "target; also accepts integer count, var:0.01, or all."
+        ),
+    )
+    parser.add_argument(
+        "--pca-top-pc-variance",
+        type=float,
+        default=0.10,
+        help=(
+            "Cumulative explained-variance threshold used only when "
+            "--pca-top-pcs=auto. If the saved PCs do not reach it, auto uses all saved PCs."
+        ),
     )
     parser.add_argument(
         "--pca-poll-interval",
@@ -546,6 +531,12 @@ def main() -> None:
         pca_volume_kind = args.pca_volume_kind
         if pca_volume_kind is None:
             pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
+        score_label = pca_rt.resolve_score_label(
+            score_metric=args.pca_score_metric,
+            target_pc=args.pca_target_pc,
+            top_pcs=args.pca_top_pcs,
+            top_pc_variance=args.pca_top_pc_variance,
+        )
 
         settings_payload = vars(REGRESSOR_SETTINGS).copy()
         settings_payload.update(
@@ -599,13 +590,13 @@ def main() -> None:
                     **metadata,
                     "score_root": str(score_root),
                     "volume_kind": pca_volume_kind,
+                    "score_label": score_label,
+                    "target_pc": args.pca_target_pc,
+                    "top_pcs": args.pca_top_pcs,
+                    "top_pc_variance": args.pca_top_pc_variance,
                     "normalization": args.pca_normalization,
                     "score_metric": args.pca_score_metric,
-                    "reference_stats_out": (
-                        str(args.pca_reference_stats_out)
-                        if args.pca_reference_stats_out
-                        else str(score_root / "pca_reference_stats.json")
-                    ),
+                    "scores_csv": str(score_root / "scores_pca_all_rois.csv"),
                 }
             },
         )
@@ -623,10 +614,13 @@ def main() -> None:
                 "score_root": score_root,
                 "score_queue": score_queue,
                 "stop_event": pca_stop,
-                "reference_stats_out": args.pca_reference_stats_out,
                 "volume_kind": pca_volume_kind,
+                "score_label": score_label,
                 "normalization": args.pca_normalization,
                 "score_metric": args.pca_score_metric,
+                "target_pc": args.pca_target_pc,
+                "top_pcs": args.pca_top_pcs,
+                "top_pc_variance": args.pca_top_pc_variance,
                 "max_trs": max_trs,
                 "poll_interval": args.pca_poll_interval,
                 "metadata": metadata,
