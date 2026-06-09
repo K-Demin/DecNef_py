@@ -525,12 +525,13 @@ def run_psychopy_presentation(
                             },
                         )
 
-                if message.get("reg_ready", True):
+                has_score = "score_raw" in message
+                if has_score and message.get("reg_ready", True):
                     reg_ready_seen = True
                     scores.append(float(message["score_raw"]))
                     _append_condition_score(condition_scores_path, message, condition)
                     updated = True
-                else:
+                elif has_score:
                     updated = True
         except Empty:
             pass
