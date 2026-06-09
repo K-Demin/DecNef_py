@@ -438,11 +438,13 @@ class FMRIRealtimePreprocessor:
 
         # 5) Build means from unwarped outputs used for registration
         epi_mean = run_dir / "epi_unwarped_mean.nii.gz"
-        epi_mask_mean = run_dir / "epi_mask_mean.nii"
+        epi_mask_mean = run_dir / "epi_mask_mean.nii.gz"
         if not epi_mean.exists():
             run(["fslmaths", str(epi_unwarped), "-Tmean", str(epi_mean)])
+            gunzip_python(epi_mean)
         if not epi_mask_mean.exists():
             run(["fslmaths", str(epi_mask), "-Tmean", str(epi_mask_mean)])
+            gunzip_python(epi_mask_mean)
 
         # 6) EPI->T1 registration using EPI mean + masks
         self._register_epi_to_t1(run_dir, epi_mean, epi_mask_mean)
