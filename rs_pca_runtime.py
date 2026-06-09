@@ -600,6 +600,119 @@ def load_reference_stats_from_score_csv(
     return stats
 
 
+def plot_pca_scores_motion(
+    *,
+    run_dir: Path,
+    scores_csv: Path,
+    out_png: Path,
+    score_columns: Optional[list[str]] = None,
+    title: str = "PCA scores and motion",
+) -> Optional[Path]:
+    scores_csv = Path(scores_csv)
+    motion_path = Path(run_dir) / "motion_rt.1D"
+    if not scores_csv.exists():
+        return None
+
+    with scores_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return None
+        volume_field = "volume_idx" if "volume_idx" in reader.fieldnames else "tr"
+        if volume_field not in reader.fieldnames:
+            return None
+        metadata_columns = {
+            "volume_idx",
+            "tr",
+            "timestamp",
+            "condition_id",
+            "symbol",
+            "roi",
+            "pc",
+            "score_label",
+            "direction",
+        }
+        candidate_columns = score_columns or [
+            column for column in reader.fieldnames if column not in metadata_columns
+        ]
+        volumes: list[int] = []
+        values: dict[str, list[float]] = {column: [] for column in candidate_columns}
+        for row in reader:
+            try:
+                volume_idx = int(float(row[volume_field]))
+            except (TypeError, ValueError):
+                continue
+            row_values: dict[str, float] = {}
+            has_score = False
+            for column in candidate_columns:
+                try:
+                    value = float(row.get(column, ""))
+                except (TypeError, ValueError):
+                    value = float("nan")
+                if np.isfinite(value):
+                    has_score = True
+                row_values[column] = value
+            if not has_score:
+                continue
+            volumes.append(volume_idx)
+            for column in candidate_columns:
+                values[column].append(row_values[column])
+
+    score_columns = [
+        column
+        for column in candidate_columns
+        if column in values and np.any(np.isfinite(np.asarray(values[column], dtype=float)))
+    ]
+    if not volumes or not score_columns:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    has_motion = motion_path.exists()
+    motion = None
+    motion_vols = None
+    if has_motion:
+        try:
+            motion = np.loadtxt(motion_path)
+            if motion.ndim == 1:
+                motion = motion[None, :]
+            all_motion_vols = np.arange(1, motion.shape[0] + 1)
+            include_motion = np.isin(all_motion_vols, np.asarray(volumes, dtype=int))
+            motion = motion[include_motion]
+            motion_vols = all_motion_vols[include_motion]
+            has_motion = motion.shape[0] > 0
+        except Exception:
+            has_motion = False
+
+    n_panels = 2 if has_motion else 1
+    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 8 if has_motion else 5), sharex=False)
+    if n_panels == 1:
+        axes = [axes]
+
+    for column in score_columns:
+        axes[0].plot(volumes, values[column], label=column)
+    axes[0].set_title(title)
+    axes[0].set_xlabel("Volume")
+    axes[0].set_ylabel("PCA score")
+    axes[0].legend(loc="upper right", fontsize=8)
+
+    if has_motion and motion is not None and motion_vols is not None:
+        for idx in range(min(motion.shape[1], 6)):
+            axes[1].plot(motion_vols, motion[:, idx], label=f"Motion {idx + 1}")
+        axes[1].set_xlabel("Volume")
+        axes[1].set_ylabel("Motion")
+        axes[1].legend(loc="upper right", ncol=3, fontsize=8)
+
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
+
 def feedback_from_score(
     raw_score: float,
     condition: PCACondition,

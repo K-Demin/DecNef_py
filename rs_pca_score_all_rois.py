@@ -641,6 +641,12 @@ def main() -> None:
         if pca_process.exitcode not in (0, None):
             raise RuntimeError(f"Realtime PCA all-ROI scorer failed with exit code {pca_process.exitcode}")
         _plot_qc(run_dir)
+        pca_rt.plot_pca_scores_motion(
+            run_dir=run_dir,
+            scores_csv=score_root / "scores_pca_all_rois.csv",
+            out_png=score_root / "qc_pca_scores_motion.png",
+            title="Daily RS PCA scores and motion",
+        )
     finally:
         fixation_stop.set()
         fixation_process.join(timeout=5)
