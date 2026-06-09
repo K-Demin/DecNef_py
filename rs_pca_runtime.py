@@ -10,6 +10,7 @@ from multiprocessing import Queue
 from pathlib import Path
 from queue import Full
 from typing import Optional
+import subprocess
 
 import numpy as np
 
@@ -85,11 +86,77 @@ def _same_zooms(a: tuple[float, ...], b: tuple[float, ...], tol: float = 0.05) -
     return all(abs(float(x) - float(y)) <= tol for x, y in zip(a[:3], b[:3]))
 
 
+def _crop_img_to_mask(img, mask_data: np.ndarray, padding_vox: int):
+    import nibabel as nib
+
+    mask_idx = np.argwhere(mask_data > 0)
+    if mask_idx.size == 0:
+        return img
+    start = np.maximum(mask_idx.min(axis=0) - int(padding_vox), 0)
+    stop = np.minimum(mask_idx.max(axis=0) + int(padding_vox) + 1, img.shape[:3])
+    slices = tuple(slice(int(start[axis]), int(stop[axis])) for axis in range(3))
+    cropped = np.asanyarray(img.dataobj)[slices].astype(np.float32, copy=False)
+    affine = img.affine.copy()
+    affine[:3, 3] = affine[:3, 3] + affine[:3, :3] @ start.astype(float)
+    return nib.Nifti1Image(cropped, affine, img.header)
+
+
+def _make_truncated_t1_reference(
+    *,
+    full_ref_img,
+    full_ref_path: Path,
+    trans_dir: Path,
+    out_path: Path,
+    padding_vox: int,
+):
+    import nibabel as nib
+
+    epi_mask = _find_first_existing([
+        trans_dir / "epi_mask_mean.nii",
+        trans_dir / "epi_mask_mean.nii.gz",
+        trans_dir / "rt_ref_epi_mask.nii",
+        trans_dir / "rt_ref_epi_mask.nii.gz",
+    ])
+    epi2t1 = trans_dir / "epi2t1_Composite.h5"
+    if epi_mask is None or not epi2t1.exists():
+        nib.save(full_ref_img, str(out_path))
+        return out_path
+
+    mask_on_full = out_path.with_name(out_path.stem + "_epi_mask_on_full.nii.gz")
+    if not mask_on_full.exists():
+        cmd = [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            str(epi_mask),
+            "-r",
+            str(full_ref_path),
+            "-o",
+            str(mask_on_full),
+            "-t",
+            str(epi2t1),
+            "-n",
+            "NearestNeighbor",
+            "--float",
+            "1",
+        ]
+        subprocess.run(cmd, check=True)
+
+    mask_data = np.asanyarray(nib.load(str(mask_on_full)).dataobj)
+    cropped_img = _crop_img_to_mask(full_ref_img, mask_data, padding_vox)
+    cropped_img.set_data_dtype(np.float32)
+    nib.save(cropped_img, str(out_path))
+    return out_path
+
+
 def ensure_pca_t1_reference(
     subject_root: Path,
     trans_dir: Path,
     explicit_path: Optional[Path] = None,
     resolution: str = "epi",
+    truncate_to_epi_fov: bool = True,
+    padding_vox: int = 2,
 ) -> Path:
     if explicit_path is not None:
         explicit_path = Path(explicit_path)
@@ -113,15 +180,35 @@ def ensure_pca_t1_reference(
         )
 
     if resolution == "t1":
-        out_path = trans_dir / "pca_t1_reference_t1res.nii.gz"
-        if not out_path.exists():
+        suffix = "_trunc" if truncate_to_epi_fov else ""
+        out_path = trans_dir / f"pca_t1_reference_t1res{suffix}.nii.gz"
+        if out_path.exists():
+            return out_path
+        if truncate_to_epi_fov:
+            full_ref_path = trans_dir / "pca_t1_reference_t1res_full.nii.gz"
+            import shutil
+            import nibabel as nib
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if not full_ref_path.exists():
+                shutil.copyfile(t1_path, full_ref_path)
+            full_ref_img = nib.load(str(full_ref_path))
+            return _make_truncated_t1_reference(
+                full_ref_img=full_ref_img,
+                full_ref_path=full_ref_path,
+                trans_dir=trans_dir,
+                out_path=out_path,
+                padding_vox=padding_vox,
+            )
+        else:
             import shutil
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(t1_path, out_path)
         return out_path
 
-    out_path = trans_dir / "pca_t1_reference_epires.nii.gz"
+    suffix = "_trunc" if truncate_to_epi_fov else ""
+    out_path = trans_dir / f"pca_t1_reference_epires{suffix}.nii.gz"
     epi_ref = _find_first_existing([
         trans_dir / "epi_unwarped_mean.nii",
         trans_dir / "epi_unwarped_mean.nii.gz",
@@ -146,6 +233,18 @@ def ensure_pca_t1_reference(
     t1_img = nib.load(str(t1_path))
     ref_img = resample_to_output(t1_img, voxel_sizes=epi_zooms, order=1)
     ref_img.set_data_dtype(np.float32)
+    if truncate_to_epi_fov:
+        full_ref_path = trans_dir / "pca_t1_reference_epires_full.nii.gz"
+        if not full_ref_path.exists():
+            nib.save(ref_img, str(full_ref_path))
+        return _make_truncated_t1_reference(
+            full_ref_img=ref_img,
+            full_ref_path=full_ref_path,
+            trans_dir=trans_dir,
+            out_path=out_path,
+            padding_vox=padding_vox,
+        )
+
     nib.save(ref_img, str(out_path))
     return out_path
 

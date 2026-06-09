@@ -339,9 +339,7 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
     from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    for key, value in settings.items():
-        if hasattr(REGRESSOR_SETTINGS, key):
-            setattr(REGRESSOR_SETTINGS, key, value)
+    REGRESSOR_SETTINGS.update(settings)
     run_rt_pipeline(cfg, score_queue)
 
 
@@ -749,6 +747,8 @@ def main() -> None:
                 trans_dir,
                 args.pca_reference_image,
                 resolution=args.pca_reference_resolution,
+                truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
+                padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
             )
 
         decoder_selected = bool(args.decoder_template)
@@ -800,7 +800,6 @@ def main() -> None:
             settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
         if pca_workflow:
             settings_payload["analysis_space"] = args.pca_space
-            settings_payload["truncate_t1_to_epi_fov"] = False
 
         pipeline_process = ctx.Process(
             target=_run_pipeline_with_settings,

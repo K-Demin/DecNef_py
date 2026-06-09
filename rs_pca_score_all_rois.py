@@ -528,6 +528,8 @@ def main() -> None:
                 trans_dir,
                 args.pca_reference_image,
                 resolution=args.pca_reference_resolution,
+                truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
+                padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
             )
 
         pca_day = args.pca_day or args.day
@@ -561,7 +563,6 @@ def main() -> None:
                 "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
                 "biopac_poll_interval": args.biopac_poll,
                 "analysis_space": args.pca_space,
-                "truncate_t1_to_epi_fov": False,
             }
         )
         if args.max_workers is not None:
