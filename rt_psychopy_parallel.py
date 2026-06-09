@@ -1150,6 +1150,8 @@ def main() -> None:
                 "top_pc_variance": args.pca_top_pc_variance,
                 "max_trs": max_trs,
                 "poll_interval": args.pca_poll_interval,
+                "qc_plot_path": run_dir / "qc_pca_scores_motion.png",
+                "qc_update_every": 5,
             },
         )
         pca_process.start()

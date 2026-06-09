@@ -96,6 +96,8 @@ def run_realtime_all_roi_pca_scorer(
     top_pc_variance: float,
     max_trs: Optional[int],
     poll_interval: float,
+    qc_plot_path: Optional[Path],
+    qc_update_every: int,
     metadata: dict,
 ) -> None:
     import nibabel as nib
@@ -198,6 +200,20 @@ def run_realtime_all_roi_pca_scorer(
                 writer.writerow(row)
                 f.flush()
                 scored_count += 1
+                if (
+                    qc_plot_path is not None
+                    and qc_update_every > 0
+                    and scored_count % qc_update_every == 0
+                ):
+                    try:
+                        pca_rt.plot_pca_scores_motion(
+                            run_dir=run_dir,
+                            scores_csv=out_csv,
+                            out_png=qc_plot_path,
+                            title="Daily RS PCA scores and motion",
+                        )
+                    except Exception:
+                        pass
                 try:
                     score_queue.put_nowait({"volume_idx": volume_idx})
                 except Full:
@@ -239,6 +255,17 @@ def run_realtime_all_roi_pca_scorer(
     }
     with (score_root / "scores_pca_all_rois_metadata.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    if qc_plot_path is not None:
+        try:
+            pca_rt.plot_pca_scores_motion(
+                run_dir=run_dir,
+                scores_csv=out_csv,
+                out_png=qc_plot_path,
+                title="Daily RS PCA scores and motion",
+            )
+        except Exception:
+            pass
 
     if scored_count < 2:
         raise ValueError(f"Need at least 2 scored TRs for daily PCA scores, got {scored_count}")
@@ -548,7 +575,7 @@ def main() -> None:
             )
             log.info("Using PCA transform reference: %s", pca_reference_image)
 
-        score_root = pca_rt.build_pca_root(run_dir.parent.parent, run_dir.name, args.pca_input)
+        score_root = run_dir
         pca_volume_kind = args.pca_volume_kind
         if pca_volume_kind is None:
             pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
@@ -644,6 +671,8 @@ def main() -> None:
                 "top_pc_variance": args.pca_top_pc_variance,
                 "max_trs": max_trs,
                 "poll_interval": args.pca_poll_interval,
+                "qc_plot_path": run_dir / "qc_pca_scores_motion.png",
+                "qc_update_every": 5,
                 "metadata": metadata,
             },
         )
@@ -665,7 +694,7 @@ def main() -> None:
         pca_rt.plot_pca_scores_motion(
             run_dir=run_dir,
             scores_csv=score_root / "scores_pca_all_rois.csv",
-            out_png=score_root / "qc_pca_scores_motion.png",
+            out_png=run_dir / "qc_pca_scores_motion.png",
             title="Daily RS PCA scores and motion",
         )
     finally:

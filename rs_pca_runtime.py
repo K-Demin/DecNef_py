@@ -73,8 +73,7 @@ def build_reference_stats_path(
     pca_input: str,
 ) -> Path:
     run_dir = build_run_dir(base_data, subj, day, run)
-    day_dir = run_dir.parent.parent
-    return build_pca_root(day_dir, run_dir.name, pca_input) / "pca_reference_stats.json"
+    return run_dir / "pca_reference_stats.json"
 
 
 def build_reference_scores_path(
@@ -85,8 +84,7 @@ def build_reference_scores_path(
     pca_input: str,
 ) -> Path:
     run_dir = build_run_dir(base_data, subj, day, run)
-    day_dir = run_dir.parent.parent
-    return build_pca_root(day_dir, run_dir.name, pca_input) / "scores_pca_all_rois.csv"
+    return run_dir / "scores_pca_all_rois.csv"
 
 
 def _find_first_existing(paths: list[Path]) -> Optional[Path]:
@@ -841,8 +839,10 @@ def plot_pca_scores_motion(
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
-    fig.savefig(out_png, dpi=150)
+    tmp_png = out_png.with_name(out_png.name + ".tmp")
+    fig.savefig(tmp_png, format="png", dpi=150)
     plt.close(fig)
+    tmp_png.replace(out_png)
     return out_png
 
 
@@ -1062,6 +1062,8 @@ def run_realtime_pca_scorer(
     top_pc_variance: float = 0.10,
     max_trs: Optional[int] = None,
     poll_interval: float = 0.05,
+    qc_plot_path: Optional[Path] = None,
+    qc_update_every: int = 5,
 ) -> None:
     import nibabel as nib
 
@@ -1073,6 +1075,7 @@ def run_realtime_pca_scorer(
 
     out_csv = run_dir / "pca_realtime_scores.csv"
     processed: set[int] = set()
+    scored_count = 0
     volume_idx = 1
     validated_grid = False
     while True:
@@ -1122,6 +1125,27 @@ def run_realtime_pca_scorer(
                 **feedback,
             }
             append_pca_score(out_csv, row)
+            scored_count += 1
+            if (
+                qc_plot_path is not None
+                and qc_update_every > 0
+                and scored_count % qc_update_every == 0
+            ):
+                try:
+                    plot_pca_scores_motion(
+                        run_dir=run_dir,
+                        scores_csv=out_csv,
+                        out_png=qc_plot_path,
+                        score_columns=[
+                            "raw_component_score",
+                            "directed_score",
+                            "score_z",
+                            "feedback_score",
+                        ],
+                        title="PCA neurofeedback scores and motion",
+                    )
+                except Exception:
+                    pass
             try:
                 score_queue.put_nowait(
                     {
@@ -1151,3 +1175,20 @@ def run_realtime_pca_scorer(
                 pass
             processed.add(volume_idx)
             volume_idx += 1
+
+    if qc_plot_path is not None:
+        try:
+            plot_pca_scores_motion(
+                run_dir=run_dir,
+                scores_csv=out_csv,
+                out_png=qc_plot_path,
+                score_columns=[
+                    "raw_component_score",
+                    "directed_score",
+                    "score_z",
+                    "feedback_score",
+                ],
+                title="PCA neurofeedback scores and motion",
+            )
+        except Exception:
+            pass
