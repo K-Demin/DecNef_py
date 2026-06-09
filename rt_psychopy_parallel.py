@@ -368,7 +368,7 @@ def _build_presentation_window(visual, color):
         "color": color,
         "units": "pix",
         "screen": 0,
-        "fullscr": False,
+        "fullscr": True,
     }
     try:
         import pyglet
@@ -397,20 +397,26 @@ def run_psychopy_presentation(
 ) -> None:
     from psychopy import core, event, visual
 
-    win = _build_presentation_window(visual, color="black")
-    title = visual.TextStim(win, text="Real-time Scores", pos=(0, 300), color="white")
+    background_color = [-0.004, -0.004, -0.004]
+    foreground_color = "black"
+    score_min = 0.0
+    score_max = 100.0
+    score_span = score_max - score_min
+
+    win = _build_presentation_window(visual, color=background_color)
+    title = visual.TextStim(win, text="Real-time Scores", pos=(0, 300), color=foreground_color)
     condition_text = visual.TextStim(
         win,
         text=condition.symbol,
         pos=(0, 200),
-        color="white",
+        color=foreground_color,
         height=80,
     )
     waiting_text = visual.TextStim(
         win,
         text="Waiting for scanner trigger ('s')...",
         pos=(0, 0),
-        color="white",
+        color=foreground_color,
     )
 
     margins = {"left": 80, "right": 40, "bottom": 80, "top": 80}
@@ -423,22 +429,36 @@ def run_psychopy_presentation(
         win,
         start=(origin_x, origin_y),
         end=(origin_x + plot_width, origin_y),
-        lineColor="white",
+        lineColor=foreground_color,
     )
     y_axis = visual.Line(
         win,
         start=(origin_x, origin_y),
         end=(origin_x, origin_y + plot_height),
-        lineColor="white",
+        lineColor=foreground_color,
     )
     # start as a degenerate 2-point line (valid Nx2)
     score_line = visual.ShapeStim(
         win,
         vertices=[(origin_x, origin_y), (origin_x, origin_y)],
         closeShape=False,
-        lineColor="cyan",
+        lineColor=foreground_color,
     )
-    last_score_text = visual.TextStim(win, text="", pos=(0, -300), color="white")
+    y_min_text = visual.TextStim(
+        win,
+        text="0",
+        pos=(origin_x - 30, origin_y),
+        color=foreground_color,
+        height=24,
+    )
+    y_max_text = visual.TextStim(
+        win,
+        text="100",
+        pos=(origin_x - 40, origin_y + plot_height),
+        color=foreground_color,
+        height=24,
+    )
+    last_score_text = visual.TextStim(win, text="", pos=(0, -300), color=foreground_color)
 
     scores = deque(maxlen=max_points)
     needs_redraw = True
@@ -476,19 +496,13 @@ def run_psychopy_presentation(
         if len(data) == 1:
             data = [data[0], data[0]]
 
-        min_score = min(data)
-        max_score = max(data)
-        if min_score == max_score:
-            min_score -= 0.5
-            max_score += 0.5
-
-        span = max_score - min_score
         x_step = plot_width / max(1, max_points - 1)
 
         vertices = []
         for idx, score in enumerate(data):
             x = origin_x + idx * x_step
-            y_norm = (score - min_score) / span
+            score_clipped = min(max(score, score_min), score_max)
+            y_norm = (score_clipped - score_min) / score_span
             y = origin_y + y_norm * plot_height
             vertices.append((x, y))
 
@@ -546,6 +560,8 @@ def run_psychopy_presentation(
             condition_text.draw()
             x_axis.draw()
             y_axis.draw()
+            y_min_text.draw()
+            y_max_text.draw()
             score_line.draw()
             last_score_text.draw()
             win.flip()
