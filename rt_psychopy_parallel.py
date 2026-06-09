@@ -1172,7 +1172,21 @@ def main() -> None:
             biopac_stop.set()
         if biopac_process is not None:
             biopac_process.join(timeout=5)
-        _plot_qc(run_dir)
+        if args.pca_mode:
+            pca_rt.plot_pca_scores_motion(
+                run_dir=run_dir,
+                scores_csv=run_dir / "pca_realtime_scores.csv",
+                out_png=run_dir / "qc_pca_scores_motion.png",
+                score_columns=[
+                    "raw_component_score",
+                    "directed_score",
+                    "score_z",
+                    "feedback_score",
+                ],
+                title="PCA neurofeedback scores and motion",
+            )
+        else:
+            _plot_qc(run_dir)
 
 
 if __name__ == "__main__":
