@@ -1,16 +1,10 @@
 #!/usr/bin/env python
 """
-Score a run with PCA decoders for all ROIs produced by roi_rs_pca_decoder_prep.py.
+Daily resting-state realtime PCA scoring.
 
-Example
--------
-python rs_pca_score_all_rois.py \
-  --subj 00085 --day 3 --run 1 --base-data ./data --pca-input reg
-
-Outputs
--------
-Writes per-TR component scores to:
-  .../day/PCA/<run>/pca_<mode>/scores_pca_all_rois.csv
+This script mirrors the realtime RS/NF path: it waits for scanner DICOMs,
+runs the normal rt_pipeline processing with an empty display, and scores all
+PCA ROI components as processed realtime volumes appear.
 """
 
 from __future__ import annotations
@@ -18,217 +12,76 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import subprocess
+import logging
+import multiprocessing as mp
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from queue import Full
+from typing import Optional
 
 import numpy as np
 
-from rs_pca_runtime import (
-    build_pca_root,
-    build_run_dir,
-    load_decoder_artifacts,
-    score_pca_volume,
+import rs_pca_runtime as pca_rt
+from rs_realtime_parallel import (
+    _merge_session_metadata,
+    _plot_qc,
+    _run_biopac_listener,
+    _run_pipeline_with_settings,
+    _run_prep_surface_rois,
+    _run_preproc,
+    _wait_for_epi_dicoms,
+    run_fixation_presentation,
 )
+from rt_global_settings import load_regressor_settings
 
 
-def _find_3d_series(run_dir: Path, pca_input: str) -> list[Path]:
-    folders = {
-        "mc": ("mc", "_mc"),
-        "reg": ("reg", "_reg"),
-        "t1": ("t1", "_t1"),
-        "unwarped": ("unwarped", "_mc_uw"),
-    }
-    if pca_input not in folders:
-        return []
-    folder_name, suffix = folders[pca_input]
-    src_dir = run_dir / folder_name
-    if not src_dir.exists():
-        return []
-    return sorted(
-        [
-            p
-            for p in src_dir.iterdir()
-            if p.is_file()
-            and (p.name.endswith(".nii") or p.name.endswith(".nii.gz"))
-            and suffix in p.name
-        ]
-    )
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("rs_pca_score_all_rois")
 
 
-def _ensure_score_4d(run_dir: Path, pca_input: str) -> Path:
-    analysis_dir = run_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-    out_path = analysis_dir / f"rs_4d_{pca_input}.nii.gz"
-    if out_path.exists():
-        return out_path
-
-    vols = _find_3d_series(run_dir, pca_input)
-    if not vols:
-        return out_path
-
-    cmd = ["fslmerge", "-t", str(out_path), *[str(v) for v in vols]]
-    subprocess.run(cmd, check=True)
-    return out_path
-
-
-def _load_4d(path: Path) -> np.ndarray:
-    import nibabel as nib
-
-    img = nib.load(str(path))
-    data = np.asarray(img.get_fdata(dtype=np.float32), dtype=np.float32)
-    if data.ndim != 4:
-        raise ValueError(f"Expected 4D NIfTI, got shape={data.shape} at {path}")
-    return data
-
-
-def _load_regression_keep_mask(
-    run_dir: Path,
-    t_expected: int,
-    *,
-    drop_first_ready: bool = True,
-) -> tuple[np.ndarray | None, dict]:
-    status_path = run_dir / "regression_status_rt.csv"
-    meta = {
-        "source": "regression_status_rt.csv",
-        "path": str(status_path),
-        "drop_first_ready": drop_first_ready,
-    }
-    if not status_path.exists():
-        meta["status"] = "missing"
-        return None, meta
-
-    ready = np.zeros(t_expected, dtype=bool)
-    rows_seen = 0
-    try:
-        with status_path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
-                meta["status"] = "missing_columns"
-                meta["columns"] = reader.fieldnames or []
-                return None, meta
-            for row in reader:
-                try:
-                    volume_idx = int(row["volume_idx"])
-                    reg_ready = bool(int(row["reg_ready"]))
-                except (TypeError, ValueError):
-                    continue
-                rows_seen += 1
-                if 1 <= volume_idx <= t_expected:
-                    ready[volume_idx - 1] = reg_ready
-    except Exception as exc:
-        meta["status"] = "read_failed"
-        meta["error"] = str(exc)
-        return None, meta
-
-    ready_idx = np.flatnonzero(ready)
-    meta["rows_seen"] = rows_seen
-    meta["ready_count"] = int(ready_idx.size)
-    if ready_idx.size == 0:
-        meta["status"] = "no_ready_volumes"
-        return None, meta
-
-    first_ready_zero = int(ready_idx[0])
-    keep = ready.copy()
-    if drop_first_ready:
-        keep[: first_ready_zero + 1] = False
-    else:
-        keep[:first_ready_zero] = False
-
-    meta.update(
-        {
-            "status": "ok",
-            "first_reg_ready_volume": first_ready_zero + 1,
-            "excluded_through_volume": first_ready_zero + 1 if drop_first_ready else first_ready_zero,
-            "kept_count": int(np.sum(keep)),
-            "excluded_count": int(t_expected - np.sum(keep)),
-        }
-    )
-    return keep, meta
-
-
-def _requires_regression_ready_filter(pca_input: str, input_path: Path | None = None) -> bool:
-    mode = str(pca_input).lower()
-    if mode in {"reg", "t1"}:
-        return True
-    if input_path is None:
-        return False
-    name = input_path.name.lower()
-    parent = input_path.parent.name.lower()
-    return parent in {"reg", "t1"} or "_reg" in name or "_t1" in name
-
-
-def _score_keep_mask(
-    run_dir: Path,
-    t_expected: int,
-    pca_input: str,
-    *,
-    input_path: Path | None = None,
-    include_pre_regression: bool,
-) -> tuple[np.ndarray, dict]:
-    if not include_pre_regression and _requires_regression_ready_filter(pca_input, input_path):
-        keep, meta = _load_regression_keep_mask(run_dir, t_expected, drop_first_ready=True)
-        if keep is not None:
-            print(
-                "[REGREADY] Scoring "
-                f"{meta['kept_count']}/{t_expected} volumes; "
-                f"first reg_ready volume={meta['first_reg_ready_volume']}, "
-                f"excluded through volume={meta['excluded_through_volume']}",
-                flush=True,
-            )
-            return keep, meta
-        raise FileNotFoundError(
-            "Cannot safely score regressed/T1 PCA input without usable regression_status_rt.csv: "
-            f"{meta}"
-        )
-
-    keep = np.ones(t_expected, dtype=bool)
-    meta = {
-        "source": "all_volumes",
-        "include_pre_regression": include_pre_regression,
-        "kept_count": int(t_expected),
-        "excluded_count": 0,
-    }
-    return keep, meta
-
-
-def _iter_roi_dirs(pca_root: Path) -> Iterable[Path]:
+def _iter_roi_dirs(pca_root: Path):
     for d in sorted(pca_root.iterdir()):
         if d.is_dir() and (d / "decoder_metadata.json").exists():
             yield d
 
 
-def _load_reference_stats(reference_csv: Path, columns: list[str]) -> dict[str, dict[str, float]]:
-    if not reference_csv.exists():
-        raise FileNotFoundError(f"Reference scores CSV not found: {reference_csv}")
-    with open(reference_csv, newline="", encoding="utf-8") as f:
+def _load_all_roi_decoders(pca_root: Path) -> dict[str, dict[str, np.ndarray]]:
+    decoders: dict[str, dict[str, np.ndarray]] = {}
+    for roi_dir in _iter_roi_dirs(pca_root):
+        decoders[roi_dir.name] = pca_rt.load_decoder_artifacts(roi_dir)
+    if not decoders:
+        raise RuntimeError(f"No ROI decoder folders found under {pca_root}")
+    return decoders
+
+
+def _score_columns(pc_counts: dict[str, int]) -> list[str]:
+    columns: list[str] = []
+    for roi in sorted(pc_counts):
+        for pc in range(1, pc_counts[roi] + 1):
+            columns.append(f"{roi}_PC{pc:02d}")
+    return columns
+
+
+def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
+    status_path = run_dir / "regression_status_rt.csv"
+    if not status_path.exists():
+        return None
+    ready: dict[int, bool] = {}
+    with status_path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            raise ValueError(f"Reference scores CSV has no header: {reference_csv}")
-        missing = [c for c in columns if c not in reader.fieldnames]
-        if missing:
-            raise ValueError(f"Reference scores CSV missing columns: {missing}")
-
-        buf: dict[str, list[float]] = {c: [] for c in columns}
+        if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+            return None
         for row in reader:
-            for c in columns:
-                try:
-                    v = float(row[c])
-                except (TypeError, ValueError):
-                    continue
-                if np.isfinite(v):
-                    buf[c].append(v)
+            try:
+                ready[int(row["volume_idx"])] = bool(int(row["reg_ready"]))
+            except (TypeError, ValueError):
+                continue
+    return ready
 
-    stats: dict[str, dict[str, float]] = {}
-    for c in columns:
-        arr = np.asarray(buf[c], dtype=float)
-        if arr.size < 2:
-            raise ValueError(f"Reference column '{c}' has insufficient valid rows (<2).")
-        std = float(arr.std())
-        if not np.isfinite(std) or std == 0.0:
-            raise ValueError(f"Reference column '{c}' has invalid std: {std}")
-        stats[c] = {"mean": float(arr.mean()), "std": std, "n": int(arr.size)}
-    return stats
+
+def _requires_regression_ready_filter(volume_kind: str) -> bool:
+    return str(volume_kind).lower() in {"reg", "t1", "mni"}
 
 
 def _write_reference_stats(
@@ -254,225 +107,552 @@ def _write_reference_stats(
     for column, buf in values.items():
         arr = np.asarray(buf, dtype=float)
         if arr.size < 2:
-            continue
+            raise ValueError(f"Reference column {column!r} has fewer than 2 valid samples")
+        std = float(arr.std())
+        if not np.isfinite(std) or std == 0.0:
+            raise ValueError(f"Reference column {column!r} has invalid std: {std}")
         payload["columns"][column] = {
             "mean": float(arr.mean()),
-            "std": float(arr.std()),
+            "std": std,
             "n": int(arr.size),
             "p05": float(np.percentile(arr, 5)),
             "p50": float(np.percentile(arr, 50)),
             "p95": float(np.percentile(arr, 95)),
         }
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def run_realtime_all_roi_pca_scorer(
+    *,
+    run_dir: Path,
+    pca_root: Path,
+    score_root: Path,
+    score_queue,
+    stop_event,
+    reference_stats_out: Optional[Path],
+    volume_kind: str,
+    normalization: str,
+    score_metric: str,
+    max_trs: Optional[int],
+    poll_interval: float,
+    metadata: dict,
+) -> None:
+    import nibabel as nib
+
+    decoders = _load_all_roi_decoders(pca_root)
+    pc_counts = {roi: int(dec["weights"].shape[0]) for roi, dec in decoders.items()}
+    score_columns = _score_columns(pc_counts)
+    fieldnames = ["volume_idx", "timestamp", *score_columns]
+
+    score_root.mkdir(parents=True, exist_ok=True)
+    out_csv = score_root / "scores_pca_all_rois.csv"
+    require_reg_ready = _requires_regression_ready_filter(volume_kind)
+    filter_meta = {
+        "source": "regression_status_rt.csv" if require_reg_ready else "none",
+        "require_regression_ready": require_reg_ready,
+        "drop_first_ready": require_reg_ready,
+        "first_reg_ready_volume": None,
+        "excluded_through_volume": None,
+        "skipped_not_ready": 0,
+        "skipped_first_ready": 0,
+    }
+
+    processed: set[int] = set()
+    scored_count = 0
+    volume_idx = 1
+
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        while True:
+            if max_trs is not None and volume_idx > max_trs:
+                break
+            if volume_idx in processed:
+                volume_idx += 1
+                continue
+
+            vol_path = pca_rt.volume_path_for_kind(run_dir, volume_idx, volume_kind)
+            if not vol_path.exists():
+                if stop_event.is_set():
+                    break
+                time.sleep(poll_interval)
+                continue
+
+            if require_reg_ready:
+                reg_ready_map = _load_reg_ready_map(run_dir)
+                if reg_ready_map is None or volume_idx not in reg_ready_map:
+                    if stop_event.is_set():
+                        break
+                    time.sleep(poll_interval)
+                    continue
+                if not reg_ready_map[volume_idx]:
+                    filter_meta["skipped_not_ready"] += 1
+                    processed.add(volume_idx)
+                    volume_idx += 1
+                    continue
+                if filter_meta["first_reg_ready_volume"] is None:
+                    filter_meta["first_reg_ready_volume"] = volume_idx
+                    filter_meta["excluded_through_volume"] = volume_idx
+                    filter_meta["skipped_first_ready"] = 1
+                    processed.add(volume_idx)
+                    volume_idx += 1
+                    continue
+
+            try:
+                img = nib.load(str(vol_path))
+                vol = np.asanyarray(img.dataobj)
+                row = {
+                    "volume_idx": volume_idx,
+                    "timestamp": time.time(),
+                }
+                for roi in sorted(decoders):
+                    scores = pca_rt.score_pca_volume(
+                        vol,
+                        decoders[roi],
+                        normalization=normalization,
+                        score_metric=score_metric,
+                    )
+                    for pc_idx, value in enumerate(scores, start=1):
+                        row[f"{roi}_PC{pc_idx:02d}"] = float(value)
+                writer.writerow(row)
+                f.flush()
+                scored_count += 1
+                try:
+                    score_queue.put_nowait({"volume_idx": volume_idx})
+                except Full:
+                    pass
+            except Exception as exc:
+                log.exception("Failed PCA scoring for volume %05d: %s", volume_idx, exc)
+            finally:
+                processed.add(volume_idx)
+                volume_idx += 1
+
+    summary = {
+        **metadata,
+        "score_root": str(score_root),
+        "pca_root": str(pca_root),
+        "volume_kind": volume_kind,
+        "normalization": normalization,
+        "score_metric": score_metric,
+        "n_scored": int(scored_count),
+        "n_seen_or_skipped": int(len(processed)),
+        "initial_volume_filter": filter_meta,
+        "rois": sorted(decoders.keys()),
+        "pc_counts": pc_counts,
+        "scores_csv": str(out_csv),
+    }
+    with (score_root / "scores_pca_all_rois_metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    stats_out = reference_stats_out or (score_root / "pca_reference_stats.json")
+    if scored_count < 2:
+        raise ValueError(f"Need at least 2 scored TRs for PCA reference stats, got {scored_count}")
+    _write_reference_stats(
+        scores_csv=out_csv,
+        columns=score_columns,
+        out_path=stats_out,
+        metadata=summary,
+    )
+    summary["reference_stats_json"] = str(stats_out)
+    with (score_root / "scores_pca_all_rois_metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    log.info("Saved realtime PCA ROI scores: %s", out_csv)
+    log.info("Saved realtime PCA reference stats: %s", stats_out)
+
+
+def _coalesce_sub(args) -> str:
+    sub = args.sub or args.subj
+    if not sub:
+        raise ValueError("Provide --sub")
+    return str(sub)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Score all PCA ROIs for an RS run")
-    parser.add_argument("--subj", required=True)
-    parser.add_argument("--day", required=True)
-    parser.add_argument("--run", required=True)
-    parser.add_argument("--base-data", type=Path, default=Path(__file__).resolve().parent / "data")
-    parser.add_argument("--pca-input", choices=["auto", "mc", "reg", "t1"], default="reg")
+    mp.set_start_method("spawn", force=True)
+    parser = argparse.ArgumentParser(
+        description="Run daily realtime RS with blank screen and score all PCA ROIs."
+    )
+    parser.add_argument("--sub", default=None, help="Subject ID, e.g. 00086")
+    parser.add_argument("--subj", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
+    parser.add_argument("--run", required=True, help="Run number, e.g. 4")
     parser.add_argument(
-        "--decoder-run",
-        default=None,
-        help="Run whose PCA decoder bundles should be used. Defaults to --run.",
+        "--incoming-root",
+        required=True,
+        help="Folder where scanner writes DICOMs in real time.",
     )
     parser.add_argument(
-        "--decoder-day",
+        "--base-data",
+        default="/SSD2/DecNef_py/data",
+        help="Base preproc data folder.",
+    )
+    parser.add_argument("--struct-block", type=int)
+    parser.add_argument("--ap-block", type=int)
+    parser.add_argument("--pa-block", type=int)
+    parser.add_argument(
+        "--epi-block",
+        type=int,
+        help="Block/run id for EPI DICOMs inside incoming-root; defaults to --run.",
+    )
+    parser.add_argument(
+        "--wait-epi-min",
+        type=int,
+        default=20,
+        help="Minimum EPI DICOMs to wait for before offline preproc.",
+    )
+    parser.add_argument(
+        "--prep-surface-rois",
+        action="store_true",
+        help="Run fmri_rt_preproc.prep_surface_rois after offline preproc.",
+    )
+    parser.add_argument(
+        "--pca-day",
         default=None,
         help="Day/session whose PCA decoder bundles should be used. Defaults to --day.",
     )
     parser.add_argument(
-        "--decoder-pca-root",
-        type=Path,
+        "--pca-run",
         default=None,
-        help="Explicit PCA decoder root containing ROI decoder folders.",
+        help="Run whose PCA decoder bundles should be used. Defaults to --run.",
     )
     parser.add_argument(
-        "--normalization",
+        "--pca-root",
+        type=Path,
+        default=None,
+        help="Explicit PCA decoder root containing ROI folders.",
+    )
+    parser.add_argument(
+        "--pca-input",
+        choices=["auto", "mc", "reg", "t1"],
+        default="t1",
+        help="PCA decoder folder name.",
+    )
+    parser.add_argument(
+        "--pca-space",
+        choices=["epi", "t1", "mni"],
+        default="t1",
+        help="rt_pipeline output space to create for PCA scoring.",
+    )
+    parser.add_argument(
+        "--pca-reference-image",
+        type=Path,
+        default=None,
+        help="Explicit reference image/grid for PCA-space transforms.",
+    )
+    parser.add_argument(
+        "--pca-reference-resolution",
+        choices=["epi", "t1"],
+        default="epi",
+        help="Default PCA T1 reference resolution when --pca-reference-image is not provided.",
+    )
+    parser.add_argument(
+        "--pca-reference-stats-out",
+        type=Path,
+        default=None,
+        help="Output JSON for daily PCA reference stats.",
+    )
+    parser.add_argument(
+        "--pca-volume-kind",
+        choices=["reg", "mc", "unwarped", "t1", "mni"],
+        default=None,
+        help="Realtime volume folder to score. Defaults from --pca-space.",
+    )
+    parser.add_argument(
+        "--pca-normalization",
         choices=["zscore", "demean", "none"],
         default="zscore",
-        help="Voxel normalization before PCA projection. zscore is recommended for consistency with PCA training.",
+        help="Voxel normalization before PCA projection.",
     )
     parser.add_argument(
-        "--score-metric",
+        "--pca-score-metric",
         choices=["projection", "cosine"],
         default="projection",
-        help="projection: weights @ voxels. cosine: cosine similarity between voxel vector and each PC.",
+        help="PCA score metric.",
     )
     parser.add_argument(
-        "--post-normalization",
-        choices=["none", "zscore"],
-        default="none",
-        help="Optional second-stage normalization of per-component scores using a reference CSV.",
+        "--pca-poll-interval",
+        type=float,
+        default=0.05,
+        help="Seconds between checks for newly processed realtime volumes.",
     )
+    parser.add_argument("--max-trs", type=int, default=None)
     parser.add_argument(
-        "--reference-scores-csv",
-        type=Path,
+        "--duration-min",
+        type=float,
         default=None,
-        help="Reference scores CSV (same columns as output) used when --post-normalization=zscore.",
+        help="Stop after this many minutes using TR from settings. Ignored if --max-trs is set.",
     )
-    parser.add_argument("--input-4d", type=Path, default=None, help="Optional explicit 4D volume to score.")
     parser.add_argument(
-        "--reference-stats-out",
-        type=Path,
+        "--skip-first-trs",
+        type=int,
+        default=10,
+        help="TRs to label as warmup in session metadata.",
+    )
+    parser.add_argument(
+        "--baseline-trs",
+        type=int,
         default=None,
-        help="Write daily RS reference stats JSON for PCA feedback normalization.",
+        help="TRs for voxel-wise normalization baseline.",
     )
+    parser.add_argument("--settings-file", default=None)
+    parser.add_argument("--max-workers", type=int, default=None)
+    parser.add_argument("--rt-max-scan-length", type=int, default=None)
+    parser.add_argument("--biopac-enable", action="store_true")
+    parser.add_argument("--biopac-host", default="0.0.0.0")
+    parser.add_argument("--biopac-port", type=int, default=15000)
+    parser.add_argument("--biopac-timeout", type=float, default=0.3)
     parser.add_argument(
-        "--write-reference-stats",
-        action="store_true",
-        help="Write reference stats to the default score output folder.",
+        "--biopac-phys-reg",
+        default="RICOR8",
+        choices=["RICOR8", "RVT5", "RVT+RICOR13"],
     )
-    parser.add_argument(
-        "--include-pre-regression-volumes",
-        action="store_true",
-        help="Do not exclude pre-regression and first reg_ready volumes for reg/t1 inputs.",
-    )
+    parser.add_argument("--biopac-handshake", action="store_true", default=True)
+    parser.add_argument("--biopac-start-online", action="store_true", default=False)
+    parser.add_argument("--biopac-mode", default="tcp", choices=["tcp", "file"])
+    parser.add_argument("--biopac-file", default=None)
+    parser.add_argument("--biopac-poll", type=float, default=0.05)
+    parser.add_argument("--biopac-listener", action="store_true")
     args = parser.parse_args()
-    if args.post_normalization == "zscore" and args.reference_scores_csv is None:
-        raise ValueError("--reference-scores-csv is required when --post-normalization=zscore")
 
-    run_dir = build_run_dir(args.base_data, args.subj, args.day, args.run)
-    day_dir = run_dir.parent.parent
-    score_root = build_pca_root(day_dir, run_dir.name, args.pca_input)
-    decoder_run = args.decoder_run or args.run
-    decoder_day = args.decoder_day or args.day
-    if args.decoder_pca_root is not None:
-        decoder_pca_root = args.decoder_pca_root
-    else:
-        decoder_run_dir = build_run_dir(args.base_data, args.subj, decoder_day, decoder_run)
-        decoder_day_dir = decoder_run_dir.parent.parent
-        decoder_pca_root = build_pca_root(
-            decoder_day_dir,
-            decoder_run_dir.name,
-            args.pca_input,
-        )
-    if not decoder_pca_root.exists():
-        raise FileNotFoundError(f"PCA decoder directory not found: {decoder_pca_root}")
+    from biopac_rt.biopac_receiver import BiopacReceiverConfig
+    from rt_pipeline import REGRESSOR_SETTINGS, RTSessionConfig
 
-    if args.input_4d is not None:
-        score_4d_path = args.input_4d
-    else:
-        if args.pca_input == "auto":
-            score_4d_path = run_dir / "analysis" / "rs_4d_auto.nii.gz"
-        else:
-            score_4d_path = _ensure_score_4d(run_dir, args.pca_input)
-        if not score_4d_path.exists() and args.pca_input == "auto":
-            for candidate in [run_dir / "analysis" / "rs_4d_reg.nii.gz", run_dir / "analysis" / "rs_4d_mc.nii.gz"]:
-                if candidate.exists():
-                    score_4d_path = candidate
-                    break
+    if args.settings_file:
+        loaded = load_regressor_settings(args.settings_file)
+        REGRESSOR_SETTINGS.update(vars(loaded))
 
-    if not score_4d_path.exists():
-        raise FileNotFoundError(f"Could not locate 4D scoring input: {score_4d_path}")
-
-    data_4d = _load_4d(score_4d_path)
-    n_trs = data_4d.shape[3]
-    score_keep, score_keep_meta = _score_keep_mask(
-        run_dir,
-        n_trs,
-        args.pca_input,
-        input_path=score_4d_path,
-        include_pre_regression=args.include_pre_regression_volumes,
+    sub = _coalesce_sub(args)
+    max_trs = args.max_trs
+    if max_trs is None and args.duration_min is not None:
+        max_trs = int(round((float(args.duration_min) * 60.0) / float(REGRESSOR_SETTINGS.TR)))
+    if args.skip_first_trs < 0:
+        raise ValueError("--skip-first-trs must be >= 0")
+    baseline_trs = (
+        int(args.baseline_trs)
+        if args.baseline_trs is not None
+        else int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
     )
-    score_tr_indices = np.flatnonzero(score_keep)
-    if score_tr_indices.size < 2:
-        raise ValueError(
-            "PCA scoring volume filter leaves fewer than 2 TRs "
-            f"({score_tr_indices.size}/{n_trs}): {score_keep_meta}"
+    if baseline_trs < 0:
+        raise ValueError("--baseline-trs must be >= 0")
+
+    try:
+        epi_block = int(args.epi_block if args.epi_block is not None else args.run)
+    except ValueError as exc:
+        raise ValueError("--run must be numeric when --epi-block is not provided.") from exc
+
+    incoming_root = Path(args.incoming_root)
+    base_data = Path(args.base_data)
+    if not incoming_root.exists():
+        raise FileNotFoundError(f"Incoming directory does not exist: {incoming_root}")
+
+    subject_root = base_data / f"sub-{sub}"
+    run_dir = subject_root / args.day / "func" / args.run
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    ctx = mp.get_context("spawn")
+    score_queue = ctx.Queue(maxsize=100)
+    fixation_stop = ctx.Event()
+    fixation_process = ctx.Process(
+        target=run_fixation_presentation,
+        args=(score_queue, max_trs, fixation_stop),
+    )
+    fixation_process.start()
+
+    _merge_session_metadata(
+        run_dir,
+        {
+            "fixation_display": {
+                "description": "Grey screen only; daily RS PCA all-ROI scoring.",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "skip_first_trs": args.skip_first_trs,
+                "baseline_trs": baseline_trs,
+            }
+        },
+    )
+
+    biopac_process = None
+    biopac_stop = None
+    try:
+        if args.biopac_listener:
+            if not args.biopac_enable:
+                raise ValueError("--biopac-listener requires --biopac-enable")
+            if args.biopac_mode != "file":
+                raise ValueError("--biopac-listener requires --biopac-mode=file")
+            biopac_output = Path(args.biopac_file) if args.biopac_file else (run_dir / "biopac_regressors_rx.csv")
+            args.biopac_file = str(biopac_output)
+            biopac_stop = ctx.Event()
+            expected_regressors = {
+                "RICOR8": 8,
+                "RVT5": 5,
+                "RVT+RICOR13": 13,
+            }.get(args.biopac_phys_reg, 8)
+            biopac_cfg = BiopacReceiverConfig(
+                host=args.biopac_host,
+                port=args.biopac_port,
+                timeout=args.biopac_timeout,
+                expected_regressors=expected_regressors,
+                handshake_tr=REGRESSOR_SETTINGS.TR if args.biopac_handshake else None,
+                subject=sub,
+                day=args.day,
+                run=args.run,
+                output_path=biopac_output,
+            )
+            biopac_process = ctx.Process(
+                target=_run_biopac_listener,
+                args=(biopac_cfg, biopac_stop),
+            )
+            biopac_process.start()
+
+        _wait_for_epi_dicoms(incoming_root, epi_block, min_vols=args.wait_epi_min)
+        _run_preproc(
+            sub=sub,
+            day=args.day,
+            base_data=base_data,
+            incoming_root=incoming_root,
+            struct_block=args.struct_block,
+            ap_block=args.ap_block,
+            pa_block=args.pa_block,
+            epi_block=epi_block,
+        )
+        if args.prep_surface_rois:
+            _run_prep_surface_rois(base_data, sub, args.day)
+
+        pca_reference_image = None
+        if args.pca_space in {"t1", "mni"}:
+            trans_dir = subject_root / args.day / "func" / "trans"
+            pca_reference_image = pca_rt.ensure_pca_t1_reference(
+                subject_root,
+                trans_dir,
+                args.pca_reference_image,
+                resolution=args.pca_reference_resolution,
+            )
+
+        pca_day = args.pca_day or args.day
+        pca_run = args.pca_run or args.run
+        if args.pca_root is not None:
+            pca_root = args.pca_root
+        else:
+            pca_run_dir = pca_rt.build_run_dir(base_data, sub, pca_day, pca_run)
+            pca_root = pca_rt.build_pca_root(pca_run_dir.parent.parent, pca_run_dir.name, args.pca_input)
+        if not pca_root.exists():
+            raise FileNotFoundError(f"PCA decoder root not found: {pca_root}")
+
+        score_root = pca_rt.build_pca_root(run_dir.parent.parent, run_dir.name, args.pca_input)
+        pca_volume_kind = args.pca_volume_kind
+        if pca_volume_kind is None:
+            pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
+
+        settings_payload = vars(REGRESSOR_SETTINGS).copy()
+        settings_payload.update(
+            {
+                "skip_first_trs": args.skip_first_trs,
+                "voxel_norm_ref_volumes": max(1, baseline_trs),
+                "enable_biopac_physio": args.biopac_enable,
+                "biopac_host": args.biopac_host,
+                "biopac_port": args.biopac_port,
+                "biopac_timeout": args.biopac_timeout,
+                "biopac_phys_reg": args.biopac_phys_reg,
+                "biopac_handshake": args.biopac_handshake,
+                "biopac_start_online_only": args.biopac_start_online,
+                "biopac_mode": args.biopac_mode,
+                "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
+                "biopac_poll_interval": args.biopac_poll,
+                "analysis_space": args.pca_space,
+                "truncate_t1_to_epi_fov": False,
+            }
+        )
+        if args.max_workers is not None:
+            settings_payload["max_workers"] = max(1, int(args.max_workers))
+        if args.rt_max_scan_length is not None:
+            settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
+
+        cfg = RTSessionConfig(
+            subject=sub,
+            day=args.day,
+            run=args.run,
+            incoming_root=incoming_root,
+            base_data=base_data,
+            decoder_template=pca_reference_image,
+            enable_scoring=False,
         )
 
-    roi_decoders: dict[str, dict] = {}
-    for roi_dir in _iter_roi_dirs(decoder_pca_root):
-        roi = roi_dir.name
-        roi_decoders[roi] = load_decoder_artifacts(roi_dir)
-
-    if not roi_decoders:
-        raise RuntimeError(f"No ROI decoder folders found under {decoder_pca_root}")
-
-    pc_counts = {roi: dec["weights"].shape[0] for roi, dec in roi_decoders.items()}
-    max_pcs = max(pc_counts.values())
-
-    score_root.mkdir(parents=True, exist_ok=True)
-    out_csv = score_root / "scores_pca_all_rois.csv"
-    fieldnames = ["tr"]
-    for roi in sorted(roi_decoders):
-        for pc in range(1, max_pcs + 1):
-            fieldnames.append(f"{roi}_PC{pc:02d}")
-    score_columns = fieldnames[1:]
-    reference_stats: dict[str, dict[str, float]] | None = None
-    if args.post_normalization == "zscore":
-        reference_stats = _load_reference_stats(args.reference_scores_csv, score_columns)
-        for key in score_columns:
-            fieldnames.append(f"{key}_z")
-
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for tr in score_tr_indices:
-            vol = data_4d[..., tr]
-            row = {"tr": int(tr) + 1}
-            for roi in sorted(roi_decoders):
-                dec = roi_decoders[roi]
-                pcs = score_pca_volume(
-                    vol,
-                    dec,
-                    normalization=args.normalization,
-                    score_metric=args.score_metric,
-                )
-                for idx in range(max_pcs):
-                    key = f"{roi}_PC{idx + 1:02d}"
-                    row[key] = float(pcs[idx]) if idx < pcs.shape[0] else ""
-                    if reference_stats is not None and row[key] != "":
-                        row[f"{key}_z"] = (
-                            float(row[key]) - reference_stats[key]["mean"]
-                        ) / reference_stats[key]["std"]
-                    elif reference_stats is not None:
-                        row[f"{key}_z"] = ""
-            writer.writerow(row)
-
-    summary = {
-        "subj": args.subj,
-        "day": args.day,
-        "run": args.run,
-        "score_root": str(score_root),
-        "decoder_day": decoder_day,
-        "decoder_run": decoder_run,
-        "decoder_pca_root": str(decoder_pca_root),
-        "input_4d": str(score_4d_path),
-        "normalization": args.normalization,
-        "score_metric": args.score_metric,
-        "post_normalization": args.post_normalization,
-        "reference_scores_csv": str(args.reference_scores_csv) if args.reference_scores_csv else None,
-        "n_trs": int(score_tr_indices.size),
-        "n_trs_original": int(n_trs),
-        "initial_volume_filter": score_keep_meta,
-        "rois": sorted(roi_decoders.keys()),
-        "pc_counts": pc_counts,
-        "scores_csv": str(out_csv),
-    }
-    with open(score_root / "scores_pca_all_rois_metadata.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    stats_out = args.reference_stats_out
-    if stats_out is None and args.write_reference_stats:
-        stats_out = score_root / "pca_reference_stats.json"
-    if stats_out is not None:
-        _write_reference_stats(
-            scores_csv=out_csv,
-            columns=score_columns,
-            out_path=stats_out,
-            metadata=summary,
+        metadata = {
+            "subj": sub,
+            "day": args.day,
+            "run": args.run,
+            "decoder_day": pca_day,
+            "decoder_run": pca_run,
+            "decoder_pca_root": str(pca_root),
+            "pca_input": args.pca_input,
+            "pca_space": args.pca_space,
+            "pca_reference_image": str(pca_reference_image) if pca_reference_image else None,
+            "pca_reference_resolution": args.pca_reference_resolution,
+        }
+        _merge_session_metadata(
+            run_dir,
+            {
+                "pca_daily_rs": {
+                    **metadata,
+                    "score_root": str(score_root),
+                    "volume_kind": pca_volume_kind,
+                    "normalization": args.pca_normalization,
+                    "score_metric": args.pca_score_metric,
+                    "reference_stats_out": (
+                        str(args.pca_reference_stats_out)
+                        if args.pca_reference_stats_out
+                        else str(score_root / "pca_reference_stats.json")
+                    ),
+                }
+            },
         )
-        summary["reference_stats_json"] = str(stats_out)
-        with open(score_root / "scores_pca_all_rois_metadata.json", "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2)
 
-    print(f"Saved PCA ROI scores: {out_csv}")
+        pipeline_process = ctx.Process(
+            target=_run_pipeline_with_settings,
+            args=(cfg, score_queue, settings_payload),
+        )
+        pca_stop = ctx.Event()
+        pca_process = ctx.Process(
+            target=run_realtime_all_roi_pca_scorer,
+            kwargs={
+                "run_dir": run_dir,
+                "pca_root": pca_root,
+                "score_root": score_root,
+                "score_queue": score_queue,
+                "stop_event": pca_stop,
+                "reference_stats_out": args.pca_reference_stats_out,
+                "volume_kind": pca_volume_kind,
+                "normalization": args.pca_normalization,
+                "score_metric": args.pca_score_metric,
+                "max_trs": max_trs,
+                "poll_interval": args.pca_poll_interval,
+                "metadata": metadata,
+            },
+        )
+        pipeline_process.start()
+        pca_process.start()
+
+        pipeline_process.join()
+        pca_stop.set()
+        pca_process.join(timeout=60)
+        if pca_process.is_alive():
+            pca_process.terminate()
+            pca_process.join(timeout=5)
+            raise RuntimeError("Realtime PCA all-ROI scorer did not finish cleanly")
+        if pipeline_process.exitcode not in (0, None):
+            raise RuntimeError(f"rt_pipeline failed with exit code {pipeline_process.exitcode}")
+        if pca_process.exitcode not in (0, None):
+            raise RuntimeError(f"Realtime PCA all-ROI scorer failed with exit code {pca_process.exitcode}")
+        _plot_qc(run_dir)
+    finally:
+        fixation_stop.set()
+        fixation_process.join(timeout=5)
+        if biopac_stop is not None:
+            biopac_stop.set()
+        if biopac_process is not None:
+            biopac_process.join(timeout=5)
 
 
 if __name__ == "__main__":

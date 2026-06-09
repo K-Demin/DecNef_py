@@ -478,17 +478,17 @@ def main() -> None:
     parser.add_argument(
         "--pca-score",
         action="store_true",
-        help="Score this RS run with existing PCA decoders after the run completes.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-day",
         default=None,
-        help="Day/session whose PCA decoder bundles should be used for --pca-score.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-run",
         default=None,
-        help="Run whose PCA decoder bundles should be used for --pca-score.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-input",
@@ -518,19 +518,19 @@ def main() -> None:
         "--pca-reference-stats-out",
         type=Path,
         default=None,
-        help="Output JSON for daily PCA reference stats.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-normalization",
         choices=["zscore", "demean", "none"],
         default="zscore",
-        help="Voxel normalization before PCA projection.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--pca-score-metric",
         choices=["projection", "cosine"],
         default="projection",
-        help="PCA score metric for daily RS reference scoring.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--biopac-enable",
@@ -631,6 +631,11 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    if args.pca_score:
+        raise ValueError(
+            "--pca-score no longer belongs in rs_realtime_parallel.py. "
+            "Run rs_pca_score_all_rois.py directly for daily realtime PCA all-ROI scoring."
+        )
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
 
     if args.settings_file:
@@ -662,7 +667,7 @@ def main() -> None:
 
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
-    pca_workflow = args.pca_prep or args.pca_score
+    pca_workflow = args.pca_prep
     pca_reference_image = None
 
     ctx = mp.get_context("spawn")
