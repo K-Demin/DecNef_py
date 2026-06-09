@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from multiprocessing import Queue
 from pathlib import Path
 from queue import Full
-from typing import Optional
+from typing import Any, Optional
 import subprocess
 
 import numpy as np
@@ -265,7 +265,73 @@ def ensure_pca_t1_reference(
     return out_path
 
 
-def load_decoder_artifacts(roi_dir: Path) -> dict[str, np.ndarray]:
+class PCAReferenceMismatchError(RuntimeError):
+    """Raised when a PCA decoder and realtime volume are not in the same grid."""
+
+
+def find_pca_decoder_reference_image(pca_root: Path) -> Optional[Path]:
+    pca_root = Path(pca_root)
+    if not pca_root.exists():
+        return None
+    reference_names = (
+        "roi_selected_mask.nii.gz",
+        "roi_original_mask.nii.gz",
+        "PC01.nii.gz",
+        "roi_tsnr_in_roi.nii.gz",
+    )
+    for roi_dir in sorted([p for p in pca_root.iterdir() if p.is_dir()]):
+        if not (roi_dir / "decoder_metadata.json").exists():
+            continue
+        for name in reference_names:
+            candidate = roi_dir / name
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def resolve_pca_transform_reference(
+    *,
+    subject_root: Path,
+    decoder_trans_dir: Path,
+    pca_root: Path,
+    explicit_path: Optional[Path] = None,
+    resolution: str = "epi",
+    truncate_to_epi_fov: bool = True,
+    padding_vox: int = 2,
+) -> Path:
+    if explicit_path is not None:
+        explicit_path = Path(explicit_path)
+        if not explicit_path.exists():
+            raise FileNotFoundError(f"PCA reference image not found: {explicit_path}")
+        return explicit_path
+
+    decoder_ref = find_pca_decoder_reference_image(pca_root)
+    if decoder_ref is not None:
+        return decoder_ref
+
+    return ensure_pca_t1_reference(
+        subject_root,
+        decoder_trans_dir,
+        None,
+        resolution=resolution,
+        truncate_to_epi_fov=truncate_to_epi_fov,
+        padding_vox=padding_vox,
+    )
+
+
+def _decoder_metadata(roi_dir: Path) -> dict[str, Any]:
+    metadata_path = roi_dir / "decoder_metadata.json"
+    if not metadata_path.exists():
+        return {}
+    try:
+        with metadata_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_decoder_artifacts(roi_dir: Path) -> dict[str, Any]:
     bundle_path = roi_dir / "decoder_bundle.npz"
     if bundle_path.exists():
         z = np.load(bundle_path)
@@ -277,6 +343,7 @@ def load_decoder_artifacts(roi_dir: Path) -> dict[str, np.ndarray]:
         }
         if "explained" in z.files:
             artifacts["explained"] = z["explained"].astype(np.float32, copy=False)
+        artifacts["_metadata"] = _decoder_metadata(roi_dir)
         return artifacts
 
     artifacts = {
@@ -288,7 +355,64 @@ def load_decoder_artifacts(roi_dir: Path) -> dict[str, np.ndarray]:
     explained_path = roi_dir / "pca_explained.npy"
     if explained_path.exists():
         artifacts["explained"] = np.load(explained_path).astype(np.float32, copy=False)
+    artifacts["_metadata"] = _decoder_metadata(roi_dir)
     return artifacts
+
+
+def validate_pca_decoder_volume_grid(
+    *,
+    decoders: dict[str, dict[str, Any]],
+    volume_shape: tuple[int, ...],
+    volume_affine: Optional[np.ndarray] = None,
+    volume_source: Optional[Path] = None,
+) -> None:
+    shape3d = tuple(int(v) for v in volume_shape[:3])
+    flat_size = int(np.prod(shape3d))
+    source = f" ({volume_source})" if volume_source is not None else ""
+
+    for roi, decoder in decoders.items():
+        voxel_indices = np.asarray(decoder["voxel_indices"], dtype=np.int64)
+        if voxel_indices.size:
+            max_index = int(np.max(voxel_indices))
+            if max_index >= flat_size:
+                raise PCAReferenceMismatchError(
+                    "PCA decoder/live volume grid mismatch"
+                    f"{source}: live volume shape={shape3d}, flat size={flat_size}, "
+                    f"but ROI {roi!r} decoder needs voxel index {max_index}. "
+                    "This usually means the decoder was built in a different T1/MNI "
+                    "reference grid than the realtime transformed volumes. For cross-day "
+                    "T1 PCA, transform live volumes into the decoder grid or rerun PCA "
+                    "decoder prep with the same reference/input grid."
+                )
+
+        metadata = decoder.get("_metadata")
+        if not isinstance(metadata, dict):
+            continue
+
+        ref_shape = metadata.get("reference_shape")
+        if ref_shape is not None:
+            ref_shape3d = tuple(int(v) for v in ref_shape[:3])
+            if ref_shape3d != shape3d:
+                raise PCAReferenceMismatchError(
+                    "PCA decoder/live volume shape mismatch"
+                    f"{source}: live volume shape={shape3d}, ROI {roi!r} "
+                    f"decoder reference_shape={ref_shape3d}."
+                )
+
+        ref_affine = metadata.get("reference_affine")
+        if ref_affine is not None and volume_affine is not None:
+            ref_affine_arr = np.asarray(ref_affine, dtype=np.float64)
+            volume_affine_arr = np.asarray(volume_affine, dtype=np.float64)
+            if ref_affine_arr.shape == (4, 4) and not np.allclose(
+                ref_affine_arr,
+                volume_affine_arr,
+                atol=1e-3,
+            ):
+                raise PCAReferenceMismatchError(
+                    "PCA decoder/live volume affine mismatch"
+                    f"{source}: live volume affine does not match ROI {roi!r} "
+                    "decoder reference_affine."
+                )
 
 
 LEGACY_COMPONENT_METRICS = {"projection", "cosine"}
@@ -318,11 +442,20 @@ def normalize_score_metric(score_metric: str) -> str:
 
 def _normalized_roi_vector(
     volume_3d: np.ndarray,
-    decoder: dict[str, np.ndarray],
+    decoder: dict[str, Any],
     normalization: str,
 ) -> np.ndarray:
     flat = volume_3d.reshape(-1).astype(np.float32, copy=False)
-    x = flat[decoder["voxel_indices"]]
+    voxel_indices = decoder["voxel_indices"]
+    if voxel_indices.size and int(np.max(voxel_indices)) >= flat.size:
+        metadata = decoder.get("_metadata")
+        roi = metadata.get("roi") if isinstance(metadata, dict) else None
+        roi_text = f" for ROI {roi!r}" if roi else ""
+        raise PCAReferenceMismatchError(
+            f"PCA decoder/live volume grid mismatch{roi_text}: "
+            f"live flat size={flat.size}, decoder max voxel index={int(np.max(voxel_indices))}."
+        )
+    x = flat[voxel_indices]
 
     if normalization == "zscore":
         safe_std = np.where(decoder["norm_std"] == 0, 1.0, decoder["norm_std"])
@@ -941,6 +1074,7 @@ def run_realtime_pca_scorer(
     out_csv = run_dir / "pca_realtime_scores.csv"
     processed: set[int] = set()
     volume_idx = 1
+    validated_grid = False
     while True:
         if max_trs is not None and volume_idx > max_trs:
             break
@@ -959,8 +1093,17 @@ def run_realtime_pca_scorer(
 
         try:
             img = nib.load(str(vol_path))
+            vol = np.asanyarray(img.dataobj)
+            if not validated_grid:
+                validate_pca_decoder_volume_grid(
+                    decoders={condition.roi: decoder},
+                    volume_shape=vol.shape[:3],
+                    volume_affine=img.affine,
+                    volume_source=vol_path,
+                )
+                validated_grid = True
             raw_score = score_pca_scalar(
-                np.asanyarray(img.dataobj),
+                vol,
                 decoder,
                 normalization=normalization,
                 score_metric=score_metric,
@@ -992,6 +1135,8 @@ def run_realtime_pca_scorer(
                 pass
             processed.add(volume_idx)
             volume_idx += 1
+        except PCAReferenceMismatchError:
+            raise
         except Exception as exc:
             try:
                 score_queue.put_nowait(

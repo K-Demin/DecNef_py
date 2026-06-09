@@ -860,20 +860,10 @@ def main() -> None:
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
     base_data = Path(args.base_data)
     subject_root = base_data / f"sub-{args.sub}"
-    trans_dir = subject_root / args.day / "func" / "trans"
     pca_reference_image = None
-    if args.pca_mode and args.pca_space in {"t1", "mni"}:
-        pca_reference_image = pca_rt.ensure_pca_t1_reference(
-            subject_root,
-            trans_dir,
-            args.pca_reference_image,
-            resolution=args.pca_reference_resolution,
-            truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
-            padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
-        )
     cfg_decoder_template = (
-        pca_reference_image
-        if args.pca_mode and pca_reference_image is not None
+        None
+        if args.pca_mode
         else Path(args.decoder_template) if args.decoder_template else None
     )
     cfg = RTSessionConfig(
@@ -978,6 +968,19 @@ def main() -> None:
         )
         if not pca_root.exists():
             raise FileNotFoundError(f"PCA decoder root not found: {pca_root}")
+        if args.pca_space in {"t1", "mni"}:
+            decoder_trans_dir = subject_root / pca_day / "func" / "trans"
+            pca_reference_image = pca_rt.resolve_pca_transform_reference(
+                subject_root=subject_root,
+                decoder_trans_dir=decoder_trans_dir,
+                pca_root=pca_root,
+                explicit_path=args.pca_reference_image,
+                resolution=args.pca_reference_resolution,
+                truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
+                padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
+            )
+            cfg.decoder_template = pca_reference_image
+            log.info("Using PCA transform reference: %s", pca_reference_image)
     else:
         symbols = _shuffle_symbols(symbols, symbol_seed)
         conditions = _build_conditions(roi_labels, direction_labels, symbols)

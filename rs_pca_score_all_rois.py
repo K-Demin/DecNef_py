@@ -121,6 +121,7 @@ def run_realtime_all_roi_pca_scorer(
     processed: set[int] = set()
     scored_count = 0
     volume_idx = 1
+    validated_grid = False
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -163,6 +164,22 @@ def run_realtime_all_roi_pca_scorer(
             try:
                 img = nib.load(str(vol_path))
                 vol = np.asanyarray(img.dataobj)
+            except Exception as exc:
+                log.exception("Failed loading PCA scoring volume %05d: %s", volume_idx, exc)
+                processed.add(volume_idx)
+                volume_idx += 1
+                continue
+
+            if not validated_grid:
+                pca_rt.validate_pca_decoder_volume_grid(
+                    decoders=decoders,
+                    volume_shape=vol.shape[:3],
+                    volume_affine=img.affine,
+                    volume_source=vol_path,
+                )
+                validated_grid = True
+
+            try:
                 row = {
                     "volume_idx": volume_idx,
                     "timestamp": time.time(),
@@ -185,6 +202,8 @@ def run_realtime_all_roi_pca_scorer(
                     score_queue.put_nowait({"volume_idx": volume_idx})
                 except Full:
                     pass
+            except pca_rt.PCAReferenceMismatchError:
+                raise
             except Exception as exc:
                 log.exception("Failed PCA scoring for volume %05d: %s", volume_idx, exc)
             finally:
@@ -505,18 +524,6 @@ def main() -> None:
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, sub, args.day)
 
-        pca_reference_image = None
-        if args.pca_space in {"t1", "mni"}:
-            trans_dir = subject_root / args.day / "func" / "trans"
-            pca_reference_image = pca_rt.ensure_pca_t1_reference(
-                subject_root,
-                trans_dir,
-                args.pca_reference_image,
-                resolution=args.pca_reference_resolution,
-                truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
-                padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
-            )
-
         pca_day = args.pca_day or args.day
         pca_run = args.pca_run or args.run
         if args.pca_root is not None:
@@ -526,6 +533,20 @@ def main() -> None:
             pca_root = pca_rt.build_pca_root(pca_run_dir.parent.parent, pca_run_dir.name, args.pca_input)
         if not pca_root.exists():
             raise FileNotFoundError(f"PCA decoder root not found: {pca_root}")
+
+        pca_reference_image = None
+        if args.pca_space in {"t1", "mni"}:
+            decoder_trans_dir = subject_root / pca_day / "func" / "trans"
+            pca_reference_image = pca_rt.resolve_pca_transform_reference(
+                subject_root=subject_root,
+                decoder_trans_dir=decoder_trans_dir,
+                pca_root=pca_root,
+                explicit_path=args.pca_reference_image,
+                resolution=args.pca_reference_resolution,
+                truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
+                padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
+            )
+            log.info("Using PCA transform reference: %s", pca_reference_image)
 
         score_root = pca_rt.build_pca_root(run_dir.parent.parent, run_dir.name, args.pca_input)
         pca_volume_kind = args.pca_volume_kind
