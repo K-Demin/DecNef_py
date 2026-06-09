@@ -51,6 +51,8 @@ class RegressorSettings:
     pipeline_engine: str = "parallel_ordered"  # "parallel_ordered" or "legacy"
     commit_wait_timeout_s: float = 1.0
     skip_first_trs: int = 0
+    truncate_t1_to_epi_fov: bool = True
+    truncate_t1_padding_vox: int = 2
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
@@ -71,6 +73,8 @@ class RegressorSettings:
                 setattr(self, key, max(0, int(value)))
             elif key == "rt_max_scan_length":
                 setattr(self, key, max(1, int(value)))
+            elif key == "truncate_t1_padding_vox":
+                setattr(self, key, max(0, int(value)))
             elif key == "fieldmap_method":
                 setattr(self, key, str(value).lower())
             elif key == "epi_phase_encoding":

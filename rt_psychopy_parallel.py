@@ -173,6 +173,7 @@ def _append_condition_score(csv_path: Path, message: dict, condition: Condition)
         "directed_score",
         "condition_id",
         "roi",
+        "score_label",
         "pc",
         "direction",
         "symbol",
@@ -193,6 +194,7 @@ def _append_condition_score(csv_path: Path, message: dict, condition: Condition)
                 "directed_score": message.get("directed_score"),
                 "condition_id": condition.condition_id,
                 "roi": "" if blind_condition else getattr(condition, "roi", ""),
+                "score_label": message.get("score_label"),
                 "pc": "" if blind_condition else getattr(condition, "pc", ""),
                 "direction": "" if blind_condition else getattr(condition, "direction", ""),
                 "symbol": condition.symbol,
@@ -354,9 +356,7 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
     from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    for key, value in settings.items():
-        if hasattr(REGRESSOR_SETTINGS, key):
-            setattr(REGRESSOR_SETTINGS, key, value)
+    REGRESSOR_SETTINGS.update(settings)
     run_rt_pipeline(cfg, score_queue)
 
 
@@ -747,10 +747,16 @@ def main() -> None:
         help="Default PCA T1 reference resolution when --pca-reference-image is not provided.",
     )
     parser.add_argument(
+        "--pca-reference-scores",
+        type=Path,
+        default=None,
+        help="Daily RS raw PCA scores CSV from rs_pca_score_all_rois.py.",
+    )
+    parser.add_argument(
         "--pca-reference-stats",
         type=Path,
         default=None,
-        help="Daily RS reference stats JSON from rs_pca_score_all_rois.py.",
+        help="Deprecated explicit daily RS reference stats JSON.",
     )
     parser.add_argument(
         "--pca-reference-day",
@@ -760,7 +766,7 @@ def main() -> None:
     parser.add_argument(
         "--pca-reference-run",
         default=None,
-        help="Run whose daily RS PCA reference stats should be used for feedback.",
+        help="Run whose daily RS PCA scores should be used for feedback.",
     )
     parser.add_argument(
         "--pca-volume-kind",
@@ -770,8 +776,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-target-pc",
-        default="PC01",
-        help="PC to modulate for each ROI condition.",
+        default=None,
+        help="Legacy single PC to modulate when --pca-score-metric is projection/cosine.",
     )
     parser.add_argument(
         "--pca-normalization",
@@ -781,9 +787,26 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-score-metric",
-        choices=["projection", "cosine"],
-        default="projection",
-        help="PCA score metric used for realtime feedback.",
+        choices=sorted(pca_rt.ALL_SCORE_METRICS),
+        default="subspace_cosine",
+        help="PCA scalar score. Default is cosine closeness to the top-PC subspace.",
+    )
+    parser.add_argument(
+        "--pca-top-pcs",
+        default="auto",
+        help=(
+            "Top PCs for multi-PC metrics: auto uses a cumulative explained-variance "
+            "target; also accepts integer count, var:0.01, or all."
+        ),
+    )
+    parser.add_argument(
+        "--pca-top-pc-variance",
+        type=float,
+        default=0.10,
+        help=(
+            "Cumulative explained-variance threshold used only when "
+            "--pca-top-pcs=auto. If the saved PCs do not reach it, auto uses all saved PCs."
+        ),
     )
     parser.add_argument(
         "--pca-poll-interval",
@@ -845,6 +868,8 @@ def main() -> None:
             trans_dir,
             args.pca_reference_image,
             resolution=args.pca_reference_resolution,
+            truncate_to_epi_fov=bool(REGRESSOR_SETTINGS.truncate_t1_to_epi_fov),
+            padding_vox=int(REGRESSOR_SETTINGS.truncate_t1_padding_vox),
         )
     cfg_decoder_template = (
         pca_reference_image
@@ -884,10 +909,17 @@ def main() -> None:
         settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
     if args.pca_mode:
         settings_payload["analysis_space"] = args.pca_space
-        settings_payload["truncate_t1_to_epi_fov"] = False
     pca_volume_kind = args.pca_volume_kind
     if args.pca_mode and pca_volume_kind is None:
         pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
+    pca_score_label = None
+    if args.pca_mode:
+        pca_score_label = pca_rt.resolve_score_label(
+            score_metric=args.pca_score_metric,
+            target_pc=args.pca_target_pc,
+            top_pcs=args.pca_top_pcs,
+            top_pc_variance=args.pca_top_pc_variance,
+        )
 
     roi_labels = _parse_csv_list(args.roi_labels)
     direction_labels = _parse_csv_list(args.direction_labels)
@@ -914,7 +946,7 @@ def main() -> None:
             roi_labels=roi_labels,
             direction_labels=direction_labels,
             symbols=symbols,
-            target_pc=args.pca_target_pc,
+            target_pc=pca_score_label,
             condition_seed=args.condition_seed,
             symbol_seed=symbol_seed,
         )
@@ -925,7 +957,11 @@ def main() -> None:
                 condition_index = int(args.run)
             except ValueError:
                 condition_index = 1
-        condition = pca_rt.condition_for_index(schedule, condition_index)
+        condition = pca_rt.condition_for_index(
+            schedule,
+            condition_index,
+            score_label=pca_score_label,
+        )
         _write_pca_run_assignment(
             run_dir,
             condition,
@@ -955,28 +991,41 @@ def main() -> None:
         condition = _condition_for_run(schedule, args.run)
         _write_run_assignment(run_dir, condition, schedule_path)
     condition_scores_path = run_dir / "scores_with_conditions.csv"
+    reference_scores_path = args.pca_reference_scores
     reference_stats_path = args.pca_reference_stats
+    reference_stats = {}
     reference_stats_day = args.pca_reference_day
     reference_stats_run = args.pca_reference_run
     if args.pca_mode:
-        if reference_stats_run is not None:
+        if reference_scores_path is not None and reference_stats_path is not None:
+            raise ValueError("Use either --pca-reference-scores or --pca-reference-stats, not both.")
+        if reference_stats_path is not None:
+            if not reference_stats_path.exists():
+                raise FileNotFoundError(f"PCA daily RS reference stats not found: {reference_stats_path}")
+            reference_stats = pca_rt.load_reference_stats(reference_stats_path)
+        elif reference_stats_run is not None:
             reference_stats_day = reference_stats_day or args.day
-            reference_stats_path = pca_rt.build_reference_stats_path(
+            reference_scores_path = pca_rt.build_reference_scores_path(
                 base_data,
                 args.sub,
                 reference_stats_day,
                 reference_stats_run,
                 args.pca_input,
             )
-        elif reference_stats_day is not None and reference_stats_path is None:
+        elif reference_stats_day is not None and reference_scores_path is None:
             raise ValueError(
                 "--pca-reference-day requires --pca-reference-run unless "
-                "--pca-reference-stats is provided explicitly."
+                "--pca-reference-scores is provided explicitly."
             )
-        if reference_stats_path is not None and not reference_stats_path.exists():
-            raise FileNotFoundError(
-                f"PCA daily RS reference stats not found: {reference_stats_path}. "
-                "Run rs_realtime_parallel.py with --pca-score for that daily RS run first."
+        if reference_scores_path is not None:
+            if not reference_scores_path.exists():
+                raise FileNotFoundError(
+                    f"PCA daily RS reference scores not found: {reference_scores_path}. "
+                    "Run rs_pca_score_all_rois.py for that daily RS run first."
+                )
+            reference_stats = pca_rt.load_reference_stats_from_score_csv(
+                reference_scores_path,
+                [condition.score_column],
             )
 
     condition_payload = {
@@ -1022,13 +1071,13 @@ def main() -> None:
                     "reference_resolution": args.pca_reference_resolution,
                     "volume_kind": pca_volume_kind,
                     "target_pc": args.pca_target_pc,
+                    "score_label": pca_score_label,
+                    "top_pcs": args.pca_top_pcs,
+                    "top_pc_variance": args.pca_top_pc_variance,
                     "normalization": args.pca_normalization,
                     "score_metric": args.pca_score_metric,
-                    "reference_stats": (
-                        str(reference_stats_path)
-                        if reference_stats_path
-                        else None
-                    ),
+                    "reference_scores": str(reference_scores_path) if reference_scores_path else None,
+                    "reference_stats": str(reference_stats_path) if reference_stats_path else None,
                     "reference_stats_day": reference_stats_day,
                     "reference_stats_run": reference_stats_run,
                 }
@@ -1089,9 +1138,13 @@ def main() -> None:
                 "score_queue": score_queue,
                 "stop_event": pca_stop,
                 "reference_stats_path": reference_stats_path,
+                "reference_stats": reference_stats,
                 "volume_kind": pca_volume_kind,
                 "normalization": args.pca_normalization,
                 "score_metric": args.pca_score_metric,
+                "target_pc": args.pca_target_pc,
+                "top_pcs": args.pca_top_pcs,
+                "top_pc_variance": args.pca_top_pc_variance,
                 "max_trs": max_trs,
                 "poll_interval": args.pca_poll_interval,
             },

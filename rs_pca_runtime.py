@@ -10,6 +10,7 @@ from multiprocessing import Queue
 from pathlib import Path
 from queue import Full
 from typing import Optional
+import subprocess
 
 import numpy as np
 
@@ -23,8 +24,12 @@ class PCACondition:
     direction: str
 
     @property
+    def score_label(self) -> str:
+        return str(self.pc).upper()
+
+    @property
     def score_column(self) -> str:
-        return f"{self.roi}_{self.pc}"
+        return f"{self.roi}_{self.score_label}"
 
     @property
     def direction_sign(self) -> float:
@@ -72,6 +77,18 @@ def build_reference_stats_path(
     return build_pca_root(day_dir, run_dir.name, pca_input) / "pca_reference_stats.json"
 
 
+def build_reference_scores_path(
+    base_data: Path,
+    subj: str,
+    day: str,
+    run: str,
+    pca_input: str,
+) -> Path:
+    run_dir = build_run_dir(base_data, subj, day, run)
+    day_dir = run_dir.parent.parent
+    return build_pca_root(day_dir, run_dir.name, pca_input) / "scores_pca_all_rois.csv"
+
+
 def _find_first_existing(paths: list[Path]) -> Optional[Path]:
     for path in paths:
         if path.exists():
@@ -85,11 +102,77 @@ def _same_zooms(a: tuple[float, ...], b: tuple[float, ...], tol: float = 0.05) -
     return all(abs(float(x) - float(y)) <= tol for x, y in zip(a[:3], b[:3]))
 
 
+def _crop_img_to_mask(img, mask_data: np.ndarray, padding_vox: int):
+    import nibabel as nib
+
+    mask_idx = np.argwhere(mask_data > 0)
+    if mask_idx.size == 0:
+        return img
+    start = np.maximum(mask_idx.min(axis=0) - int(padding_vox), 0)
+    stop = np.minimum(mask_idx.max(axis=0) + int(padding_vox) + 1, img.shape[:3])
+    slices = tuple(slice(int(start[axis]), int(stop[axis])) for axis in range(3))
+    cropped = np.asanyarray(img.dataobj)[slices].astype(np.float32, copy=False)
+    affine = img.affine.copy()
+    affine[:3, 3] = affine[:3, 3] + affine[:3, :3] @ start.astype(float)
+    return nib.Nifti1Image(cropped, affine, img.header)
+
+
+def _make_truncated_t1_reference(
+    *,
+    full_ref_img,
+    full_ref_path: Path,
+    trans_dir: Path,
+    out_path: Path,
+    padding_vox: int,
+):
+    import nibabel as nib
+
+    epi_mask = _find_first_existing([
+        trans_dir / "epi_mask_mean.nii",
+        trans_dir / "epi_mask_mean.nii.gz",
+        trans_dir / "rt_ref_epi_mask.nii",
+        trans_dir / "rt_ref_epi_mask.nii.gz",
+    ])
+    epi2t1 = trans_dir / "epi2t1_Composite.h5"
+    if epi_mask is None or not epi2t1.exists():
+        nib.save(full_ref_img, str(out_path))
+        return out_path
+
+    mask_on_full = out_path.with_name(out_path.stem + "_epi_mask_on_full.nii.gz")
+    if not mask_on_full.exists():
+        cmd = [
+            "antsApplyTransforms",
+            "-d",
+            "3",
+            "-i",
+            str(epi_mask),
+            "-r",
+            str(full_ref_path),
+            "-o",
+            str(mask_on_full),
+            "-t",
+            str(epi2t1),
+            "-n",
+            "NearestNeighbor",
+            "--float",
+            "1",
+        ]
+        subprocess.run(cmd, check=True)
+
+    mask_data = np.asanyarray(nib.load(str(mask_on_full)).dataobj)
+    cropped_img = _crop_img_to_mask(full_ref_img, mask_data, padding_vox)
+    cropped_img.set_data_dtype(np.float32)
+    nib.save(cropped_img, str(out_path))
+    return out_path
+
+
 def ensure_pca_t1_reference(
     subject_root: Path,
     trans_dir: Path,
     explicit_path: Optional[Path] = None,
     resolution: str = "epi",
+    truncate_to_epi_fov: bool = True,
+    padding_vox: int = 2,
 ) -> Path:
     if explicit_path is not None:
         explicit_path = Path(explicit_path)
@@ -113,15 +196,35 @@ def ensure_pca_t1_reference(
         )
 
     if resolution == "t1":
-        out_path = trans_dir / "pca_t1_reference_t1res.nii.gz"
-        if not out_path.exists():
+        suffix = "_trunc" if truncate_to_epi_fov else ""
+        out_path = trans_dir / f"pca_t1_reference_t1res{suffix}.nii.gz"
+        if out_path.exists():
+            return out_path
+        if truncate_to_epi_fov:
+            full_ref_path = trans_dir / "pca_t1_reference_t1res_full.nii.gz"
+            import shutil
+            import nibabel as nib
+
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if not full_ref_path.exists():
+                shutil.copyfile(t1_path, full_ref_path)
+            full_ref_img = nib.load(str(full_ref_path))
+            return _make_truncated_t1_reference(
+                full_ref_img=full_ref_img,
+                full_ref_path=full_ref_path,
+                trans_dir=trans_dir,
+                out_path=out_path,
+                padding_vox=padding_vox,
+            )
+        else:
             import shutil
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(t1_path, out_path)
         return out_path
 
-    out_path = trans_dir / "pca_t1_reference_epires.nii.gz"
+    suffix = "_trunc" if truncate_to_epi_fov else ""
+    out_path = trans_dir / f"pca_t1_reference_epires{suffix}.nii.gz"
     epi_ref = _find_first_existing([
         trans_dir / "epi_unwarped_mean.nii",
         trans_dir / "epi_unwarped_mean.nii.gz",
@@ -146,6 +249,18 @@ def ensure_pca_t1_reference(
     t1_img = nib.load(str(t1_path))
     ref_img = resample_to_output(t1_img, voxel_sizes=epi_zooms, order=1)
     ref_img.set_data_dtype(np.float32)
+    if truncate_to_epi_fov:
+        full_ref_path = trans_dir / "pca_t1_reference_epires_full.nii.gz"
+        if not full_ref_path.exists():
+            nib.save(ref_img, str(full_ref_path))
+        return _make_truncated_t1_reference(
+            full_ref_img=ref_img,
+            full_ref_path=full_ref_path,
+            trans_dir=trans_dir,
+            out_path=out_path,
+            padding_vox=padding_vox,
+        )
+
     nib.save(ref_img, str(out_path))
     return out_path
 
@@ -154,20 +269,69 @@ def load_decoder_artifacts(roi_dir: Path) -> dict[str, np.ndarray]:
     bundle_path = roi_dir / "decoder_bundle.npz"
     if bundle_path.exists():
         z = np.load(bundle_path)
-        return {
+        artifacts = {
             "voxel_indices": z["voxel_indices"].astype(np.int64, copy=False),
             "weights": z["weights"].astype(np.float32, copy=False),
             "norm_mean": z["norm_mean"].astype(np.float32, copy=False),
             "norm_std": z["norm_std"].astype(np.float32, copy=False),
         }
+        if "explained" in z.files:
+            artifacts["explained"] = z["explained"].astype(np.float32, copy=False)
+        return artifacts
 
-    return {
+    artifacts = {
         "voxel_indices": np.load(roi_dir / "decoder_voxel_indices.npy").astype(np.int64, copy=False),
         "weights": np.load(roi_dir / "decoder_weights.npy").astype(np.float32, copy=False),
         "norm_mean": np.load(roi_dir / "decoder_norm_mean.npy").astype(np.float32, copy=False),
         "norm_std": np.load(roi_dir / "decoder_norm_std.npy").astype(np.float32, copy=False),
     }
+    explained_path = roi_dir / "pca_explained.npy"
+    if explained_path.exists():
+        artifacts["explained"] = np.load(explained_path).astype(np.float32, copy=False)
+    return artifacts
 
+
+LEGACY_COMPONENT_METRICS = {"projection", "cosine"}
+MULTI_PC_METRICS = {"subspace_cosine", "subspace_distance", "projection_norm"}
+ALL_SCORE_METRICS = LEGACY_COMPONENT_METRICS | MULTI_PC_METRICS
+
+
+def normalize_score_metric(score_metric: str) -> str:
+    metric = str(score_metric).strip().lower()
+    aliases = {
+        "multi_cosine": "subspace_cosine",
+        "top_pc_cosine": "subspace_cosine",
+        "top_pcs_cosine": "subspace_cosine",
+        "distance": "subspace_distance",
+        "cosine_distance": "subspace_distance",
+        "norm": "projection_norm",
+        "pc_norm": "projection_norm",
+    }
+    metric = aliases.get(metric, metric)
+    if metric not in ALL_SCORE_METRICS:
+        raise ValueError(
+            f"Unknown PCA score metric: {score_metric}. "
+            f"Use one of {sorted(ALL_SCORE_METRICS)}."
+        )
+    return metric
+
+
+def _normalized_roi_vector(
+    volume_3d: np.ndarray,
+    decoder: dict[str, np.ndarray],
+    normalization: str,
+) -> np.ndarray:
+    flat = volume_3d.reshape(-1).astype(np.float32, copy=False)
+    x = flat[decoder["voxel_indices"]]
+
+    if normalization == "zscore":
+        safe_std = np.where(decoder["norm_std"] == 0, 1.0, decoder["norm_std"])
+        return ((x - decoder["norm_mean"]) / safe_std).astype(np.float32, copy=False)
+    if normalization == "demean":
+        return (x - decoder["norm_mean"]).astype(np.float32, copy=False)
+    if normalization == "none":
+        return x.astype(np.float32, copy=False)
+    raise ValueError(f"Unknown PCA normalization: {normalization}")
 
 def score_pca_volume(
     volume_3d: np.ndarray,
@@ -176,29 +340,205 @@ def score_pca_volume(
     normalization: str = "zscore",
     score_metric: str = "projection",
 ) -> np.ndarray:
-    flat = volume_3d.reshape(-1).astype(np.float32, copy=False)
-    x = flat[decoder["voxel_indices"]]
-
-    if normalization == "zscore":
-        safe_std = np.where(decoder["norm_std"] == 0, 1.0, decoder["norm_std"])
-        x = (x - decoder["norm_mean"]) / safe_std
-    elif normalization == "demean":
-        x = x - decoder["norm_mean"]
-    elif normalization == "none":
-        pass
-    else:
-        raise ValueError(f"Unknown PCA normalization: {normalization}")
-
+    metric = normalize_score_metric(score_metric)
+    if metric not in LEGACY_COMPONENT_METRICS:
+        raise ValueError(
+            f"score_pca_volume returns per-PC values and only supports "
+            f"{sorted(LEGACY_COMPONENT_METRICS)}. Use score_pca_scalar for {metric}."
+        )
+    x = _normalized_roi_vector(volume_3d, decoder, normalization)
     weights = decoder["weights"]
-    if score_metric == "projection":
+    if metric == "projection":
         return (weights @ x).astype(np.float32, copy=False)
-    if score_metric == "cosine":
+    if metric == "cosine":
         x_norm = float(np.linalg.norm(x))
         if x_norm == 0:
             return np.zeros((weights.shape[0],), dtype=np.float32)
         w_norm = np.linalg.norm(weights, axis=1)
         w_norm_safe = np.where(w_norm == 0, 1.0, w_norm)
         return ((weights @ x) / (w_norm_safe * x_norm)).astype(np.float32, copy=False)
+    raise ValueError(f"Unknown PCA score metric: {score_metric}")
+
+
+def _target_pc_index(target_pc: str | None) -> int:
+    pc = "PC01" if target_pc is None else str(target_pc).strip().upper()
+    try:
+        return int(pc.replace("PC", "")) - 1
+    except ValueError as exc:
+        raise ValueError(f"Invalid PCA target PC: {target_pc!r}") from exc
+
+
+def _format_variance_label(top_pc_variance: float) -> str:
+    pct = float(top_pc_variance) * 100.0
+    if abs(pct - round(pct)) < 1e-6:
+        return f"{int(round(pct))}PCT"
+    text = f"{pct:.3g}".replace(".", "P")
+    return f"{text}PCT"
+
+
+def _format_min_variance_label(min_variance: float) -> str:
+    pct = float(min_variance) * 100.0
+    if abs(pct - round(pct)) < 1e-6:
+        return f"{int(round(pct))}PCT"
+    text = f"{pct:.3g}".replace(".", "P")
+    return f"{text}PCT"
+
+
+def _parse_min_variance_top_pcs(top_pcs: str | int) -> Optional[float]:
+    text = str(top_pcs).strip().lower()
+    for prefix in ("var:", "evr:", "minvar:", ">="):
+        if text.startswith(prefix):
+            return float(text[len(prefix):])
+    return None
+
+
+def resolve_score_label(
+    *,
+    score_metric: str,
+    target_pc: str | None = None,
+    top_pcs: str | int = "auto",
+    top_pc_variance: float = 0.10,
+) -> str:
+    metric = normalize_score_metric(score_metric)
+    if metric in LEGACY_COMPONENT_METRICS:
+        return f"PC{_target_pc_index(target_pc) + 1:02d}"
+    top_pcs_text = str(top_pcs).strip().lower()
+    min_variance = _parse_min_variance_top_pcs(top_pcs)
+    if min_variance is not None:
+        return f"TOPPC{_format_min_variance_label(min_variance)}"
+    if top_pcs_text == "auto":
+        return f"CUM{_format_variance_label(top_pc_variance)}"
+    if top_pcs_text == "all":
+        return "TOPPCALL"
+    return f"TOPPC{int(top_pcs):02d}"
+
+
+def select_top_pc_indices(
+    decoder: dict[str, np.ndarray],
+    *,
+    top_pcs: str | int = "auto",
+    top_pc_variance: float = 0.10,
+) -> np.ndarray:
+    n_components = int(decoder["weights"].shape[0])
+    if n_components <= 0:
+        raise ValueError("PCA decoder has no components")
+
+    top_pcs_text = str(top_pcs).strip().lower()
+    min_variance = _parse_min_variance_top_pcs(top_pcs)
+    if top_pcs_text == "all":
+        n_keep = n_components
+    elif min_variance is not None:
+        explained = decoder.get("explained")
+        if explained is not None and len(explained):
+            explained = np.asarray(explained, dtype=float)
+            valid = np.where(np.nan_to_num(explained, nan=-np.inf) >= min_variance)[0]
+            n_keep = int(valid[-1] + 1) if valid.size else 1
+        else:
+            n_keep = min(3, n_components)
+    elif top_pcs_text == "auto":
+        explained = decoder.get("explained")
+        if explained is not None and len(explained):
+            explained = np.asarray(explained, dtype=float)
+            if np.any(np.isfinite(explained)):
+                cumulative = np.cumsum(np.nan_to_num(explained, nan=0.0))
+                threshold = float(top_pc_variance)
+                if cumulative.size and threshold <= float(cumulative[-1]):
+                    n_keep = int(np.searchsorted(cumulative, threshold, side="left") + 1)
+                else:
+                    n_keep = n_components
+            else:
+                n_keep = min(3, n_components)
+        else:
+            n_keep = min(3, n_components)
+    else:
+        n_keep = int(top_pcs)
+
+    n_keep = max(1, min(int(n_keep), n_components))
+    return np.arange(n_keep, dtype=np.int64)
+
+
+def describe_top_pc_selection(
+    decoder: dict[str, np.ndarray],
+    *,
+    top_pcs: str | int = "auto",
+    top_pc_variance: float = 0.10,
+) -> dict:
+    indices = select_top_pc_indices(
+        decoder,
+        top_pcs=top_pcs,
+        top_pc_variance=top_pc_variance,
+    )
+    explained = decoder.get("explained")
+    selected_explained = None
+    cumulative_explained = None
+    auto_threshold_reached = None
+    if explained is not None and len(explained):
+        explained = np.asarray(explained, dtype=float)
+        selected_explained = [float(explained[i]) for i in indices if i < len(explained)]
+        cumulative_explained = float(np.sum(selected_explained))
+        if str(top_pcs).strip().lower() == "auto":
+            auto_threshold_reached = cumulative_explained >= float(top_pc_variance)
+    return {
+        "top_pcs": str(top_pcs),
+        "min_pc_variance": _parse_min_variance_top_pcs(top_pcs),
+        "top_pc_variance": float(top_pc_variance),
+        "auto_threshold_reached": auto_threshold_reached,
+        "selected_pc_indices_1based": [int(i) + 1 for i in indices],
+        "selected_explained": selected_explained,
+        "selected_cumulative_explained": cumulative_explained,
+    }
+
+
+def score_pca_scalar(
+    volume_3d: np.ndarray,
+    decoder: dict[str, np.ndarray],
+    *,
+    normalization: str = "zscore",
+    score_metric: str = "subspace_cosine",
+    target_pc: str | None = None,
+    top_pcs: str | int = "auto",
+    top_pc_variance: float = 0.10,
+) -> float:
+    metric = normalize_score_metric(score_metric)
+    if metric in LEGACY_COMPONENT_METRICS:
+        scores = score_pca_volume(
+            volume_3d,
+            decoder,
+            normalization=normalization,
+            score_metric=metric,
+        )
+        pc_idx = _target_pc_index(target_pc)
+        if pc_idx < 0 or pc_idx >= scores.shape[0]:
+            raise ValueError(
+                f"PCA decoder has {scores.shape[0]} PCs, cannot use "
+                f"{target_pc or 'PC01'}"
+            )
+        return float(scores[pc_idx])
+
+    x = _normalized_roi_vector(volume_3d, decoder, normalization)
+    weights = decoder["weights"]
+    indices = select_top_pc_indices(
+        decoder,
+        top_pcs=top_pcs,
+        top_pc_variance=top_pc_variance,
+    )
+    selected = weights[indices]
+    projections = selected @ x
+    if metric == "projection_norm":
+        return float(np.linalg.norm(projections))
+
+    x_norm = float(np.linalg.norm(x))
+    if x_norm == 0.0:
+        return 1.0 if metric == "subspace_distance" else 0.0
+    w_norm = np.linalg.norm(selected, axis=1)
+    w_norm_safe = np.where(w_norm == 0, 1.0, w_norm)
+    cosines = projections / (w_norm_safe * x_norm)
+    closeness = float(np.sqrt(np.sum(cosines * cosines)))
+    closeness = float(np.clip(closeness, 0.0, 1.0))
+    if metric == "subspace_cosine":
+        return closeness
+    if metric == "subspace_distance":
+        return 1.0 - closeness
     raise ValueError(f"Unknown PCA score metric: {score_metric}")
 
 
@@ -212,6 +552,52 @@ def load_reference_stats(path: Optional[Path]) -> dict[str, dict[str, float]]:
     with Path(path).open("r", encoding="utf-8") as f:
         payload = json.load(f)
     return payload.get("columns", payload)
+
+
+def load_reference_stats_from_score_csv(
+    scores_csv: Path,
+    columns: list[str],
+) -> dict[str, dict[str, float]]:
+    scores_csv = Path(scores_csv)
+    if not scores_csv.exists():
+        raise FileNotFoundError(f"PCA reference scores CSV not found: {scores_csv}")
+    values: dict[str, list[float]] = {column: [] for column in columns}
+    with scores_csv.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"PCA reference scores CSV has no header: {scores_csv}")
+        missing = [column for column in columns if column not in reader.fieldnames]
+        if missing:
+            raise ValueError(f"PCA reference scores CSV missing columns: {missing}")
+        for row in reader:
+            for column in columns:
+                try:
+                    value = float(row[column])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if np.isfinite(value):
+                    values[column].append(value)
+
+    stats: dict[str, dict[str, float]] = {}
+    for column, buf in values.items():
+        arr = np.asarray(buf, dtype=float)
+        if arr.size < 2:
+            raise ValueError(
+                f"PCA reference column {column!r} has fewer than 2 valid samples "
+                f"in {scores_csv}"
+            )
+        std = float(arr.std())
+        if not np.isfinite(std) or std == 0.0:
+            raise ValueError(f"PCA reference column {column!r} has invalid std: {std}")
+        stats[column] = {
+            "mean": float(arr.mean()),
+            "std": std,
+            "n": int(arr.size),
+            "p05": float(np.percentile(arr, 5)),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+        }
+    return stats
 
 
 def feedback_from_score(
@@ -289,7 +675,6 @@ def load_or_create_condition_schedule(
             "schema_version": schema_version,
             "roi_labels": roi_labels,
             "direction_labels": direction_labels,
-            "target_pc": target_pc,
         }
         mismatches = [k for k, v in expected.items() if schedule.get(k) != v]
         if not mismatches:
@@ -357,7 +742,12 @@ def load_or_create_condition_schedule(
     return private_schedule
 
 
-def condition_for_index(schedule: dict, index: int) -> PCACondition:
+def condition_for_index(
+    schedule: dict,
+    index: int,
+    *,
+    score_label: Optional[str] = None,
+) -> PCACondition:
     order = schedule["order"]
     if not order:
         raise ValueError("Condition schedule has an empty order")
@@ -369,7 +759,7 @@ def condition_for_index(schedule: dict, index: int) -> PCACondition:
         condition_id=cond["condition_id"],
         symbol=cond["symbol"],
         roi=cond["roi"],
-        pc=cond["pc"],
+        pc=score_label or cond.get("pc") or schedule.get("target_pc", "PC01"),
         direction=cond["direction"],
     )
 
@@ -396,6 +786,7 @@ def append_pca_score(csv_path: Path, row: dict) -> None:
         "timestamp",
         "condition_id",
         "symbol",
+        "score_label",
         "raw_component_score",
         "directed_score",
         "score_z",
@@ -416,22 +807,23 @@ def run_realtime_pca_scorer(
     score_queue: Queue,
     stop_event,
     reference_stats_path: Optional[Path] = None,
+    reference_stats: Optional[dict[str, dict[str, float]]] = None,
     volume_kind: str = "reg",
     normalization: str = "zscore",
-    score_metric: str = "projection",
+    score_metric: str = "subspace_cosine",
+    target_pc: Optional[str] = None,
+    top_pcs: str | int = "auto",
+    top_pc_variance: float = 0.10,
     max_trs: Optional[int] = None,
     poll_interval: float = 0.05,
 ) -> None:
     import nibabel as nib
 
     decoder = load_decoder_artifacts(pca_root / condition.roi)
-    reference_stats = load_reference_stats(reference_stats_path)
-    pc_idx = int(condition.pc.upper().replace("PC", "")) - 1
-    if pc_idx < 0 or pc_idx >= decoder["weights"].shape[0]:
-        raise ValueError(
-            f"{condition.roi} has {decoder['weights'].shape[0]} PCs, "
-            f"cannot use {condition.pc}"
-        )
+    loaded_reference_stats = reference_stats or load_reference_stats(reference_stats_path)
+    metric = normalize_score_metric(score_metric)
+    if metric in LEGACY_COMPONENT_METRICS and target_pc is None:
+        target_pc = condition.score_label
 
     out_csv = run_dir / "pca_realtime_scores.csv"
     processed: set[int] = set()
@@ -454,19 +846,22 @@ def run_realtime_pca_scorer(
 
         try:
             img = nib.load(str(vol_path))
-            scores = score_pca_volume(
+            raw_score = score_pca_scalar(
                 np.asanyarray(img.dataobj),
                 decoder,
                 normalization=normalization,
                 score_metric=score_metric,
+                target_pc=target_pc,
+                top_pcs=top_pcs,
+                top_pc_variance=top_pc_variance,
             )
-            raw_score = float(scores[pc_idx])
-            feedback = feedback_from_score(raw_score, condition, reference_stats)
+            feedback = feedback_from_score(raw_score, condition, loaded_reference_stats)
             row = {
                 "volume_idx": volume_idx,
                 "timestamp": time.time(),
                 "condition_id": condition.condition_id,
                 "symbol": condition.symbol,
+                "score_label": condition.score_label,
                 "raw_component_score": raw_score,
                 **feedback,
             }
