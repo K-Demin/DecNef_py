@@ -449,6 +449,7 @@ def run_psychopy_presentation(
     first_trigger_timestamp: Optional[float] = None
     waiting = True
     while waiting:
+        win.fullscr = True
         waiting_text.draw()
         win.flip()
         keys = event.getKeys()
