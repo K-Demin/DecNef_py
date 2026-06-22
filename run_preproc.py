@@ -254,6 +254,14 @@ def _stage_epi_block(
     return converted
 
 
+
+def _fieldmap_pair_dir(fmap_root: Path, ap_block: int | None, pa_block: int | None) -> Path:
+    """Return the role-based pair folder for explicit AP/PA blocks."""
+
+    if ap_block is None or pa_block is None:
+        return fmap_root
+    return fmap_root / f"pair-ap{ap_block:03d}_pa{pa_block:03d}"
+
 def _find_structural(anat_dir: Path) -> Path:
     """Locate the first structural (T1) scan, converting DICOMs if necessary."""
 
@@ -352,7 +360,8 @@ def main():
             raise FileNotFoundError(f"Incoming directory does not exist: {incoming_dir}")
 
         anat_dir = day_root.parent / "anat"
-        fmap_dir = day_root / "fmap"
+        fmap_root = day_root / "fmap"
+        fmap_dir = _fieldmap_pair_dir(fmap_root, args.ap_block, args.pa_block)
         ensure_dir(anat_dir)
         ensure_dir(fmap_dir)
         ensure_dir(run_dir)
@@ -419,7 +428,8 @@ def main():
     # ------------------------------------------------------------------
     # NOTE: we don't have args.run anymore; just give a fixed run_id
     t1_path = _find_structural(day_root.parent / "anat")
-    fmap_dir = day_root / "fmap"
+    fmap_root = day_root / "fmap"
+    fmap_dir = _fieldmap_pair_dir(fmap_root, args.ap_block, args.pa_block)
     ap_path = _find_fieldmap(fmap_dir, "AP")
     pa_path = _find_fieldmap(fmap_dir, "PA")
 
@@ -432,6 +442,7 @@ def main():
         t1_file=t1_path,
         ap_file=ap_path,
         pa_file=pa_path,
+        fieldmap_dir=fmap_dir,
     )
 
     # Optionally save config.json so you can re-use it later

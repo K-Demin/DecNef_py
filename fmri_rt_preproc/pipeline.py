@@ -43,7 +43,7 @@ class FMRIRealtimePreprocessor:
                  ants_env: str = "ants_env"):
         self.cfg = cfg
         self.anat_dir = cfg.subject_root / "anat"
-        self.fmap_dir = cfg.root / "fmap"
+        self.fmap_dir = Path(getattr(cfg, "fieldmap_dir", None) or (cfg.root / "fmap"))
         self.func_dir = cfg.root / "func"
         self.decoder_template = (cfg.root / cfg.decoder_template).resolve()
         self.fastsurfer_env = fastsurfer_env
@@ -224,7 +224,7 @@ class FMRIRealtimePreprocessor:
 
     def _prepare_fieldmap(self, epi_ref: Path):
         """
-        Build a day-level AP/PA fieldmap in the RT motion-reference pose/grid.
+        Build an AP/PA fieldmap in the configured fieldmap working directory.
 
         AP and PA volumes are motion-corrected to the same rt_ref_epi.nii that
         online BOLD volumes use. The corrected AP/PA series are then averaged
