@@ -19,6 +19,7 @@ class SubjectDayConfig:
     t1_file: Path
     mni_template: Path
     runs: list[RunConfig]
+    fieldmap_dir: Path | None = None
     fieldmap_method: str = "pyhysco"
     epi_phase_encoding: str = "PA"
     project_root = Path(__file__).resolve().parents[1]
@@ -38,8 +39,9 @@ class SubjectDayConfig:
             day_id=cfg["day_id"],
             root=root,
             subject_root=subject_root,
-            ap_file=root / "fmap" / "AP.nii",
-            pa_file=root / "fmap" / "PA.nii",
+            ap_file=root / cfg.get("ap_file", "fmap/AP.nii"),
+            pa_file=root / cfg.get("pa_file", "fmap/PA.nii"),
+            fieldmap_dir=root / cfg.get("fieldmap_dir", "fmap"),
             t1_file=subject_root / "anat" / "T1.nii",
             mni_template=Path(cfg["templates"]["mni_t1"]),
             runs=runs,
@@ -98,6 +100,7 @@ class SubjectDayConfig:
             subject_root=root.parent,
             ap_file=root / "fmap" / "AP.nii.gz",
             pa_file=root / "fmap" / "PA.nii.gz",
+            fieldmap_dir=root / "fmap",
             t1_file=root.parent / "anat" / "T1.nii.gz",
             mni_template=mni_template,
             runs=runs,
@@ -116,6 +119,7 @@ class SubjectDayConfig:
         t1_file: Path | None = None,
         ap_file: Path | None = None,
         pa_file: Path | None = None,
+        fieldmap_dir: Path | None = None,
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -166,6 +170,7 @@ class SubjectDayConfig:
             subject_root=root.parent,
             ap_file=ap_path,
             pa_file=pa_path,
+            fieldmap_dir=fieldmap_dir or ap_path.parent,
             t1_file=t1_path,
             mni_template=mni_template,
             runs=runs,
@@ -191,6 +196,9 @@ class SubjectDayConfig:
             },
             "fieldmap_method": self.fieldmap_method,
             "epi_phase_encoding": self.epi_phase_encoding,
+            "ap_file": str(self.ap_file.relative_to(root)),
+            "pa_file": str(self.pa_file.relative_to(root)),
+            "fieldmap_dir": str((self.fieldmap_dir or self.ap_file.parent).relative_to(root)),
             "runs": [
                 {
                     "id": r.id,
