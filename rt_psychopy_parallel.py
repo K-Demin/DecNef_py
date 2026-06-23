@@ -587,6 +587,16 @@ def main() -> None:
     parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
     parser.add_argument("--run", required=True, help="Run number, e.g. 4")
     parser.add_argument(
+        "--ap-block",
+        default=None,
+        help="AP block to use for b0",
+    )
+    parser.add_argument(
+        "--pa-block",
+        default=None,
+        help="PA block to use for b0",
+    )
+    parser.add_argument(
         "--incoming-root",
         required=False,
         default="/home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya",

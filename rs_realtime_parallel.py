@@ -342,6 +342,31 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     REGRESSOR_SETTINGS.update(settings)
     run_rt_pipeline(cfg, score_queue)
 
+def _fieldmap_pair_dir(
+    base_data: Path,
+    sub: str,
+    day: str,
+    ap_block: Optional[int],
+    pa_block: Optional[int],
+) -> Path:
+    fmap_root = base_data / f"sub-{sub}" / str(day) / "fmap"
+    if ap_block is None or pa_block is None:
+        return fmap_root
+    return fmap_root / f"pair-ap{ap_block:03d}_pa{pa_block:03d}"
+
+def _check_rt_fieldmap_exists(fmap_dir: Path) -> None:
+    candidates = [
+        fmap_dir / "pyhysco_epi-EstFieldMap.nii",
+        fmap_dir / "pyhysco_epi-EstFieldMap.nii.gz",
+        fmap_dir / "pyhysco-EstFieldMap.nii",
+        fmap_dir / "pyhysco-EstFieldMap.nii.gz",
+    ]
+    if not any(p.exists() for p in candidates):
+        raise FileNotFoundError(
+            "No PyHySCO fieldmap found for realtime unwarping.\n"
+            f"Expected one of:\n  " + "\n  ".join(str(p) for p in candidates)
+        )
+
 
 def _build_presentation_window(visual, color):
     default_size = (1000, 700)
@@ -758,6 +783,17 @@ def main() -> None:
         elif args.no_score:
             log.info("[SCORE] Decoder was provided but --no-score is set; scoring will be skipped.")
 
+        fieldmap_dir = _fieldmap_pair_dir(
+            base_data=base_data,
+            sub=args.sub,
+            day=args.day,
+            ap_block=args.ap_block,
+            pa_block=args.pa_block,
+        )
+
+        _check_rt_fieldmap_exists(fieldmap_dir)
+        log.info("[FMAP] RT will use fieldmap dir: %s", fieldmap_dir)
+
         cfg = RTSessionConfig(
             subject=args.sub,
             day=args.day,
@@ -770,6 +806,7 @@ def main() -> None:
                 else pca_reference_image
             ),
             enable_scoring=enable_scoring,
+            fieldmap_dir=fieldmap_dir,
         )
 
         # pca_root = cfg.day_root / "PCA"

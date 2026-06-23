@@ -1,0 +1,45 @@
+# Sample configuration for a pilot
+# 
+# These parameters configure a 6s paddle control lag paired with a 6-7s receive 
+# speed, with a 2-minute active trial duration and 6s between trials.
+# point_increment and paddle_size will be ignored if levels are provided. 
+#
+# Note that size and speed parameters are in normalized units; these values are 
+# normalized to window size and therefore maintain the same relative size/speed 
+# invariant of window size
+# ----------------------------------------------------------------------------
+
+# Window settings
+win_size: [1200, 800]
+fullscr: true
+
+# Input configuration
+#input_method: press
+paddle_response_mode: hold # hrf or hold
+
+# Difficulty and scoring
+init_level: 0
+init_points: 0
+point_increment: 1
+performance_criteria: 0.75
+use_aggressive_leveling: true
+
+# Paddle settings
+paddle_size: 0.3
+paddle_lag: 360
+step_size: 5 #0.5 for 'press' mode
+
+# Ball settings
+ball_radius: 0.04
+send_speed: 0.02
+receive_speed: 0.0025
+
+# Timing parameters
+reset_timer: 0
+reset_delay: 2.0
+time_limit: 120.0 #2 min
+pre_delay: 6
+block_pre_delay: 30
+
+# Opponent settings
+opponent_handicap: 0

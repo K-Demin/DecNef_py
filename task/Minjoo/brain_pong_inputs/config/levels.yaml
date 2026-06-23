@@ -1,0 +1,55 @@
+# Level configurations for pilot testing
+#
+# Each level specifies paddle sizes and point increments for 15 levels. Paddle 
+# size decreases for 0.5 each level, and points increase by 1 every two levels
+#
+# Note that paddle heights are in normalized units; they are normalized to the 
+# window height and therefore maintain the same relative size invariant of 
+# window size
+# ----------------------------------------------------------------------------
+
+0:
+  paddle_size: 0.8
+  point_increment: 1
+1:
+  paddle_size: 0.75
+  point_increment: 1
+2:
+  paddle_size: 0.7
+  point_increment: 2
+3:
+  paddle_size: 0.65
+  point_increment: 2
+4:
+  paddle_size: 0.6
+  point_increment: 3
+5:
+  paddle_size: 0.55
+  point_increment: 3
+6:
+  paddle_size: 0.5
+  point_increment: 4
+7:
+  paddle_size: 0.45
+  point_increment: 4
+8:
+  paddle_size: 0.4
+  point_increment: 5
+9:
+  paddle_size: 0.35
+  point_increment: 5
+10:
+  paddle_size: 0.3
+  point_increment: 6
+11:
+  paddle_size: 0.25
+  point_increment: 6
+12:
+  paddle_size: 0.2
+  point_increment: 7
+13:
+  paddle_size: 0.15
+  point_increment: 7
+14:
+  paddle_size: 0.1
+  point_increment: 8

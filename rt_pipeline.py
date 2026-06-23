@@ -12,6 +12,7 @@ from typing import Optional, Any
 import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, CancelledError
+from typing import Optional
 
 import nibabel as nib
 import numpy as np
@@ -422,6 +423,7 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
+    fieldmap_dir: Optional[Path] = None
 
     @property
     def subject_root(self) -> Path:
@@ -540,6 +542,12 @@ class RTSessionConfig:
         """Deprecated alias for the unwarped analysis-reference mask."""
         return self.rt_unwarped_analysis_ref_mask
 
+    @property
+    def fmap_dir(self) -> Path:
+        if self.fieldmap_dir is not None:
+            return Path(self.fieldmap_dir)
+        return self.day_root / "fmap"
+
 
 def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     return cfg.decoder_template or (
@@ -644,8 +652,8 @@ def _build_pyhysco_applier(
     if not bool(getattr(REGRESSOR_SETTINGS, "use_preloaded_pyhysco", True)):
         return None
 
-    fmap_dir = cfg.day_root / "fmap"
-    pyhysco_field = _resolve_pyhysco_fieldmap(fmap_dir)
+    fmap_dir = cfg.fmap_dir
+    pyhysco_field = _preferred_pyhysco_fieldmap(fmap_dir)
     if not pyhysco_field.exists():
         log.warning("[FMAP] Preloaded PyHySCO disabled: missing fieldmap at %s", pyhysco_field)
         return None
@@ -814,6 +822,20 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
         "skipped_first_reg_ready": skipped_first_reg_ready,
     }
 
+def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
+    if path_nii.exists():
+        return path_nii
+    gz = path_nii.with_suffix(path_nii.suffix + ".gz")
+    if gz.exists():
+        return gz
+    return path_nii
+
+
+def _preferred_pyhysco_fieldmap(fmap_dir: Path) -> Path:
+    aligned = _prefer_uncompressed_nifti(fmap_dir / "pyhysco_epi-EstFieldMap.nii")
+    if aligned.exists():
+        return aligned
+    return _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
 
 def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None:
     metadata_path = cfg.rt_work_dir / "session_metadata.json"
@@ -1997,12 +2019,12 @@ def process_volume(
 
 
 def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
-    fmap_dir = cfg.day_root / "fmap"
+    fmap_dir = cfg.fmap_dir
     method = str(REGRESSOR_SETTINGS.fieldmap_method).lower()
     epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
 
     if method == "pyhysco":
-        pyhysco_field = _resolve_pyhysco_fieldmap(fmap_dir)
+        pyhysco_field = _preferred_pyhysco_fieldmap(fmap_dir)
         if not pyhysco_field.exists():
             log.error("[FMAP] Missing PyHySCO fieldmap: %s", pyhysco_field)
             return False

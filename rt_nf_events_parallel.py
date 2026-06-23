@@ -642,6 +642,18 @@ def main() -> None:
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
     )
+    parser.add_argument(
+        "--ap-block",
+        type=int,
+        default=None,
+        help="AP b0 block to use",
+    )
+    parser.add_argument(
+        "--pa-block",
+        type=int,
+        default=None,
+        help="PA b0 block to use",
+    )
 
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS, load_reference_score_stats
@@ -674,6 +686,8 @@ def main() -> None:
         base_data=Path(args.base_data),
         decoder_template=Path(args.decoder_template) if args.decoder_template else None,
         reference_score_run=args.reference_score_run,
+        ap_block=args.ap_block,
+        pa_block=args.pa_block
     )
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
