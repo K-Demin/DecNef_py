@@ -478,6 +478,8 @@ def main() -> None:
     base_data = Path(args.base_data)
     if not incoming_root.exists():
         raise FileNotFoundError(f"Incoming directory does not exist: {incoming_root}")
+    if (args.ap_block is None) != (args.pa_block is None):
+        raise ValueError("Set both --ap-block and --pa-block, or neither.")
 
     subject_root = base_data / f"sub-{sub}"
     run_dir = subject_root / args.day / "func" / args.run
@@ -617,12 +619,24 @@ def main() -> None:
             base_data=base_data,
             decoder_template=pca_reference_image,
             enable_scoring=False,
+            ap_block=args.ap_block,
+            pa_block=args.pa_block,
+        )
+
+        log.info(
+            "[FMAP] RTSessionConfig has ap_block=%s pa_block=%s fmap_dir=%s",
+            cfg.ap_block,
+            cfg.pa_block,
+            cfg.fmap_dir,
         )
 
         metadata = {
             "subj": sub,
             "day": args.day,
             "run": args.run,
+            "ap_block": args.ap_block,
+            "pa_block": args.pa_block,
+            "fmap_dir": str(cfg.fmap_dir),
             "decoder_day": pca_day,
             "decoder_run": pca_run,
             "decoder_pca_root": str(pca_root),

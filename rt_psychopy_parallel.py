@@ -612,11 +612,13 @@ def main() -> None:
     parser.add_argument(
         "--ap-block",
         default=None,
+        type=int,
         help="AP block to use for b0",
     )
     parser.add_argument(
         "--pa-block",
         default=None,
+        type=int,
         help="PA block to use for b0",
     )
     parser.add_argument(
@@ -926,6 +928,8 @@ def main() -> None:
         decoder_template=cfg_decoder_template,
         reference_score_run=None if args.pca_mode else args.reference_score_run,
         enable_scoring=not args.pca_mode,
+        ap_block=args.ap_block,
+        pa_block=args.pa_block,
     )
 
     if args.pca_mode and args.reference_score_run:
@@ -1100,6 +1104,9 @@ def main() -> None:
             "psychopy": {
                 "max_points": args.max_points,
                 "max_trs": max_trs,
+                "ap_block": args.ap_block,
+                "pa_block": args.pa_block,
+                "fmap_dir": str(cfg.fmap_dir),
                 "duration_min": args.duration_min,
                 "roi_labels": roi_labels,
                 "direction_labels": direction_labels,

@@ -39,15 +39,39 @@ def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 def load_brainpong_settings(settings_file: Optional[Path]) -> dict[str, Any]:
     default_path = Path(__file__).with_name("brainpong_settings.json")
-    cfg = _load_json(default_path)
-    if settings_file:
-        cfg = _merge_dict(cfg, _load_json(settings_file))
+
+    if settings_file is not None:
+        settings_file = Path(settings_file).expanduser()
+
+        # Keep normal shell behavior: relative paths are relative to where you run the command.
+        if not settings_file.is_absolute():
+            settings_file = Path.cwd() / settings_file
+
+        if not settings_file.exists():
+            raise FileNotFoundError(
+                f"Brain-pong settings file not found: {settings_file}"
+            )
+
+        if default_path.exists():
+            cfg = _merge_dict(_load_json(default_path), _load_json(settings_file))
+        else:
+            # Treat provided file as the complete config if no default exists.
+            cfg = _load_json(settings_file)
+    else:
+        if not default_path.exists():
+            raise FileNotFoundError(
+                f"No Brain-pong settings file provided and default is missing: {default_path}\n"
+                "Use --brainpong-settings /path/to/settings.json"
+            )
+        cfg = _load_json(default_path)
+
     feedback = cfg.setdefault("feedback", {})
     if not int(feedback.get("feedback_delay_volumes", 0) or 0):
         delay_sec = float(feedback.get("feedback_delay_sec", 0.0) or 0.0)
         tr = float(cfg.get("TR", 1.0) or 1.0)
         if delay_sec > 0 and tr > 0:
             feedback["feedback_delay_volumes"] = int(round(delay_sec / tr))
+
     return cfg
 
 
@@ -308,7 +332,8 @@ class BrainPongLogger:
 def _build_window(visual, task_cfg: dict[str, Any]):
     default_size = tuple(task_cfg.get("win_size", [1200, 800]))
     fullscr = bool(task_cfg.get("fullscr", False))
-    return visual.Window(size=default_size, fullscr=fullscr, winType="pyglet", color="black", units="norm")
+    return visual.Window(size=[1920, 1080], units='height', fullscr=fullscr, winType="pyglet", color="black", screen=0)
+
 
 
 def _target_direction_for_trial(task_cfg: dict[str, Any], block_idx: int, trial_idx: int) -> str:
@@ -668,12 +693,22 @@ def run_brainpong_presentation(
     tailer = FileScoreTailer(score_file) if score_file else None
 
     win = visual.Window(
-        size=tuple(params.get("win_size", [1200, 800])),
-        fullscr=bool(params.get("fullscr", True)),
-        winType="pyglet",
+        size=tuple(params.get("win_size", [1920, 1080])),
+        units="pix",  # keep pix for BrainPong/game geometry
         color="black",
-        units="pix",
+        pos=(0, 0),
+        allowGUI=True,
+        checkTiming=False,
+        screen=int(params.get("screen", 0)),
+        monitor=str(params.get("monitor", "testMonitor")),
+        fullscr=False,
+        winType="pyglet",
     )
+
+    win.getActualFrameRate()
+    win.fullscr = bool(params.get("fullscr", True))
+    win.mouseVisible = bool(params.get("mouseVisible", False))
+    win.flip()
     waiting_text = visual.TextStim(
         win,
         units="norm",
@@ -948,6 +983,8 @@ def _prepare_rt_config(args: argparse.Namespace, cfg: dict[str, Any]):
         decoder_roi_txt=Path(args.decoder_roi_txt) if args.decoder_roi_txt else None,
         reference_score_run=args.reference_score_run,
         enable_scoring=True,
+        ap_block=args.ap_block,
+        pa_block=args.pa_block,
     )
 
 
@@ -969,11 +1006,13 @@ def main() -> None:
     parser.add_argument("--rs", dest="reference_score_run", default=None)
     parser.add_argument(
         "--ap-block",
+        type=int,
         default=None,
         help="AP block to use for b0",
     )
     parser.add_argument(
         "--pa-block",
+        type=int,
         default=None,
         help="PA block to use for b0",
     )
@@ -1034,6 +1073,9 @@ def main() -> None:
                     "script": "rt_brainpong_parallel.py",
                     "brainpong_config": cfg,
                     "decoder_template": str(rt_cfg.decoder_template) if rt_cfg.decoder_template else None,
+                    "ap_block": args.ap_block,
+                    "pa_block": args.pa_block,
+                    "fmap_dir": str(rt_cfg.fmap_dir),
                 }
             },
         )

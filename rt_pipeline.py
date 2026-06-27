@@ -423,7 +423,24 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
-    fieldmap_dir: Optional[Path] = None
+
+    # NEW
+    ap_block: Optional[int] = None
+    pa_block: Optional[int] = None
+
+    @property
+    def fmap_dir(self) -> Path:
+        if self.ap_block is None and self.pa_block is None:
+            return self.day_root / "fmap"
+
+        if self.ap_block is None or self.pa_block is None:
+            raise ValueError("Set both --ap-block and --pa-block, or neither.")
+
+        return (
+            self.day_root
+            / "fmap"
+            / f"pair-ap{int(self.ap_block):03d}_pa{int(self.pa_block):03d}"
+        )
 
     @property
     def subject_root(self) -> Path:
@@ -541,12 +558,6 @@ class RTSessionConfig:
     def rt_ref_mask(self) -> Path:
         """Deprecated alias for the unwarped analysis-reference mask."""
         return self.rt_unwarped_analysis_ref_mask
-
-    @property
-    def fmap_dir(self) -> Path:
-        if self.fieldmap_dir is not None:
-            return Path(self.fieldmap_dir)
-        return self.day_root / "fmap"
 
 
 def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
@@ -836,6 +847,95 @@ def _preferred_pyhysco_fieldmap(fmap_dir: Path) -> Path:
     if aligned.exists():
         return aligned
     return _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
+
+def _fieldmap_ready(cfg: RTSessionConfig) -> bool:
+    method = str(REGRESSOR_SETTINGS.fieldmap_method).lower()
+    epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
+    fmap_dir = cfg.fmap_dir
+
+    if method == "pyhysco":
+        return _preferred_pyhysco_fieldmap(fmap_dir).exists()
+
+    if method == "ants":
+        warp, affine, _ = _resolve_ants_unwarp_inputs(cfg, fmap_dir, epi_pe)
+        return warp.exists() and affine.exists()
+
+    raise ValueError(f"Unknown fieldmap_method={method!r}")
+
+def ensure_fieldmap_only(cfg: RTSessionConfig) -> None:
+    """
+    Ensure the selected AP/PA pair has fieldmap outputs.
+
+    This is RT-side prerequisite checking.
+    It does not run full preprocessing.
+    It does not require structural block.
+    It does not require a separate EPI block.
+    It uses the existing func/trans/rt_ref_epi.nii reference.
+    """
+
+    # No explicit AP/PA pair: use legacy/common fmap folder.
+    if cfg.ap_block is None and cfg.pa_block is None:
+        log.info("[FMAP] No AP/PA pair specified; using default fmap dir: %s", cfg.fmap_dir)
+        return
+
+    if cfg.ap_block is None or cfg.pa_block is None:
+        raise ValueError("Set both --ap-block and --pa-block, or neither.")
+
+    if _fieldmap_ready(cfg):
+        log.info("[FMAP] Fieldmap already ready in %s", cfg.fmap_dir)
+        return
+
+    ref_epi = cfg.rt_distorted_motion_ref_epi
+    if not ref_epi.exists():
+        raise FileNotFoundError(
+            f"[FMAP] Cannot build AP/PA fieldmap: missing RT reference EPI: {ref_epi}. "
+            "Run the base preprocessing once so func/trans/rt_ref_epi.nii exists."
+        )
+
+    log.warning(
+        "[FMAP] Fieldmap missing for AP/PA pair ap=%s pa=%s in %s; building fieldmap only.",
+        cfg.ap_block,
+        cfg.pa_block,
+        cfg.fmap_dir,
+    )
+
+    # Reuse the DICOM staging/conversion helper from run_preproc.
+    # It copies only the requested AP/PA DICOM blocks and converts them to fixed names.
+    from run_preproc import _stage_convert_to_target
+    from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
+    from types import SimpleNamespace
+
+    cfg.fmap_dir.mkdir(parents=True, exist_ok=True)
+
+    ap_path = cfg.fmap_dir / "AP.nii.gz"
+    pa_path = cfg.fmap_dir / "PA.nii.gz"
+
+    _stage_convert_to_target(cfg.incoming_dir, int(cfg.ap_block), ap_path)
+    _stage_convert_to_target(cfg.incoming_dir, int(cfg.pa_block), pa_path)
+
+    # Minimal config object for FMRIRealtimePreprocessor._prepare_fieldmap().
+    fieldmap_cfg = SimpleNamespace(
+        subject_id=cfg.subject,
+        day_id=cfg.day,
+        root=cfg.day_root,
+        subject_root=cfg.subject_root,
+        ap_file=ap_path,
+        pa_file=pa_path,
+        fieldmap_dir=cfg.fmap_dir,
+        fieldmap_method=str(REGRESSOR_SETTINGS.fieldmap_method).lower(),
+        epi_phase_encoding=str(REGRESSOR_SETTINGS.epi_phase_encoding).upper(),
+        decoder_template=Path("unused_decoder_template.nii"),
+    )
+
+    pipe = FMRIRealtimePreprocessor(fieldmap_cfg)
+    pipe._prepare_fieldmap(ref_epi)
+
+    if not _fieldmap_ready(cfg):
+        raise FileNotFoundError(
+            f"[FMAP] Fieldmap-only build finished, but required outputs are still missing in {cfg.fmap_dir}"
+        )
+
+    log.info("[FMAP] Fieldmap-only build complete: %s", cfg.fmap_dir)
 
 def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None:
     metadata_path = cfg.rt_work_dir / "session_metadata.json"
@@ -2085,6 +2185,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         )
     decoder_template = resolve_decoder_template(cfg)
 
+    ensure_fieldmap_only(cfg)
+
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
     # Process existing DICOMs first (offline-style), but only for this run
@@ -2222,7 +2324,7 @@ def append_biopac_timelag(
         w.writerow(
             [
                 volume_idx,
-                f"{trigger_timestxp:.6f}",
+                f"{trigger_timestamp:.6f}",
                 f"{volume_timestamp:.6f}",
                 f"{timelag_s:.6f}",
                 f"{avg_timelag_s:.6f}",
@@ -2235,6 +2337,18 @@ def main():
     parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
     parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
     parser.add_argument("--run", required=True, help="Run number, e.g. 4 (matches 000004 in DICOM name)")
+    parser.add_argument(
+        "--ap-block",
+        type=int,
+        default=None,
+        help="AP block to use for b0",
+    )
+    parser.add_argument(
+        "--pa-block",
+        type=int,
+        default=None,
+        help="PA block to use for b0",
+    )
     parser.add_argument(
         "--rs",
         dest="reference_score_run",
@@ -2418,6 +2532,8 @@ def main():
         reference_score_run=args.reference_score_run,
         enable_scoring=not args.no_score,
         enable_original_score=args.enable_original_score,
+        ap_block=args.ap_block,
+        pa_block=args.pa_block,
     )
 
     if not cfg.incoming_dir.exists():

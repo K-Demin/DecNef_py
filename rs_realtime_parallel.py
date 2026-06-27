@@ -804,7 +804,8 @@ def main() -> None:
             log.info("[SCORE] No decoder selected (--decoder-template not provided); scoring will be skipped.")
         elif args.no_score:
             log.info("[SCORE] Decoder was provided but --no-score is set; scoring will be skipped.")
-
+        if (args.ap_block is None) != (args.pa_block is None):
+            raise ValueError("Set both --ap-block and --pa-block, or neither.")
         fieldmap_dir = _fieldmap_pair_dir(
             base_data=base_data,
             sub=args.sub,
@@ -828,7 +829,8 @@ def main() -> None:
                 else pca_reference_image
             ),
             enable_scoring=enable_scoring,
-            fieldmap_dir=fieldmap_dir,
+            ap_block=args.ap_block,
+            pa_block=args.pa_block,
         )
 
         # pca_root = cfg.day_root / "PCA"
