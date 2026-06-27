@@ -368,6 +368,26 @@ def _check_rt_fieldmap_exists(fmap_dir: Path) -> None:
         )
 
 
+def _release_mouse_cursor(win) -> None:
+    try:
+        win.mouseVisible = True
+    except Exception as exc:
+        log.warning("Could not show PsychoPy mouse cursor: %s", exc)
+
+    handles = [getattr(win, "winHandle", None)]
+    backend = getattr(win, "backend", None)
+    if backend is not None:
+        handles.append(getattr(backend, "winHandle", None))
+
+    for handle in handles:
+        if handle is None or not hasattr(handle, "set_exclusive_mouse"):
+            continue
+        try:
+            handle.set_exclusive_mouse(False)
+        except Exception as exc:
+            log.warning("Could not release exclusive mouse control: %s", exc)
+
+
 def _build_presentation_window(visual, color):
     default_size = (1000, 700)
     window_kwargs = {
@@ -393,7 +413,9 @@ def _build_presentation_window(visual, color):
 
     except Exception as exc:
         log.warning("Could not detect external monitor; using default window size: %s", exc)
-    return visual.Window(**window_kwargs)
+    win = visual.Window(**window_kwargs)
+    _release_mouse_cursor(win)
+    return win
 
 
 def run_fixation_presentation(
@@ -407,8 +429,8 @@ def run_fixation_presentation(
     seen_vols: set[int] = set()
 
     while True:
-
         win.fullscr = True
+        _release_mouse_cursor(win)
         win.flip()
         try:
             while True:
