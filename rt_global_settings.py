@@ -57,6 +57,11 @@ class RegressorSettings:
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
     save_intermediate_unwarped: bool = True
+    enable_volume_streamer: bool = False
+    volume_stream_kind: str = "unwarped"  # "raw", "mc", "unwarped", "reg", or "score_input"
+    volume_stream_every_n: int = 1
+    volume_stream_max_queue: int = 2
+    volume_stream_window_title: str = "RT volume QC"
     pyhysco_device: str = "cuda"
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 
@@ -81,6 +86,12 @@ class RegressorSettings:
                 setattr(self, key, str(value).upper())
             elif key == "pyhysco_backend":
                 setattr(self, key, str(value).lower())
+            elif key == "volume_stream_kind":
+                setattr(self, key, str(value).lower())
+            elif key == "volume_stream_every_n":
+                setattr(self, key, max(1, int(value)))
+            elif key == "volume_stream_max_queue":
+                setattr(self, key, max(1, int(value)))
             else:
                 setattr(self, key, value)
 

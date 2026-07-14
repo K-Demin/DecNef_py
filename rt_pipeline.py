@@ -33,6 +33,7 @@ from biopac_rt.biopac_receiver import (
     BiopacRetroTSFileBuffer,
 )
 from rt_global_settings import load_regressor_settings
+from volume_streamer import VolumeStreamerConfig, VolumeStreamerHandle
 
 # ---------- Logging setup ----------
 logging.basicConfig(
@@ -1092,6 +1093,17 @@ class DICOMHandler(FileSystemEventHandler):
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
         self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
         self._pyhysco_unwarped_save_notice_emitted = False
+        self.volume_streamer = VolumeStreamerHandle(
+            VolumeStreamerConfig(
+                enabled=bool(getattr(REGRESSOR_SETTINGS, "enable_volume_streamer", False)),
+                kind=str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")),
+                every_n=int(getattr(REGRESSOR_SETTINGS, "volume_stream_every_n", 1)),
+                max_queue=int(getattr(REGRESSOR_SETTINGS, "volume_stream_max_queue", 2)),
+                window_title=str(getattr(REGRESSOR_SETTINGS, "volume_stream_window_title", "RT volume QC")),
+            ),
+            logger=log,
+        )
+        self.volume_streamer.start()
         log.info(
             "[FMAP] Effective settings: use_preloaded_pyhysco=%s save_intermediate_unwarped=%s "
             "pyhysco_backend=%s pyhysco_device=%s",
@@ -1290,6 +1302,7 @@ class DICOMHandler(FileSystemEventHandler):
                 self.biopac_receiver.send_run_end()
             self.biopac_receiver.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self.volume_streamer.stop()
 
     def start_biopac(self):
         if self.biopac_receiver is None:
@@ -2025,6 +2038,16 @@ def process_volume(
         )
         return False
 
+    stream_kind = str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")).lower()
+    stream_paths = {
+        "raw": raw_nii,
+        "mc": mc_nii,
+        "unwarped": mc_unwarped_nii if mc_unwarped_nii.exists() else None,
+        "reg": reg_nii,
+        "score_input": score_input_nii,
+    }
+    handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind))
+
     if not cfg.enable_scoring:
         if handler.score_queue is not None:
             try:
@@ -2492,6 +2515,25 @@ def main():
         help="Maximum retries per DICOM if processing fails.",
     )
     parser.add_argument(
+        "--volume-streamer",
+        action="store_true",
+        default=None,
+        help="Open a small best-effort local QC window showing selected live NIfTI volumes.",
+    )
+    parser.add_argument(
+        "--volume-stream-kind",
+        choices=["raw", "mc", "unwarped", "reg", "score_input"],
+        default=None,
+        help="Which per-volume NIfTI to show in the QC window. Defaults to settings-file/global config.",
+    )
+    parser.add_argument(
+        "--volume-stream-every-n",
+        type=int,
+        default=None,
+        help="Render only every Nth volume in the QC window to reduce system load. Defaults to settings-file/global config.",
+    )
+
+    parser.add_argument(
         "--settings-file",
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
@@ -2520,6 +2562,12 @@ def main():
     REGRESSOR_SETTINGS.pipeline_engine = args.pipeline_engine
     REGRESSOR_SETTINGS.commit_wait_timeout_s = max(0.1, float(args.commit_wait_timeout_s))
     REGRESSOR_SETTINGS.max_retries = args.max_retries
+    if args.volume_streamer is not None:
+        REGRESSOR_SETTINGS.enable_volume_streamer = args.volume_streamer
+    if args.volume_stream_kind is not None:
+        REGRESSOR_SETTINGS.volume_stream_kind = args.volume_stream_kind
+    if args.volume_stream_every_n is not None:
+        REGRESSOR_SETTINGS.volume_stream_every_n = max(1, int(args.volume_stream_every_n))
 
     cfg = RTSessionConfig(
         subject=args.sub,
