@@ -642,7 +642,25 @@ def main() -> None:
     parser.add_argument(
         "--decoder-template",
         required=False,
-        help="Optional decoder template path to override the default.",
+        help="Optional decoder template path to override the default for decoder scoring.",
+    )
+    parser.add_argument(
+        "--decoder-roi-txt",
+        required=False,
+        default=None,
+        help=(
+            "Optional ROI_DECODER-style text file for decoder scoring. "
+            "Ignored when using PCA scoring."
+        ),
+    )
+    parser.add_argument(
+        "--score-source",
+        choices=["decoder", "pca"],
+        default=None,
+        help=(
+            "Score backend for feedback. Defaults to decoder unless --pca-mode "
+            "is supplied; --pca-mode is kept as an alias for --score-source=pca."
+        ),
     )
     parser.add_argument(
         "--roi-labels",
@@ -755,8 +773,8 @@ def main() -> None:
         "--pca-mode",
         action="store_true",
         help=(
-            "PCA workflow mode: disable decoder scoring and ignore --rs "
-            "(analysis is driven by PCA outputs rather than decoder scores)."
+            "Deprecated alias for --score-source=pca: disable decoder scoring "
+            "and drive feedback from PCA outputs."
         ),
     )
     parser.add_argument(
@@ -914,9 +932,16 @@ def main() -> None:
     base_data = Path(args.base_data)
     subject_root = base_data / f"sub-{args.sub}"
     pca_reference_image = None
+    score_source = args.score_source or ("pca" if args.pca_mode else "decoder")
+    use_pca = score_source == "pca"
+    if args.pca_mode and args.score_source == "decoder":
+        raise ValueError("--pca-mode conflicts with --score-source=decoder")
+    if use_pca and args.decoder_roi_txt:
+        log.info("PCA score source enabled: ignoring --decoder-roi-txt=%s", args.decoder_roi_txt)
+
     cfg_decoder_template = (
         None
-        if args.pca_mode
+        if use_pca
         else Path(args.decoder_template) if args.decoder_template else None
     )
     cfg = RTSessionConfig(
@@ -926,14 +951,15 @@ def main() -> None:
         incoming_root=Path(args.incoming_root),
         base_data=base_data,
         decoder_template=cfg_decoder_template,
-        reference_score_run=None if args.pca_mode else args.reference_score_run,
-        enable_scoring=not args.pca_mode,
+        decoder_roi_txt=None if use_pca else Path(args.decoder_roi_txt) if args.decoder_roi_txt else None,
+        reference_score_run=None if use_pca else args.reference_score_run,
+        enable_scoring=not use_pca,
         ap_block=args.ap_block,
         pa_block=args.pa_block,
     )
 
-    if args.pca_mode and args.reference_score_run:
-        log.info("PCA mode enabled: ignoring --rs=%s", args.reference_score_run)
+    if use_pca and args.reference_score_run:
+        log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
@@ -952,13 +978,13 @@ def main() -> None:
     )
     if args.rt_max_scan_length is not None:
         settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
-    if args.pca_mode:
+    if use_pca:
         settings_payload["analysis_space"] = args.pca_space
     pca_volume_kind = args.pca_volume_kind
-    if args.pca_mode and pca_volume_kind is None:
+    if use_pca and pca_volume_kind is None:
         pca_volume_kind = "reg" if args.pca_space == "epi" else args.pca_space
     pca_score_label = None
-    if args.pca_mode:
+    if use_pca:
         pca_score_label = pca_rt.resolve_score_label(
             score_metric=args.pca_score_metric,
             target_pc=args.pca_target_pc,
@@ -970,7 +996,7 @@ def main() -> None:
     direction_labels = _parse_csv_list(args.direction_labels)
     symbols = _parse_csv_list(args.condition_symbols)
     symbol_seed = args.symbol_seed
-    if symbol_seed is None and not args.pca_mode:
+    if symbol_seed is None and not use_pca:
         try:
             symbol_seed = int(args.sub)
         except ValueError:
@@ -979,7 +1005,7 @@ def main() -> None:
     pca_day = None
     pca_run = None
     pca_root = None
-    if args.pca_mode:
+    if use_pca:
         default_private_key, default_public_schedule = pca_rt.default_condition_paths(
             cfg.subject_root
         )
@@ -1054,7 +1080,7 @@ def main() -> None:
     reference_stats = {}
     reference_stats_day = args.pca_reference_day
     reference_stats_run = args.pca_reference_run
-    if args.pca_mode:
+    if use_pca:
         if reference_scores_path is not None and reference_stats_path is not None:
             raise ValueError("Use either --pca-reference-scores or --pca-reference-stats, not both.")
         if reference_stats_path is not None:
@@ -1090,7 +1116,7 @@ def main() -> None:
         "condition_id": condition.condition_id,
         "symbol": condition.symbol,
     }
-    if not args.pca_mode:
+    if not use_pca:
         condition_payload.update(
             {
                 "roi": condition.roi,
@@ -1114,10 +1140,13 @@ def main() -> None:
                 "condition_seed": args.condition_seed,
                 "symbol_seed": symbol_seed,
                 "condition_schedule": str(
-                    public_schedule_path if args.pca_mode else schedule_path
+                    public_schedule_path if use_pca else schedule_path
                 ),
                 "condition_assignment": condition_payload,
-                "pca_mode": args.pca_mode,
+                "score_source": score_source,
+                "pca_mode": use_pca,
+                "decoder_template": str(cfg.decoder_template) if cfg.decoder_template else None,
+                "decoder_roi_txt": str(cfg.decoder_roi_txt) if cfg.decoder_roi_txt else None,
                 "pca_decoder": {
                     "day": pca_day,
                     "run": pca_run,
@@ -1142,7 +1171,7 @@ def main() -> None:
                     "reference_stats_day": reference_stats_day,
                     "reference_stats_run": reference_stats_run,
                 }
-                if args.pca_mode
+                if use_pca
                 else None,
             }
         },
@@ -1189,7 +1218,7 @@ def main() -> None:
     pipeline_process.start()
     pca_stop = ctx.Event()
     pca_process = None
-    if args.pca_mode:
+    if use_pca:
         pca_process = ctx.Process(
             target=pca_rt.run_realtime_pca_scorer,
             kwargs={
@@ -1235,7 +1264,7 @@ def main() -> None:
             biopac_stop.set()
         if biopac_process is not None:
             biopac_process.join(timeout=5)
-        if args.pca_mode:
+        if use_pca:
             pca_rt.plot_pca_scores_motion(
                 run_dir=run_dir,
                 scores_csv=run_dir / "pca_realtime_scores.csv",
