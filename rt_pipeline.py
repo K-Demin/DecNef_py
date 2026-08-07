@@ -18,6 +18,8 @@ import nibabel as nib
 import numpy as np
 import torch
 
+from motion_fd import fd_from_rtpspy_delta
+
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -1709,8 +1711,8 @@ def process_volume(
     nib.save(mc_img, str(mc_nii))
 
     # ----- 2b) MOTION + FD (ONLINE) -----
-    # RtpVolreg stores [roll, pitch, yaw, dS, dL, dP]: rotations first
-    # in degrees, followed by translations in mm.
+    # RtpVolreg exposes [roll pitch yaw dS dL dP]: rotations in degrees,
+    # followed by translations in mm.
     try:
         motion_vec = np.asarray(handler.volreg._motion[volume_idx - 1]).astype(float)  # shape (6,)
     except Exception as e:
@@ -1727,14 +1729,8 @@ def process_volume(
         delta = motion_vec - handler.prev_motion
     handler.prev_motion = motion_vec.copy()
 
-    # Convert rotations from degrees → radians, then to surface displacement.
-    rot_deg = delta[:3]                            # degrees
-    trans = delta[3:]                              # mm
-    rot_rad = rot_deg * np.pi / 180.0              # radians
-    disp_rot = handler.brain_radius_mm * rot_rad   # mm
-
-    # Framewise displacement: sum of absolute displacement
-    fd_value = float(np.sum(np.abs(np.concatenate([trans, disp_rot]))))
+    # Framewise displacement: translation plus radius-scaled rotation.
+    fd_value = float(fd_from_rtpspy_delta(delta, handler.brain_radius_mm))
 
     # Optionally emulate pre_trial_scan_num behavior:
     if volume_idx <= handler.pre_trial_scans:
