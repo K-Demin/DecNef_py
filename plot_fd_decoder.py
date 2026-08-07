@@ -2,8 +2,10 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
+
+from motion_fd import fd_from_rtpspy_motion
 
 
 def zscore(x):
@@ -50,9 +52,9 @@ def load_fd_from_csv(run_dir: Path):
 
 def load_fd_from_motion(run_dir: Path, radius_mm: float = 50.0):
     """
-    Fallback: compute FD from motion_rt.1D (AFNI / RtpVolreg style):
-      cols 0–2: translations (mm)
-      cols 3–5: rotations (deg) -> convert to radians, then to mm via radius.
+    Fallback: compute FD from motion_rt.1D (RtpVolreg style):
+      cols 0–2: rotations (deg)
+      cols 3–5: translations (mm).
 
     FD(t) = sum_i |Δtrans_i(t)| + sum_j |radius * Δrot_rad_j(t)|
     """
@@ -64,19 +66,7 @@ def load_fd_from_motion(run_dir: Path, radius_mm: float = 50.0):
     if motion.ndim == 1:
         motion = motion[None, :]
 
-    # Δ params between successive TRs
-    delta = np.zeros_like(motion)
-    delta[1:, :] = motion[1:, :] - motion[:-1, :]
-
-    # translations: mm
-    d_trans = delta[:, 0:3]
-
-    # rotations: degrees → radians → mm
-    d_rot_deg = delta[:, 3:6]
-    d_rot_rad = d_rot_deg * np.pi / 180.0
-    d_rot_mm = d_rot_rad * radius_mm
-
-    fd = np.sum(np.abs(d_trans), axis=1) + np.sum(np.abs(d_rot_mm), axis=1)
+    fd = fd_from_rtpspy_motion(motion, radius_mm=radius_mm)
     vol_idx = np.arange(1, len(fd) + 1, dtype=int)
 
     return vol_idx, fd
