@@ -397,9 +397,18 @@ class RtpVolreg(RTP):
         chol_fitim_p = self.chol_fitim.ctypes.data_as(
                 ctypes.POINTER(ctypes.c_double))
 
-        # Initial motion parameter
-        if not np.all(self._motion[vol_idx-1, :] == 0):
-            init_motpar = self._motion[vol_idx-1, :]
+        # Initial motion parameter.
+        #
+        # rtp_align_one expects the native AFNI/C-library order:
+        #   [roll, pitch, yaw, dx, dy, dz]
+        # but do_proc stores public motion rows below in RTPSpy order:
+        #   [roll, pitch, yaw, dz, dx, dy]
+        # Convert the previous public row back to native order before using it
+        # as the next optimizer seed. Feeding the permuted public row directly
+        # produces a translation cycle with period three.
+        prev_motion = self._motion[vol_idx-1, :]
+        if not np.all(prev_motion == 0):
+            init_motpar = prev_motion[[0, 1, 2, 4, 5, 3]].copy()
         else:
             init_motpar = np.zeros(6, dtype=np.float32)
 
