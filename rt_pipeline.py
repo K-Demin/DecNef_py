@@ -1709,8 +1709,8 @@ def process_volume(
     nib.save(mc_img, str(mc_nii))
 
     # ----- 2b) MOTION + FD (ONLINE) -----
-    # RtpVolreg stores motion as [x y z rx ry rz] per volume (AFNI-style).
-    # Typically translations in mm, rotations in degrees.
+    # RtpVolreg stores [roll, pitch, yaw, dS, dL, dP]: rotations first
+    # in degrees, followed by translations in mm.
     try:
         motion_vec = np.asarray(handler.volreg._motion[volume_idx - 1]).astype(float)  # shape (6,)
     except Exception as e:
@@ -1727,9 +1727,9 @@ def process_volume(
         delta = motion_vec - handler.prev_motion
     handler.prev_motion = motion_vec.copy()
 
-    # Convert rotations (rx, ry, rz) from degrees → radians, then to mm
-    trans = delta[:3]                              # mm
-    rot_deg = delta[3:]                            # degrees
+    # Convert rotations from degrees → radians, then to surface displacement.
+    rot_deg = delta[:3]                            # degrees
+    trans = delta[3:]                              # mm
     rot_rad = rot_deg * np.pi / 180.0              # radians
     disp_rot = handler.brain_radius_mm * rot_rad   # mm
 
