@@ -1,0 +1,309 @@
+MINJOO BRAIN-PONG SEQUENCE
+===========================
+
+Before the experiment
+---------------------
+
+1. conda activate rt_pipe
+2. Copy the subject data template and rename it to sub-00000.
+3. Put the T1 file in the subject anat folder(if day1).
+4. Put the subject decoder in /SSD2/DecNef_py/decoders/Minjoo/.
+6. Update the Brain-pong settings file used by that NF run
+   (brainpong_settings_velocity.json or brainpong_settings_position.json):
+   - TR and analysis_space
+   - decoder pair/path and category-to-direction mapping
+   - feedback delay/smoothing
+   - number of blocks/trials
+7. Confirm the shared behavioral task files:
+   - task/Minjoo/brain_pong_inputs/config/defaults_delay.yaml
+     (window, game physics, 30s/6s waits, 120s active duration, leveling rule)
+   - task/Minjoo/brain_pong_inputs/config/levels.yaml
+     (level-specific paddle size and point increment)
+
+IMPORTANT:
+- Replace every REPLACE_* value below before running.
+- --run must match the scanner EPI block number.
+- --rs in the Brain-pong command must match the resting-state --run.
+- Keep the category-to-direction mapping hidden from the participant.
+- Confirm that TR in the selected Brain-pong settings file matches the scanner sequence.
+- Brain-pong uses the --rs reference run to convert score_z into signed-percentile
+  feedback. Confirm that the reference run scores.csv exists before starting NF.
+
+
+LOCALIZER / RESTING STATE / OFFLINE PREPARATION
+-----------------------------------------------
+
+Ideal scanner block order:
+- run 1: localizer
+- run 2: AP fieldmap for resting/reference
+- run 3: PA fieldmap for resting/reference
+- run 4: resting/reference EPI
+
+Start this command, then start the resting-state scan. --run must equal
+--epi-block.
+
+python rs_realtime_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 4 \
+    --wait-epi-min 20 \
+    --ap-block 2 \
+    --pa-block 3 \
+    --epi-block 4 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MJ/ \
+    --settings-file minjoo_settings.json \
+    --base-data /SSD2/DecNef_py/data \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz \
+    --max-trs 600
+
+The resting-state script may need ESC after acquisition if it does not stop automatically.
+
+
+BRAIN-PONG NEUROFEEDBACK
+------------------------
+
+Before starting:
+- Confirm that the incoming folder is receiving the correct scan numbers.
+- Confirm that each command's --run matches the scanner EPI block.
+- Confirm that the selected Brain-pong settings file has the intended decoder pair and blind mapping.
+- Confirm that --rs is the resting run above.
+- One NF run is one Brain-pong block. With trials_per_block=3:
+  30-second initial baseline/first pre-delay, 3 feedback trials of 120 seconds
+  each, and 6-second pre-delay before trials 2 and 3.
+  Total scheduled duration after trigger is 402 seconds (6 minutes 42 seconds).
+- Labels like "NF run1" below are the task NF run labels. The CLI --run
+  value is the scanner EPI block number, which may skip if the scanner has
+  extra/error runs.
+- Use --nf-run for the task run number. Internally this is still saved as
+  blockXX.tsv for compatibility with analysis scripts.
+- Use --start-level to set the level for this NF run. After each NF run,
+  read brainpong/brainpong_next_state.json and use its next_start_level for
+  the next NF run in the same mode chain.
+
+<NF run1: velocity mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 3 \
+    --run 7 \
+    --rs 4 \
+    --ap-block 5 \
+    --pa-block 6 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --nf-run 1 \
+    --start-level 1 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+
+<NF run2: velocity mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 3 \
+    --run 10 \
+    --rs 4 \
+    --ap-block 8 \
+    --pa-block 9 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_velocity.json \
+    --nf-run 2 \
+    --start-level 1 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run3: velocity mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 13 \
+    --rs 4 \
+    --ap-block 11 \
+    --pa-block 12 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_velocity.json \
+    --nf-run 3 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN2 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run4: velocity mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 16 \
+    --rs 4 \
+    --ap-block 14 \
+    --pa-block 15 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_velocity.json \
+    --nf-run 4 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN3 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run5: velocity mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 19 \
+    --rs 4 \
+    --ap-block 17 \
+    --pa-block 18 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_velocity.json \
+    --nf-run 5 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN4 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run6: position mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 22 \
+    --rs 4 \
+    --ap-block 20 \
+    --pa-block 21 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_position.json \
+    --nf-run 6 \
+    --start-level 1 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run7: position mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 25 \
+    --rs 4 \
+    --ap-block 23 \
+    --pa-block 24 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_position.json \
+    --nf-run 7 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN6 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run8: position mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 28 \
+    --rs 4 \
+    --ap-block 26 \
+    --pa-block 27 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_position.json \
+    --nf-run 8 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN7 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run9: position mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 31 \
+    --rs 4 \
+    --ap-block 29 \
+    --pa-block 30 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_position.json \
+    --nf-run 9 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN8 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+<NF run10: position mode>
+python rt_brainpong_parallel.py \
+    --sub 99988 \
+    --day 2 \
+    --run 34 \
+    --rs 4 \
+    --ap-block 32 \
+    --pa-block 33 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260707.20260707_99988.MINJOO/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --brainpong-settings brainpong_settings_position.json \
+    --nf-run 10 \
+    --start-level REPLACE_NEXT_START_LEVEL_FROM_NF_RUN9 \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz
+
+Each completed run writes brainpong/brainpong_next_state.json. Its
+next_start_level is the value to enter as --start-level for the next NF run in
+the same mode chain. Points reset to init_points for each NF run.
+Velocity and position modes start separate level chains.
+
+The PsychoPy window waits for the scanner trigger key 's'.
+Press ESC to end the Brain-pong presentation early.
+
+
+
+CHECK SCORES DURING / AFTER THE RUN
+-----------------------------------
+
+Realtime decoder scores:
+/SSD2/DecNef_py/data/sub-99988/2/func/REPLACE_SCANNER_EPI_BLOCK/scores.csv
+
+Brain-pong logs:
+/SSD2/DecNef_py/data/sub-99988/2/func/REPLACE_SCANNER_EPI_BLOCK/brainpong/
+
+Expected Brain-pong files:
+- brainpong_config_snapshot.json
+- brainpong_scores.csv
+- brainpong_frames.csv
+- brainpong_trials.csv
+- brainpong_run_summary.json
+- brainpong_next_state.json (use next_start_level for the next NF run)
+- blockXX.tsv (shared behavioral block summary with level/performance)
+- blockXX_trialXX.tsv (shared ball, paddle, hit/miss, and points log)
+- blockXX.log
+
+Plot decoder scores after the run:
+
+python plot_scores.py \
+    /SSD2/DecNef_py/data/sub-REPLACE_SUBJECT/REPLACE_DAY/func/REPLACE_NF_RUN/scores.csv \
+    /SSD2/DecNef_py/data/sub-REPLACE_SUBJECT/REPLACE_DAY/func/REPLACE_NF_RUN/scores_plot.png
+
+
+OFFLINE REPROCESSING (IF NEEDED)
+--------------------------------
+
+python run_preproc.py \
+    --sub 99988 \
+    --day 1 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/REPLACE_INCOMING_FOLDER/ \
+    --base-data /SSD2/DecNef_py/data \
+    --ap-block 2 \
+    --pa-block 3 \
+    --epi-block 4
+
+python rt_pipeline.py \
+    --sub 99988 \
+    --day 1 \
+    --run REPLACE_RUN \
+    --max-workers 1 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/REPLACE_INCOMING_FOLDER/ \
+    --base-data /SSD2/DecNef_py/data \
+    --settings-file minjoo_settings.json \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/REPLACE_DECODER.nii.gz
+
+
+AFTER THE EXPERIMENT
+--------------------
+
+1. Check scores.csv and all Brain-pong logs.
+2. Calculate and report the final score.
+3. Confirm subject/day/run identifiers in the saved config snapshot.
+4. Upload the subject output folder to NAS.
