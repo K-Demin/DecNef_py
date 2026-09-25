@@ -12,6 +12,11 @@ import numpy as np
 import gzip
 import shutil
 import os
+import json
+from fmri_rt_preproc.native_fieldmap import (
+    PIPELINE_ORDER, native_paths, calibration_spec, load_calibration,
+    save_native_mean, require_same_grid, validate_bold, source_identity,
+)
 
 from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
 
@@ -222,72 +227,29 @@ class FMRIRealtimePreprocessor:
 
     # ---------- Fieldmap / AP-PA ----------
 
-    def _prepare_fieldmap(self, epi_ref: Path):
-        """
-        Build an AP/PA fieldmap in the configured fieldmap working directory.
-
-        AP and PA volumes are motion-corrected to the same rt_ref_epi.nii that
-        online BOLD volumes use. The corrected AP/PA series are then averaged
-        and passed to PyHySCO/ANTs.
-        """
-        ensure_dir(self.fmap_dir)
-        ap = self.cfg.ap_file
-        pa = self.cfg.pa_file
-        fieldmap_ref = self.rt_distorted_motion_ref_epi if self.rt_distorted_motion_ref_epi.exists() else epi_ref
-        ap_mean_ref, pa_mean_ref = self._motion_correct_fieldmaps_to_ref(ap, pa, fieldmap_ref)
-
-        if self.fieldmap_method == "pyhysco":
-            self._run_ap_pa_pyhysco(ap_mean_ref, pa_mean_ref, output_stem="pyhysco_epi")
-        elif self.fieldmap_method == "ants":
-            ap2pa_warp = self.fmap_dir / "AP2PA_epi_Warped.nii"
-            if not self._is_current_grid_output(ap2pa_warp, pa_mean_ref, [ap_mean_ref, pa_mean_ref]):
-                self._run_ap_pa_ants(ap_mean_ref, pa_mean_ref, output_prefix_name="AP2PA_epi_")
-        else:
-            raise ValueError(
-                f"Unknown fieldmap_method={self.fieldmap_method}. Use 'pyhysco' or 'ants'."
-            )
-
-    def _motion_correct_fieldmaps_to_ref(self, ap: Path, pa: Path, epi_ref: Path) -> tuple[Path, Path]:
-        ensure_dir(self.fmap_dir)
-        fsl_env = dict(os.environ, FSLOUTPUTTYPE="NIFTI_GZ")
-        ap_mc = self.fmap_dir / "AP_mc.nii.gz"
-        pa_mc = self.fmap_dir / "PA_mc.nii.gz"
-        ap_mean = self.fmap_dir / "AP_mean.nii.gz"
-        pa_mean = self.fmap_dir / "PA_mean.nii.gz"
-        force = not getattr(self, "_fieldmap_mc_to_ref_ready", False)
-
-        for src, dst in ((ap, ap_mc), (pa, pa_mc)):
-            if not force and self._is_current_grid_output(dst, epi_ref, [src, epi_ref]):
-                continue
-            run([
-                "mcflirt",
-                "-in", str(src),
-                "-out", str(dst),
-                "-reffile", str(epi_ref),
-            ], env=fsl_env)
-            if not self._same_grid(dst, epi_ref):
-                raise RuntimeError(
-                    f"{dst} is not in the same grid as RT motion reference {epi_ref}"
-                )
-
-        for src, dst in ((ap_mc, ap_mean), (pa_mc, pa_mean)):
-            if not force and self._is_current_grid_output(dst, epi_ref, [src, epi_ref]):
-                continue
-            run(["fslmaths", str(src), "-Tmean", str(dst)], env=fsl_env)
-            if not self._same_grid(dst, epi_ref):
-                raise RuntimeError(
-                    f"{dst} is not in the same grid as RT motion reference {epi_ref}"
-                )
-
-        ap_mean_nii = gunzip_python(ap_mean)
-        pa_mean_nii = gunzip_python(pa_mean)
-        for out_path in (ap_mean_nii, pa_mean_nii):
-            if not self._same_grid(out_path, epi_ref):
-                raise RuntimeError(
-                    f"{out_path} is not in the same grid as RT motion reference {epi_ref}"
-                )
-        self._fieldmap_mc_to_ref_ready = True
-        return ap_mean_nii, pa_mean_nii
+    def _prepare_fieldmap(self, epi_ref=None):
+        """Average raw AP/PA in place, without ANY motion correction."""
+        if self.fieldmap_method != "pyhysco":
+            raise ValueError("unwarp -> MC currently supports PyHySCO only; ANTs AP-to-PA warps are not interchangeable.")
+        ap, pa = self.cfg.ap_file, self.cfg.pa_file
+        spec = calibration_spec(ap, pa)
+        if spec["ap_pe"] is None and spec["pa_pe"] is None:
+            log.warning("AP/PA metadata missing: using legacy voxel phase-encoding axis 2.")
+        folder, field, manifest = native_paths(self.fmap_dir)
+        folder.mkdir(parents=True, exist_ok=True)
+        if manifest.exists() and all(p.exists() for p in (field, folder / "AP_mean.nii", folder / "PA_mean.nii")):
+            if json.loads(manifest.read_text()) == spec:
+                return
+        if manifest.exists():
+            manifest.unlink()  # An interrupted build must never appear complete.
+        require_same_grid(nib.load(str(ap)), nib.load(str(pa)))
+        ap_mean, pa_mean = folder / "AP_mean.nii", folder / "PA_mean.nii"
+        save_native_mean(ap, ap_mean)
+        save_native_mean(pa, pa_mean)
+        self._run_ap_pa_pyhysco(ap_mean, pa_mean, output_stem="pyhysco_native")
+        if not field.exists():
+            raise FileNotFoundError(f"PyHySCO did not produce {field}")
+        manifest.write_text(json.dumps(spec, indent=2))
 
     def _is_current_output(self, out_path: Path, inputs: list[Path]) -> bool:
         if not out_path.exists():
@@ -316,13 +278,13 @@ class FMRIRealtimePreprocessor:
         )
 
     def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path, output_stem: str = "pyhysco"):
-        pyhysco_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii"
-        if self._is_current_grid_output(pyhysco_field, ap_mean, [ap_mean, pa_mean]):
+        pyhysco_field = ap_mean.parent / f"{output_stem}-EstFieldMap.nii"
+        if self._is_current_output(pyhysco_field, [ap_mean, pa_mean]):
             print("✓ PyHySCO fieldmap already exists — skipping")
             return
 
-        pyhysco_prefix = self.fmap_dir / output_stem
-        generated_field = self.fmap_dir / f"{output_stem}-EstFieldMap.nii.gz"
+        pyhysco_prefix = ap_mean.parent / output_stem
+        generated_field = ap_mean.parent / f"{output_stem}-EstFieldMap.nii.gz"
         for stale in (pyhysco_field, generated_field):
             if stale.exists():
                 stale.unlink()
@@ -399,55 +361,38 @@ class FMRIRealtimePreprocessor:
         run_dir = run_cfg.epi_file.parent
         ensure_dir(run_dir)
 
-        # 0) Input: 4D epi, already combined outside this script
-        epi_4d = run_cfg.epi_file  # e.g. epi_4d.nii
-        epi_first = run_dir / "epi_first.nii"
-        self._extract_first_epi_volume(epi_4d, epi_first)
+        # Use a fresh preparation directory when migrating old MC-first assets.
+        epi_4d = run_cfg.epi_file
+        marker = run_dir / "preparation_order.json"
+        identity = {"order": PIPELINE_ORDER, "epi": source_identity(epi_4d),
+                    "calibration": calibration_spec(self.cfg.ap_file, self.cfg.pa_file),
+                    "epi_phase_encoding": self.epi_phase_encoding}
+        if marker.exists():
+            if json.loads(marker.read_text()) != identity:
+                raise ValueError("Preparation inputs changed. Use a fresh preparation directory to avoid stale transforms.")
+        elif any((run_dir / name).exists() for name in
+                 ("epi_mc.nii", "epi_unwarped_mean.nii", "epi_unwarped_mean.nii.gz", "epi2t1_Composite.h5")):
+            raise ValueError("Legacy preparation detected. Reuse its corrected reference from realtime, or prepare in a fresh day directory.")
+        marker.write_text(json.dumps(identity, indent=2))
+        self._prepare_fieldmap()
 
-        # 1) Skullstrip raw EPI (for nuisance mask preparation during MC stats)
-        epi_brain_raw = run_dir / "epi_brain_raw.nii"
-        epi_mask_raw = run_dir / "epi_mask_raw.nii"
-        self._skullstrip_epi(epi_4d, epi_brain_raw, epi_mask_raw)
-
-        # 2) Motion correction first (to run EPI1)
-        rt_mc_ref_mean = run_dir / "epi_mc_mean.nii"
-        rt_mc_ref_mask_mean = run_dir / "epi_mc_mask_mean.nii"
-        self._motion_correct_and_mean(
-            epi_4d=epi_4d,
-            epi_mask=epi_mask_raw,
-            epi_mean=rt_mc_ref_mean,
-            epi_mask_mean=rt_mc_ref_mask_mean,
-            n_vols_for_mean=20,  # or None to use all volumes
-        )
-
-        # --- Set global RT MC reference from MC-first mean ---
-        self._maybe_set_rt_reference(rt_mc_ref_mean, rt_mc_ref_mask_mean)
-
-        # 2.5) Prepare AP/PA fieldmap in the same RT motion-reference pose/grid
-        self._prepare_fieldmap(self.rt_distorted_motion_ref_epi)
-
-        # 3) Apply AP/PA warp to motion-corrected 4D EPI
-        epi_mc = epi_4d.with_name("epi_mc.nii")
+        # Unwarp raw BOLD first, then build an MC mean in corrected space.
         epi_unwarped = run_dir / "epi_unwarped.nii"
-        self._unwarp_epi(epi_mc, epi_unwarped)
-
-        # 4) Skullstrip unwarped EPI for registration and nuisance masks
-        epi_brain = run_dir / "epi_brain.nii"
-        epi_mask = run_dir / "epi_mask.nii"
-        self._skullstrip_epi(epi_unwarped, epi_brain, epi_mask)
-
-        # 5) Build means from unwarped outputs used for registration
-        epi_mean = run_dir / "epi_unwarped_mean.nii.gz"
-        epi_mask_mean = run_dir / "epi_mask_mean.nii.gz"
-        if not epi_mean.exists():
-            run(["fslmaths", str(epi_unwarped), "-Tmean", str(epi_mean)])
-            gunzip_python(epi_mean)
-        if not epi_mask_mean.exists():
-            run(["fslmaths", str(epi_mask), "-Tmean", str(epi_mask_mean)])
-            gunzip_python(epi_mask_mean)
+        self._unwarp_epi(epi_4d, epi_unwarped)
+        epi_mean = run_dir / "epi_unwarped_mean.nii"
+        epi_mask_mean = run_dir / "epi_mask_mean.nii"
+        self._motion_correct_and_mean(
+            epi_4d=epi_unwarped,
+            epi_mean=epi_mean,
+            n_vols_for_mean=20,
+        )
+        # Segment the aligned mean, never average unaligned per-volume masks.
+        self._skullstrip_epi(epi_mean, run_dir / "epi_brain_mean.nii", epi_mask_mean)
+        self._maybe_set_rt_reference(epi_mean, epi_mask_mean)
 
         # 6) EPI->T1 registration using EPI mean + masks
-        self._register_epi_to_t1(run_dir, epi_mean, epi_mask_mean)
+        self._register_epi_to_t1(run_dir, self.rt_unwarped_analysis_ref_epi,
+                                 self.rt_unwarped_analysis_ref_mask)
 
         # 6.5 create masks for regression
         self._make_rtp_nuisance_masks()
@@ -491,89 +436,22 @@ class FMRIRealtimePreprocessor:
         nib.save(nib.Nifti1Image(first_vol.astype(np.float32), img_4d.affine, img_4d.header), str(out))
 
     def _preferred_pyhysco_fieldmap(self) -> Path:
-        aligned = prefer_uncompressed_nifti(self.fmap_dir / "pyhysco_epi-EstFieldMap.nii")
-        if aligned.exists():
-            return aligned
-        return prefer_uncompressed_nifti(self.fmap_dir / "pyhysco-EstFieldMap.nii")
-
-    def _distorted_motion_ref_for_unwarp(self) -> Path:
-        return self.rt_distorted_motion_ref_epi
-
-    def _preferred_ants_unwarp_inputs(self) -> tuple[Path, Path, Path]:
-        if self.epi_phase_encoding == "AP":
-            aligned_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_epi_1Warp.nii")
-            legacy_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1Warp.nii")
-            legacy_ref = self.fmap_dir / "AP_mean.nii"
-        else:
-            aligned_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_epi_1InverseWarp.nii")
-            legacy_warp = prefer_uncompressed_nifti(self.fmap_dir / "AP2PA_1InverseWarp.nii")
-            legacy_ref = self.fmap_dir / "PA_mean.nii"
-
-        aligned_affine = self.fmap_dir / "AP2PA_epi_0GenericAffine.mat"
-        if aligned_warp.exists() and aligned_affine.exists():
-            return aligned_warp, aligned_affine, self._distorted_motion_ref_for_unwarp()
-
-        legacy_affine = self.fmap_dir / "AP2PA_0GenericAffine.mat"
-        return legacy_warp, legacy_affine, legacy_ref
+        load_calibration(self.fmap_dir)
+        return native_paths(self.fmap_dir)[1]
 
     def _unwarp_epi(self, epi_4d: Path, out: Path):
-        """
-        Apply AP->PA warp to a 4D EPI (fieldmap-style unwarping).
-
-        Prefers AP2PA_epi_* / pyhysco_epi-* fieldmaps. New outputs with those
-        names are built from AP/PA motion-corrected to rt_ref_epi.nii; legacy
-        AP2PA_* / pyhysco-* files remain as fallback.
-        """
+        spec = validate_bold(nib.load(str(epi_4d)), self.fmap_dir, self.epi_phase_encoding, epi_4d)
         if out.exists():
             return
-
-        pyhysco_field = self._preferred_pyhysco_fieldmap()
-        if self.fieldmap_method == "pyhysco" and pyhysco_field.exists():
-            polarity = 1 if self.epi_phase_encoding == "AP" else -1
-            print(f"→ Applying PyHySCO fieldmap to {epi_4d.name}")
-            apply_pyhysco_fieldmap(
-                epi_path=epi_4d,
-                fieldmap_path=pyhysco_field,
-                out_path=out,
-                phase_encoding_direction=self.pyhysco_phase_encoding_direction,
-                polarity=polarity,
-            )
-            return
-        warp, affine, ref_img = self._preferred_ants_unwarp_inputs()
-
-        if not warp.exists() or not affine.exists():
-            raise FileNotFoundError(
-                f"Expected fieldmap transforms not found:\n"
-                f"  {warp}\n"
-                f"  {affine}\n"
-                "Make sure _run_ap_pa_ants completed successfully."
-            )
-
-        cmd = [
-            "bash", "-lc",
-            f"""
-            export ANTS_USE_GPU=1
-            export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-            export OMP_NUM_THREADS=$(nproc)
-            antsApplyTransforms -d 3 \
-              -e 3 \
-              -i {epi_4d} \
-              -o {out} \
-              -r {ref_img} \
-              -t {warp} \
-              -t {affine} --float 1
-            """
-
-        ]
-        run(cmd)
+        apply_pyhysco_fieldmap(
+            epi_path=epi_4d, fieldmap_path=self._preferred_pyhysco_fieldmap(),
+            out_path=out, phase_encoding_direction=spec["phase_encoding_axis"],
+            polarity=1 if self.epi_phase_encoding == "AP" else -1,
+        )
 
     @property
     def pyhysco_phase_encoding_direction(self) -> int:
-        """
-        Derive PyHySCO PED from chosen EPI phase-encoding:
-          AP -> 1, PA -> 2.
-        """
-        return 1 if self.epi_phase_encoding == "AP" else 2
+        return calibration_spec(self.cfg.ap_file, self.cfg.pa_file)["phase_encoding_axis"]
 
     def _skullstrip_epi(self, epi_unwarped: Path, brain: Path, mask: Path):
         if brain.exists() and mask.exists():
@@ -588,22 +466,18 @@ class FMRIRealtimePreprocessor:
     def _motion_correct_and_mean(
             self,
             epi_4d: Path,
-            epi_mask: Path,
             epi_mean: Path,
-            epi_mask_mean: Path,
             n_vols_for_mean: int | None = 20,
     ):
         """
         Motion correction using RTPSpy's RtpVolreg + temporal means.
 
         Inputs:
-          epi_4d       : raw 4D EPI before AP/PA unwarping
-          epi_mask     : EPI skullstrip mask from mri_synthstrip
+          epi_4d       : unwarped 4D EPI before motion correction
         Outputs:
           epi_mc.nii      : motion-corrected EPI (subset of volumes)
           motion.1D           : AFNI-style motion params
           epi_mean            : mean over time of epi_mc
-          epi_mask_mean       : mean over time of epi_mask
         """
 
         # Output paths (KEEP EXACT OLD NAMING)
@@ -611,7 +485,7 @@ class FMRIRealtimePreprocessor:
         motion_1d = epi_4d.with_name("motion.1D")
 
         # If already computed, skip
-        if epi_mean.exists() and epi_mask_mean.exists() and mc_epi.exists() and motion_1d.exists():
+        if epi_mean.exists() and mc_epi.exists() and motion_1d.exists():
             return
 
         # ------------------------------------------------------------------
@@ -640,8 +514,13 @@ class FMRIRealtimePreprocessor:
         vr.ignore_init = 0
         vr.save_proc = False
 
-        # Reference is the first volume
-        vr.set_ref_vol(f"{epi_4d}[0]")
+        # Later reference runs use the same corrected session reference.
+        ref = self.rt_unwarped_analysis_ref_epi
+        if ref.exists() and ref.resolve() != epi_mean.resolve():
+            require_same_grid(img_4d, nib.load(str(ref)))
+            vr.set_ref_vol(str(ref))
+        else:
+            vr.set_ref_vol(f"{epi_4d}[0]")
 
         # ------------------------------------------------------------------
         #                RUN MOTION CORRECTION VOLUME-BY-VOLUME
@@ -673,39 +552,16 @@ class FMRIRealtimePreprocessor:
             mean_vol = mc_data.mean(axis=-1)
             nib.save(nib.Nifti1Image(mean_vol, affine, header), str(epi_mean))
 
-        if epi_mask.exists() and not epi_mask_mean.exists():
-            mask_img = nib.load(str(epi_mask))
-            mask_data = np.asanyarray(mask_img.dataobj)
-
-            # If mask is 3D → no-op copy
-            if mask_data.ndim == 3:
-                nib.save(mask_img, str(epi_mask_mean))
-            else:
-                mask_mean = mask_data[..., :n_use].mean(axis=-1)
-                nib.save(nib.Nifti1Image(mask_mean, mask_img.affine, mask_img.header),
-                         str(epi_mask_mean))
-
     def _maybe_set_rt_reference(self, epi_mean: Path, epi_mask_mean: Path):
-        """
-        Set the global real-time EPI reference if it does not exist yet.
-
-        We use the first run's MC-first mean EPI as the reference
-        for:
-          - RT motion correction (RtpVolreg)
-          - aligned fieldmap output grid
-          - distorted-space DVARS mask
-        EPI-to-T1 registration uses the unwarped mean EPI created later.
-        """
-        if not self.rt_distorted_motion_ref_epi.exists():
-            print(f"→ Setting RT reference EPI to {epi_mean.name}")
-            # Use Python copy so we don't assume 'cp' exists
-            import shutil
-            shutil.copyfile(epi_mean, self.rt_distorted_motion_ref_epi)
-
-        if epi_mask_mean.exists() and not self.rt_distorted_motion_ref_mask.exists():
-            import shutil
-            shutil.copyfile(epi_mask_mean, self.rt_distorted_motion_ref_mask)
-
+        """Publish corrected references; legacy filenames now contain corrected data."""
+        for source, target in (
+            (epi_mean, self.rt_unwarped_analysis_ref_epi),
+            (epi_mask_mean, self.rt_unwarped_analysis_ref_mask),
+            (epi_mean, self.trans_dir / "rt_ref_epi.nii"),
+            (epi_mask_mean, self.trans_dir / "rt_ref_epi_mask.nii"),
+        ):
+            if source.resolve() != target.resolve() and not target.exists():
+                nib.save(nib.load(str(source)), str(target))
 
     def _register_epi_to_t1(self, run_dir: Path, epi_mean: Path, epi_mask_mean: Path):
         t1_n4 = self.anat_dir / "T1_N4.nii"
