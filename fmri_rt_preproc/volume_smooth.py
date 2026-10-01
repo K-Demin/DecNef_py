@@ -2,7 +2,7 @@
 import numpy as np
 import nibabel as nib
 from scipy.ndimage import gaussian_filter
-from .native_fieldmap import require_same_grid
+from .analysis_mask import final_output_kind, prepare_analysis_mask
 
 
 class MaskedGaussianSmoother:
@@ -16,20 +16,23 @@ class MaskedGaussianSmoother:
         self.mask = np.asarray(mask, dtype=bool).copy()
         self.affine = np.asarray(affine, dtype=float).copy()
         fwhm = float(fwhm_mm)
-        if not np.isfinite(fwhm) or fwhm <= 0:
-            raise ValueError("Smoother requires finite positive FWHM; bypass it for 0 mm.")
+        if not np.isfinite(fwhm) or fwhm < 0:
+            raise ValueError("FWHM must be finite and nonnegative.")
         if self.mask.ndim != 3 or not self.mask.any():
             raise ValueError("Smoothing mask must be a nonempty 3D binary mask.")
         sizes = np.linalg.norm(self.affine[:3, :3], axis=0)
         if not np.isfinite(sizes).all() or np.any(sizes <= 0):
             raise ValueError("Invalid smoothing voxel sizes.")
+        self.output_kind = "smooth" if fwhm > 0 else "masked"
+        self.output = np.zeros(self.mask.shape, dtype=np.float64)
+        if fwhm == 0:
+            return  # Mask-only processing: no Gaussian setup or filtering.
         self.sigma = fwhm / (np.sqrt(8 * np.log(2)) * sizes)
         density = self._filter(self.mask.astype(np.float64))
         self.bad = density[self.mask] < 1e-6
         self.denominator = np.where(self.bad, 1., density[self.mask])
         self.buffer = np.zeros(self.mask.shape, dtype=np.float64)
         self.filtered = np.empty_like(self.buffer)
-        self.output = np.zeros_like(self.buffer)
 
     def _filter(self, data, output=None):
         return gaussian_filter(data, sigma=self.sigma, output=output,
@@ -42,6 +45,9 @@ class MaskedGaussianSmoother:
         values = data[self.mask]
         if not np.isfinite(values).all():
             raise ValueError("Nonfinite values inside smoothing mask.")
+        if self.output_kind == "masked":
+            self.output[self.mask] = values
+            return self.output
         self.buffer[self.mask] = values
         self._filter(self.buffer, output=self.filtered)
         result = self.filtered[self.mask] / self.denominator
@@ -50,44 +56,19 @@ class MaskedGaussianSmoother:
         return self.output
 
 
-def prepare_smoother(cfg, fwhm_mm, analysis_space, final_reference, run_command):
-    """Prepare the whole-brain mask once, using the same chain as final BOLD."""
-    fwhm = float(fwhm_mm)
-    if not np.isfinite(fwhm) or fwhm < 0:
-        raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
-    if fwhm == 0:
+def prepare_smoother(cfg, fwhm_mm, analysis_space, final_reference, run_command,
+                     mask_type="whole_brain", custom_file=None, custom_space="final"):
+    """Prepare the experiment mask once; zero FWHM may still apply masking."""
+    kind = final_output_kind(fwhm_mm, mask_type)
+    if kind is None:
         return None
-    source = cfg.rt_unwarped_analysis_ref_mask
-    reference = nib.load(str(final_reference))
-    folder = cfg.rt_work_dir / "smooth"
+    folder = cfg.rt_work_dir / kind
     folder.mkdir(parents=True, exist_ok=True)
-    mask_path = folder / "mask.nii"
-    if analysis_space == "epi":
-        mask_img = nib.load(str(source))
-    else:
-        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
-        if analysis_space == "mni":
-            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
-        elif analysis_space != "t1":
-            raise ValueError(f"Unsupported smoothing space: {analysis_space}")
-        for path in [source, *transforms]:
-            if not path.exists():
-                raise FileNotFoundError(path)
-        cmd = ["antsApplyTransforms", "-d", "3", "-i", str(source),
-               "-r", str(final_reference), "-o", str(mask_path),
-               "-n", "NearestNeighbor", "--float", "1"]
-        for transform in transforms:
-            cmd.extend(["-t", str(transform)])
-        run_command(cmd)
-        mask_img = nib.load(str(mask_path))
-    require_same_grid(mask_img, reference)
-    values = np.asarray(mask_img.dataobj).copy()
-    if values.ndim != 3 or not np.isfinite(values).all():
-        raise ValueError("Smoothing mask must be a finite 3D image.")
-    mask = values > 0.5
-    smoother = MaskedGaussianSmoother(mask, reference.affine, fwhm)
-    nib.save(nib.Nifti1Image(mask.astype(np.uint8), reference.affine), str(mask_path))
-    return smoother
+    mask, affine = prepare_analysis_mask(cfg, mask_type, analysis_space, final_reference,
+                                        folder, run_command, custom_file, custom_space)
+    processor = MaskedGaussianSmoother(mask, affine, fwhm_mm)
+    nib.save(nib.Nifti1Image(mask.astype(np.uint8), affine), str(folder / "mask.nii"))
+    return processor
 
 
 def smooth_file(smoother, source, destination):

@@ -110,19 +110,21 @@ def test_pca_waits_for_final_smoothing(tmp_path, space, kind):
         volume_path_for_kind(tmp_path, 1, "smooth")
 
 
-def test_pca_preparation_excludes_mask_and_original_stream(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["smooth", "masked"])
+def test_pca_preparation_excludes_mask_and_original_stream(tmp_path, monkeypatch, kind):
     import roi_rs_pca_decoder_prep as prep
 
-    folder = tmp_path / "smooth"
+    folder = tmp_path / kind
     folder.mkdir()
     expected = []
-    for name in ("vol_00001_smooth.nii", "vol_00002_smooth.nii", "mask.nii", "vol_00001_smooth_orig.nii"):
+    for name in (f"vol_00001_{kind}.nii", f"vol_00002_{kind}.nii", "mask.nii", f"vol_00001_{kind}_orig.nii"):
         path = folder / name
         path.touch()
-        if name.endswith("_smooth.nii"):
+        if name.endswith(f"_{kind}.nii"):
             expected.append(path)
     (tmp_path / "session_metadata.json").write_text(json.dumps(
-        {"smoothing_fwhm_mm": 4, "regression": {"analysis_space": "t1"}}))
+        {"smoothing_fwhm_mm": 4 if kind == "smooth" else 0, "analysis_mask": "cortical_gm",
+         "regression": {"analysis_space": "t1"}}))
     calls = []
 
     def merge(volumes, output):
@@ -133,5 +135,5 @@ def test_pca_preparation_excludes_mask_and_original_stream(tmp_path, monkeypatch
     monkeypatch.setattr(prep, "_run_fslmerge", merge)
     pca, tsnr = prep._discover_rs_inputs(tmp_path, "auto")
     assert pca == tsnr
-    assert pca.name.endswith("_smooth.nii.gz")
+    assert pca.name.endswith(f"_{kind}.nii.gz")
     assert calls == [expected]

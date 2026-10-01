@@ -25,6 +25,7 @@ from fmri_rt_preproc.native_fieldmap import (
 
 from motion_fd import fd_from_rtpspy_delta
 from fmri_rt_preproc.volume_smooth import prepare_smoother, smooth_file
+from fmri_rt_preproc.analysis_mask import final_output_kind, mask_provenance
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -934,7 +935,9 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "enable_original_score": cfg.enable_original_score,
             "preprocessing_order": PIPELINE_ORDER,
             "smoothing_fwhm_mm": float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0)),
-            "smoothing_mask": "whole_brain_in_final_grid",
+            "analysis_mask": getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
+            "analysis_mask_file": getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
+            "analysis_mask_space": getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"),
             "fieldmap_dir": str(cfg.fmap_dir),
             "motion_reference": str(cfg.rt_motion_ref_epi),
             "tr": REGRESSOR_SETTINGS.TR,
@@ -1076,6 +1079,9 @@ class DICOMHandler(FileSystemEventHandler):
             str(REGRESSOR_SETTINGS.analysis_space).lower(),
             cfg.rt_unwarped_analysis_ref_epi if REGRESSOR_SETTINGS.analysis_space == "epi"
             else resolve_decoder_template(cfg), run,
+            mask_type=getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
+            custom_file=getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
+            custom_space=getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"),
         )
         self._pyhysco_unwarped_save_notice_emitted = False
         self.volume_streamer = VolumeStreamerHandle(
@@ -2001,13 +2007,14 @@ def process_volume(
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
         smooth_t0 = time.time()
-        folder = cfg.rt_work_dir / "smooth"
+        kind = smoother.output_kind
+        folder = cfg.rt_work_dir / kind
         score_input_nii = smooth_file(smoother, score_input_nii,
-                                      folder / f"vol_{volume_idx:05d}_smooth.nii")
+                                      folder / f"vol_{volume_idx:05d}_{kind}.nii")
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
-                folder / f"vol_{volume_idx:05d}_smooth_orig.nii")
-        log_step("SMOOTH", volume_idx, start_t=smooth_t0)
+                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii")
+        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0)
 
     stream_kind = str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")).lower()
     stream_paths = {
@@ -2136,21 +2143,19 @@ def validate_run_provenance(cfg):
     fwhm = float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0))
     if not np.isfinite(fwhm) or fwhm < 0:
         raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
-    if fwhm > 0:
+    mask_type = getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain")
+    if final_output_kind(fwhm, mask_type) is not None:
         space = str(REGRESSOR_SETTINGS.analysis_space).lower()
         reference = cfg.rt_unwarped_analysis_ref_epi if space == "epi" else resolve_decoder_template(cfg)
-        transforms = [] if space == "epi" else [cfg.trans_dir / "epi2t1_Composite.h5"]
-        if space == "mni":
-            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
-        payload["smoothing"] = {"fwhm_mm": fwhm, "space": space,
-            "mask": source_identity(cfg.rt_unwarped_analysis_ref_mask),
-            "reference": source_identity(reference),
-            "transforms": [source_identity(p) for p in transforms]}
+        payload["final_masking"] = {"fwhm_mm": fwhm, "space": space,
+            **mask_provenance(cfg, mask_type, space, reference,
+                getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
+                getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"))}
     if marker.exists():
         if json.loads(marker.read_text()) != payload:
             raise ValueError("Run preprocessing/calibration/reference changed. Use a fresh run output directory.")
     elif any((folder / name).exists() and any((folder / name).glob("*.nii*"))
-             for name in ("mc", "unwarped", "reg", "t1", "mni", "smooth")):
+             for name in ("mc", "unwarped", "reg", "t1", "mni", "smooth", "masked")):
         raise ValueError("Legacy processed run detected. Use a fresh output directory for unwarp -> MC replay.")
     marker.write_text(json.dumps(payload, indent=2))
 

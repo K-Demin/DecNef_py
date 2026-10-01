@@ -67,6 +67,7 @@ VERBOSE = True
 
 import csv
 import json
+from fmri_rt_preproc.analysis_mask import final_output_kind
 import argparse
 from dataclasses import dataclass
 from importlib import util
@@ -244,7 +245,7 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
         (from 3D series if needed)
     """
     pca_mode = (pca_mode or "auto").lower()
-    if pca_mode not in ("auto", "mc", "reg", "t1", "smooth"):
+    if pca_mode not in ("auto", "mc", "reg", "t1", "smooth", "masked"):
         pca_mode = "auto"
 
     metadata = run_dir / "session_metadata.json"
@@ -252,17 +253,20 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
         info = json.loads(metadata.read_text(encoding="utf-8"))
         space = info.get("regression", {}).get("analysis_space", "mni")
         final_kind = "reg" if space == "epi" else space
-        if float(info.get("smoothing_fwhm_mm", 0)) > 0 and pca_mode in {"auto", final_kind}:
-            pca_mode = "smooth"
+        output_kind = final_output_kind(info.get("smoothing_fwhm_mm", 0), info.get("analysis_mask", "whole_brain"))
+        if output_kind is not None and pca_mode in {"auto", final_kind}:
+            pca_mode = output_kind
+        if pca_mode in {"smooth", "masked"} and pca_mode != output_kind:
+            raise ValueError(f"PCA {pca_mode} input is disabled for this run.")
 
-    if pca_mode == "smooth":
+    if pca_mode in {"smooth", "masked"}:
         # Exact suffix excludes mask.nii, *_smooth_orig.nii, and partial files.
-        volumes = sorted((run_dir / "smooth").glob("vol_*_smooth.nii"))
+        volumes = sorted((run_dir / pca_mode).glob(f"vol_*_{pca_mode}.nii"))
         if not volumes:
-            raise FileNotFoundError("No final smoothed volumes found for PCA preparation.")
+            raise FileNotFoundError(f"No final {pca_mode} volumes found for PCA preparation.")
         out_dir = run_dir / FSLMERGE_OUTDIR_NAME
         out_dir.mkdir(parents=True, exist_ok=True)
-        merged = out_dir / f"{PREFER_MERGED_BASENAME}_smooth.nii.gz"
+        merged = out_dir / f"{PREFER_MERGED_BASENAME}_{pca_mode}.nii.gz"
         if (FORCE_REBUILD_4D or not merged.exists()
                 or any(p.stat().st_mtime_ns > merged.stat().st_mtime_ns for p in volumes)):
             if not _run_fslmerge(volumes, merged):
@@ -664,13 +668,13 @@ def _load_regression_keep_mask(
 
 def _requires_regression_ready_filter(pca_input_mode: str, pca_rs_path: Optional[Path] = None) -> bool:
     mode = str(pca_input_mode).lower()
-    if mode in {"reg", "t1", "smooth"}:
+    if mode in {"reg", "t1", "smooth", "masked"}:
         return True
     if pca_rs_path is None:
         return False
     name = pca_rs_path.name.lower()
     parent = pca_rs_path.parent.name.lower()
-    return parent in {"reg", "t1", "smooth"} or any(tag in name for tag in ("_reg", "_t1", "_smooth"))
+    return parent in {"reg", "t1", "smooth", "masked"} or any(tag in name for tag in ("_reg", "_t1", "_smooth", "_masked"))
 
 
 def _initial_keep_mask(
@@ -1724,10 +1728,10 @@ def main():
     parser.add_argument("-run", required=True, help="Run ID within the day (e.g., 1 or run-01)")
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1", "smooth"],
+        choices=["auto", "mc", "reg", "t1", "smooth", "masked"],
         default=None,
         help=(
-            "PCA input selection: auto (final smoothed stream when enabled, otherwise reg), mc, reg, t1, or smooth. "
+            "PCA input selection: auto (final masked/smoothed stream when enabled, otherwise reg), mc, reg, t1, smooth, or masked. "
             "Overrides PCA_INPUT_MODE."
         ),
     )

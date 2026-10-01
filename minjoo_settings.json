@@ -1,6 +1,9 @@
 {
   "smoothing_fwhm_mm": 0.0,
-  "_comment_smoothing": "Final whole-brain normalized Gaussian; FWHM in mm, 0 bypasses smoothing. Enabled outputs: smooth/.",
+  "analysis_mask": "whole_brain",
+  "analysis_mask_file": null,
+  "analysis_mask_space": "final",
+  "_comment_smoothing": "Final mask: whole_brain, cortical_gm, or custom (binary analysis_mask_file; space final/epi/t1/mni). FWHM in mm; 0 skips filtering, cortex/custom still writes masked/. Positive FWHM writes smooth/.",
   "_comment": "Minjoo realtime pipeline defaults shared by rt_pipeline.py, rs_realtime_parallel.py, and rt_brainpong_parallel.py.",
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
   "_comment_timing": "Acquisition timing/model settings. Keep TR and analysis_space consistent with brainpong_settings.json.",

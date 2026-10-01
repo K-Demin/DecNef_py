@@ -13,6 +13,7 @@ from typing import Any, Optional
 import subprocess
 
 import numpy as np
+from fmri_rt_preproc.analysis_mask import final_output_kind
 
 
 @dataclass(frozen=True)
@@ -1015,16 +1016,17 @@ def volume_path_for_kind(run_dir: Path, volume_idx: int, volume_kind: str) -> Pa
     # Metadata is written before processing begins, so polling never grabs an
     # unsmoothed file while its smoothed counterpart is still being produced.
     metadata = run_dir / "session_metadata.json"
-    if volume_kind in {"reg", "t1", "mni", "smooth"} and metadata.exists():
+    if volume_kind in {"reg", "t1", "mni", "smooth", "masked"} and metadata.exists():
         info = json.loads(metadata.read_text(encoding="utf-8"))
-        if volume_kind == "smooth" and float(info.get("smoothing_fwhm_mm", 0)) <= 0:
-            raise ValueError("PCA smooth input requested, but smoothing is disabled for this run.")
+        output_kind = final_output_kind(info.get("smoothing_fwhm_mm", 0), info.get("analysis_mask", "whole_brain"))
+        if volume_kind in {"smooth", "masked"} and volume_kind != output_kind:
+            raise ValueError(f"PCA {volume_kind} input requested, but this stage is disabled for this run.")
         space = info.get("regression", {}).get("analysis_space", "mni")
         final_kind = "reg" if space == "epi" else space
-        if float(info.get("smoothing_fwhm_mm", 0)) > 0 and volume_kind == final_kind:
-            volume_kind = "smooth"
-    if volume_kind == "smooth":
-        return run_dir / "smooth" / f"vol_{volume_idx:05d}_smooth.nii"
+        if output_kind is not None and volume_kind == final_kind:
+            volume_kind = output_kind
+    if volume_kind in {"smooth", "masked"}:
+        return run_dir / volume_kind / f"vol_{volume_idx:05d}_{volume_kind}.nii"
     if volume_kind == "reg":
         return run_dir / "reg" / f"vol_{volume_idx:05d}_reg.nii"
     if volume_kind == "mc":

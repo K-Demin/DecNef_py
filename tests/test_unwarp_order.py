@@ -23,7 +23,7 @@ from test_native_fieldmap import make_pair
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("save_intermediate", [False, True])
 @pytest.mark.parametrize("original_score", [False, True])
-@pytest.mark.parametrize("smoothing", [False, True])
+@pytest.mark.parametrize("smoothing", [False, True, "masked"])
 def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fallback, save_intermediate, original_score, smoothing):
     pair = make_pair(tmp_path / "pair")
     raw = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
@@ -73,8 +73,11 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     handler.volume_streamer = SimpleNamespace(publish=lambda idx, path: streamed.append(path))
     if smoothing:
         from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
-        (tmp_path / "smooth").mkdir()
-        handler.smoother = MaskedGaussianSmoother(np.ones(raw.shape), np.eye(4), 4)
+        kind = "masked" if smoothing == "masked" else "smooth"
+        (tmp_path / kind).mkdir()
+        mask = np.ones(raw.shape, bool)
+        mask[0] = False
+        handler.smoother = MaskedGaussianSmoother(mask, np.eye(4), 0 if kind == "masked" else 4)
         cfg.enable_scoring = True
         scored = []
 
@@ -94,19 +97,20 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     assert rt.process_volume(cfg, handler, source, 1, raw_nii=source, volume_timestamp=1.)
     assert events == ["unwarp", "mc"]
     if smoothing:
-        assert streamed == [tmp_path / "smooth" / "vol_00001_smooth.nii"]
+        assert streamed == [tmp_path / kind / f"vol_00001_{kind}.nii"]
         smoothed = handler.smoother.apply(expected).copy()
         np.testing.assert_allclose(nib.load(streamed[0]).get_fdata(), smoothed)
         assert len(scored) == (2 if original_score else 1)
         for data in scored:
             np.testing.assert_allclose(data, smoothed)
-        original_path = tmp_path / "smooth" / "vol_00001_smooth_orig.nii"
+        original_path = tmp_path / kind / f"vol_00001_{kind}_orig.nii"
         assert original_path.exists() == original_score
         if original_score:
             np.testing.assert_allclose(nib.load(original_path).get_fdata(), smoothed)
     else:
         assert streamed == [cfg.rt_mc_dir / "vol_00001_mc.nii"]
         assert not (tmp_path / "smooth").exists()
+        assert not (tmp_path / "masked").exists()
     assert not list(cfg.rt_unwarp_dir.glob("*_mc_uw.nii"))
     np.testing.assert_array_equal(nib.load(cfg.rt_mc_dir / "vol_00001_mc.nii").get_fdata(), expected)
     np.testing.assert_array_equal(handler.prev_mc_for_dvars, expected)

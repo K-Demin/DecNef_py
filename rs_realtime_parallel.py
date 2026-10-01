@@ -535,7 +535,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1", "smooth"],
+        choices=["auto", "mc", "reg", "t1", "smooth", "masked"],
         default="t1",
         help="PCA input/output mode used for PCA prep and scoring.",
     )
