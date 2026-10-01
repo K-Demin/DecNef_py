@@ -15,6 +15,10 @@ class RegressorSettings:
     max_poly_order: float = np.inf
     TR: float = 1.0
     analysis_space: str = "mni"  # "epi", "t1", or "mni" (default)
+    smoothing_fwhm_mm: float = 0.0  # 0: no filtering; cortex/custom masking still applies
+    analysis_mask: str = "whole_brain"  # whole_brain, cortical_gm, custom
+    analysis_mask_file: Optional[str] = None  # binary NIfTI for custom mode
+    analysis_mask_space: str = "final"  # custom mask coordinates: final, epi, t1, mni
     use_gpu_resampler: bool = False
     gpu_resampler_device: str = "cuda"
     use_gs: bool = False
@@ -72,6 +76,19 @@ class RegressorSettings:
                 continue
             if key == "biopac_file" and value is not None:
                 setattr(self, key, Path(value))
+            elif key in {"analysis_mask", "analysis_mask_space"}:
+                value = str(value).lower()
+                allowed = {"whole_brain", "cortical_gm", "custom"} if key == "analysis_mask" else {"final", "epi", "t1", "mni"}
+                if value not in allowed:
+                    raise ValueError(f"Invalid {key}: {value}")
+                setattr(self, key, value)
+            elif key == "analysis_mask_file":
+                self.analysis_mask_file = str(value) if value else None
+            elif key == "smoothing_fwhm_mm":
+                fwhm = float(value)
+                if not np.isfinite(fwhm) or fwhm < 0:
+                    raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
+                self.smoothing_fwhm_mm = fwhm
             elif key == "voxel_norm_ref_volumes":
                 setattr(self, key, max(1, int(value)))
             elif key == "skip_first_trs":

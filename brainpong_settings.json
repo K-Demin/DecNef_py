@@ -1,4 +1,9 @@
 {
+  "smoothing_fwhm_mm": 0.0,
+  "analysis_mask": "whole_brain",
+  "analysis_mask_file": null,
+  "analysis_mask_space": "final",
+  "_comment_smoothing": "Final mask: whole_brain, cortical_gm, or custom (binary analysis_mask_file; space final/epi/t1/mni). FWHM in mm; 0 skips filtering, cortex/custom still writes masked/. Positive FWHM writes smooth/.",
   "_comment": "Brain-pong realtime neurofeedback defaults. Keep scanner preprocessing settings in rt_settings.json; this file controls decoder interpretation, task behavior, and logging.",
   "TR": 1.0,
   "analysis_space": "t1",

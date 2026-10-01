@@ -21,6 +21,77 @@ All heavy transforms for realtime are precomputed offline.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
+Final analysis masking and spatial smoothing
+--------------------------------------------
+
+Configure these fields in rt_settings.json or your participant settings JSON:
+  "analysis_mask": "whole_brain",   # whole_brain, cortical_gm, or custom
+  "analysis_mask_file": null,       # custom binary NIfTI path
+  "analysis_mask_space": "final",   # custom coordinates: final, epi, t1, mni
+  "smoothing_fwhm_mm": 0.0          # FWHM in mm; 0 means no Gaussian filtering
+(The explanatory # comments above are not valid JSON.)
+
+The defaults (whole_brain + 0 mm) retain the existing complete bypass, with no
+new final-stage files. cortical_gm/custom apply masking even at 0 mm. Positive
+FWHM applies normalized Gaussian smoothing within the selected analysis mask.
+Use the same analysis mask and smoothing recipe for training and online scoring.
+
+Example: cortex only without smoothing:
+  "analysis_mask": "cortical_gm", "smoothing_fwhm_mm": 0.0
+Example: cortex only with a 4 mm Gaussian:
+  "analysis_mask": "cortical_gm", "smoothing_fwhm_mm": 4.0
+Example: custom mask already on the final grid:
+  "analysis_mask": "custom", "analysis_mask_file": "/path/to/mask.nii.gz",
+  "analysis_mask_space": "final", "smoothing_fwhm_mm": 4.0
+Use absolute custom paths; relative paths are resolved from the process directory.
+
+Order: unwarp -> MC -> regression/normalization -> EPI/T1/MNI output ->
+       final analysis masking / masked smoothing -> scoring.
+Motion estimation, DVARS, and WM/CSF nuisance extraction retain their existing
+inputs. The decoder ROI can be a smaller subset of the analysis/smoothing mask.
+
+whole_brain uses the corrected session EPI brain mask. cortical_gm selects the
+bilateral cortical DKT parcels from anat/fastsurfer/<subject>/mri/
+aparc.DKTatlas+aseg.deep.mgz; WM, CSF, subcortical GM, cerebellum, and unknown
+labels are excluded. It reuses existing FastSurfer segmentation, with no new
+segmentation run. Custom masks must be finite binary 0/1 volumes.
+
+Masks are mapped once per run into the exact final BOLD grid, with nearest-neighbor
+interpolation. T1->EPI uses the inverse EPI-to-T1 composite, T1->MNI uses the
+anatomical warp, and EPI->T1/MNI uses the BOLD transform chain. Same-space masks
+may be resampled between grids. A custom "final" mask must already match exactly.
+MNI->EPI/T1 mask conversion is not supported; supply a mask in final coordinates.
+Cortex/custom masks are intersected with transformed EPI brain coverage. Empty,
+nonfinite, nonbinary custom, or incompatible masks fail before volume processing.
+
+Positive-FWHM mathematics matches smooth_masked in the supplied volume_smooth.py:
+Gaussian(mask * volume) / Gaussian(mask) inside the SAME selected mask, zero outside;
+float64, per-axis mm-to-voxel conversion, zero padding, truncate=4, and original-value
+fallback where the denominator is below 1e-6. The denominator and buffers are cached.
+At 0 mm, cortex/custom mode copies in-mask values unchanged and zeros everything
+else, with no Gaussian calls. This remains volumetric, not surface-geodesic smoothing.
+
+Outputs under func/<run>/:
+  smooth/vol_XXXXX_smooth.nii       positive FWHM, masked and smoothed
+  masked/vol_XXXXX_masked.nii       cortex/custom masking with 0 mm
+  corresponding *_orig.nii         optional original-score comparison stream
+Each active folder includes mask.nii (the actual final mask); source/coverage masks
+may also be saved for inspection. Earlier-step files remain unchanged. Final volumes
+are published atomically for PCA readers. Stream "score_input" to see final output;
+"mc" and "unwarped" continue to show the earlier corrected volumes.
+
+PCA final reg/t1/mni readers follow the selected final stage from run metadata.
+Preparation accepts --pca-input smooth or masked; auto follows the final stage,
+as does reg/t1 when it matches the final analysis space. Only the selected main
+volume suffix is merged, excluding masks and *_orig files. Earlier intermediate
+streams remain explicitly selectable. Existing PCA models are not retrained.
+Mask source/reference/transform identities and FWHM are recorded. Use a fresh run
+output directory when changing them. SMOOTH/MASK timing logs include volume writes.
+
+Label references:
+https://deep-mi.org/FastSurfer/stable/overview/OUTPUT_FILES.html
+https://surfer.nmr.mgh.harvard.edu/fswiki/FsTutorial/AnatomicalROI/FreeSurferColorLUT
+
 
 Environments
 ------------

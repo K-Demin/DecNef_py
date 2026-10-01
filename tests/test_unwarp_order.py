@@ -23,7 +23,8 @@ from test_native_fieldmap import make_pair
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("save_intermediate", [False, True])
 @pytest.mark.parametrize("original_score", [False, True])
-def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fallback, save_intermediate, original_score):
+@pytest.mark.parametrize("smoothing", [False, True, "masked"])
+def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fallback, save_intermediate, original_score, smoothing):
     pair = make_pair(tmp_path / "pair")
     raw = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
     ramp = np.arange(3, dtype=np.float32)[:, None, None] + 1
@@ -70,16 +71,48 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     handler.motion_regressor.get_regressors = lambda idx: ([], None)
     streamed = []
     handler.volume_streamer = SimpleNamespace(publish=lambda idx, path: streamed.append(path))
+    if smoothing:
+        from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
+        kind = "masked" if smoothing == "masked" else "smooth"
+        (tmp_path / kind).mkdir()
+        mask = np.ones(raw.shape, bool)
+        mask[0] = False
+        handler.smoother = MaskedGaussianSmoother(mask, np.eye(4), 0 if kind == "masked" else 4)
+        cfg.enable_scoring = True
+        scored = []
+
+        def score(data):
+            scored.append(data.copy())
+            return float(data.mean())
+
+        handler.scorer = SimpleNamespace(score_from_array=score, baseline_count=0, n_baseline=0)
+        handler.reference_score_stats = None
+        handler.score_event_tracker = SimpleNamespace(for_volume=lambda idx: None)
     monkeypatch.setattr(rt, "apply_pyhysco_fieldmap", file_apply)
     settings = SimpleNamespace(epi_phase_encoding="PA", fieldmap_method="pyhysco",
         save_intermediate_unwarped=save_intermediate, enable_fd_censor_reg=False,
-        enable_dvars_censor_reg=False, biopac_timelag=False, analysis_space="epi")
+        enable_dvars_censor_reg=False, biopac_timelag=False, analysis_space="epi",
+        volume_stream_kind="score_input" if smoothing else "unwarped")
     monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", settings)
     assert rt.process_volume(cfg, handler, source, 1, raw_nii=source, volume_timestamp=1.)
     assert events == ["unwarp", "mc"]
-    assert streamed == [cfg.rt_mc_dir / "vol_00001_mc.nii"]
+    if smoothing:
+        assert streamed == [tmp_path / kind / f"vol_00001_{kind}.nii"]
+        smoothed = handler.smoother.apply(expected).copy()
+        np.testing.assert_allclose(nib.load(streamed[0]).get_fdata(), smoothed)
+        assert len(scored) == (2 if original_score else 1)
+        for data in scored:
+            np.testing.assert_allclose(data, smoothed)
+        original_path = tmp_path / kind / f"vol_00001_{kind}_orig.nii"
+        assert original_path.exists() == original_score
+        if original_score:
+            np.testing.assert_allclose(nib.load(original_path).get_fdata(), smoothed)
+    else:
+        assert streamed == [cfg.rt_mc_dir / "vol_00001_mc.nii"]
+        assert not (tmp_path / "smooth").exists()
+        assert not (tmp_path / "masked").exists()
     assert not list(cfg.rt_unwarp_dir.glob("*_mc_uw.nii"))
-    np.testing.assert_array_equal(nib.load(streamed[0]).get_fdata(), expected)
+    np.testing.assert_array_equal(nib.load(cfg.rt_mc_dir / "vol_00001_mc.nii").get_fdata(), expected)
     np.testing.assert_array_equal(handler.prev_mc_for_dvars, expected)
     np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
     np.testing.assert_array_equal(nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata(), expected)
@@ -167,3 +200,18 @@ def test_run_rejects_changed_pair_and_legacy_outputs(tmp_path, monkeypatch):
     (work / "mc" / "vol_00001_mc.nii").touch()
     with pytest.raises(ValueError, match="Legacy"):
         rt.validate_run_provenance(cfg)
+
+
+def test_run_rejects_changed_smoothing(tmp_path, monkeypatch):
+    pair = make_pair(tmp_path / "pair")
+    ref = native_paths(pair)[0] / "AP_mean.nii"
+    cfg = SimpleNamespace(rt_work_dir=tmp_path, fmap_dir=pair, rt_motion_ref_epi=ref,
+        rt_unwarped_analysis_ref_epi=ref, rt_unwarped_analysis_ref_mask=ref)
+    settings = SimpleNamespace(epi_phase_encoding="PA", analysis_space="epi", smoothing_fwhm_mm=4.)
+    monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", settings)
+    rt.validate_run_provenance(cfg)
+    rt.validate_run_provenance(cfg)
+    for fwhm in (0, 6):
+        settings.smoothing_fwhm_mm = fwhm
+        with pytest.raises(ValueError, match="changed"):
+            rt.validate_run_provenance(cfg)
