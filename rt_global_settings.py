@@ -15,6 +15,7 @@ class RegressorSettings:
     max_poly_order: float = np.inf
     TR: float = 1.0
     analysis_space: str = "mni"  # "epi", "t1", or "mni" (default)
+    smoothing_fwhm_mm: float = 0.0  # 0: complete bypass; whole-brain normalized Gaussian
     use_gpu_resampler: bool = False
     gpu_resampler_device: str = "cuda"
     use_gs: bool = False
@@ -72,6 +73,11 @@ class RegressorSettings:
                 continue
             if key == "biopac_file" and value is not None:
                 setattr(self, key, Path(value))
+            elif key == "smoothing_fwhm_mm":
+                fwhm = float(value)
+                if not np.isfinite(fwhm) or fwhm < 0:
+                    raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
+                self.smoothing_fwhm_mm = fwhm
             elif key == "voxel_norm_ref_volumes":
                 setattr(self, key, max(1, int(value)))
             elif key == "skip_first_trs":

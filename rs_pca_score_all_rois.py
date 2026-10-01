@@ -77,7 +77,7 @@ def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
 
 
 def _requires_regression_ready_filter(volume_kind: str) -> bool:
-    return str(volume_kind).lower() in {"reg", "t1", "mni"}
+    return str(volume_kind).lower() in {"reg", "t1", "mni", "smooth"}
 
 
 def run_realtime_all_roi_pca_scorer(
@@ -335,7 +335,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1"],
+        choices=["auto", "mc", "reg", "t1", "smooth"],
         default="t1",
         help="PCA decoder folder name.",
     )
@@ -365,7 +365,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-volume-kind",
-        choices=["reg", "mc", "unwarped", "t1", "mni"],
+        choices=["reg", "mc", "unwarped", "t1", "mni", "smooth"],
         default=None,
         help="Realtime volume folder to score. Defaults from --pca-space.",
     )

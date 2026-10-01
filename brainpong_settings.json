@@ -1,4 +1,6 @@
 {
+  "smoothing_fwhm_mm": 0.0,
+  "_comment_smoothing": "Final whole-brain normalized Gaussian; FWHM in mm, 0 bypasses smoothing. Enabled outputs: smooth/.",
   "_comment": "Brain-pong realtime neurofeedback defaults. Keep scanner preprocessing settings in rt_settings.json; this file controls decoder interpretation, task behavior, and logging.",
   "TR": 1.0,
   "analysis_space": "t1",

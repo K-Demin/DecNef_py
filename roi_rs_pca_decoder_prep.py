@@ -244,8 +244,36 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
         (from 3D series if needed)
     """
     pca_mode = (pca_mode or "auto").lower()
-    if pca_mode not in ("auto", "mc", "reg", "t1"):
+    if pca_mode not in ("auto", "mc", "reg", "t1", "smooth"):
         pca_mode = "auto"
+
+    metadata = run_dir / "session_metadata.json"
+    if metadata.exists():
+        info = json.loads(metadata.read_text(encoding="utf-8"))
+        space = info.get("regression", {}).get("analysis_space", "mni")
+        final_kind = "reg" if space == "epi" else space
+        if float(info.get("smoothing_fwhm_mm", 0)) > 0 and pca_mode in {"auto", final_kind}:
+            pca_mode = "smooth"
+
+    if pca_mode == "smooth":
+        # Exact suffix excludes mask.nii, *_smooth_orig.nii, and partial files.
+        volumes = sorted((run_dir / "smooth").glob("vol_*_smooth.nii"))
+        if not volumes:
+            raise FileNotFoundError("No final smoothed volumes found for PCA preparation.")
+        out_dir = run_dir / FSLMERGE_OUTDIR_NAME
+        out_dir.mkdir(parents=True, exist_ok=True)
+        merged = out_dir / f"{PREFER_MERGED_BASENAME}_smooth.nii.gz"
+        if (FORCE_REBUILD_4D or not merged.exists()
+                or any(p.stat().st_mtime_ns > merged.stat().st_mtime_ns for p in volumes)):
+            if not _run_fslmerge(volumes, merged):
+                raise RuntimeError("Failed to merge smoothed PCA input.")
+        # Preserve native MC tSNR when the final grid is EPI; other grids use
+        # the selected final stream, as the existing T1 preparation path does.
+        if metadata.exists() and space == "epi":
+            _, tsnr = _discover_rs_inputs(run_dir, "mc")
+        else:
+            tsnr = merged
+        return merged, tsnr
 
     mc_dir = run_dir / "mc"
     reg_dir = run_dir / "reg"
@@ -636,13 +664,13 @@ def _load_regression_keep_mask(
 
 def _requires_regression_ready_filter(pca_input_mode: str, pca_rs_path: Optional[Path] = None) -> bool:
     mode = str(pca_input_mode).lower()
-    if mode in {"reg", "t1"}:
+    if mode in {"reg", "t1", "smooth"}:
         return True
     if pca_rs_path is None:
         return False
     name = pca_rs_path.name.lower()
     parent = pca_rs_path.parent.name.lower()
-    return parent in {"reg", "t1"} or "_reg" in name or "_t1" in name
+    return parent in {"reg", "t1", "smooth"} or any(tag in name for tag in ("_reg", "_t1", "_smooth"))
 
 
 def _initial_keep_mask(
@@ -1696,10 +1724,10 @@ def main():
     parser.add_argument("-run", required=True, help="Run ID within the day (e.g., 1 or run-01)")
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1"],
+        choices=["auto", "mc", "reg", "t1", "smooth"],
         default=None,
         help=(
-            "PCA input selection: auto (prefer reg), mc, reg, or t1. "
+            "PCA input selection: auto (final smoothed stream when enabled, otherwise reg), mc, reg, t1, or smooth. "
             "Overrides PCA_INPUT_MODE."
         ),
     )

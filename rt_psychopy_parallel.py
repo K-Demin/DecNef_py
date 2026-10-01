@@ -795,7 +795,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1"],
+        choices=["auto", "mc", "reg", "t1", "smooth"],
         default="t1",
         help="PCA decoder/output mode folder name.",
     )
@@ -841,7 +841,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-volume-kind",
-        choices=["reg", "mc", "unwarped", "t1", "mni"],
+        choices=["reg", "mc", "unwarped", "t1", "mni", "smooth"],
         default=None,
         help="Realtime volume folder to score with PCA.",
     )

@@ -21,6 +21,48 @@ All heavy transforms for realtime are precomputed offline.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
+Final spatial smoothing
+-----------------------
+
+Set "smoothing_fwhm_mm" in rt_settings.json or your participant settings JSON.
+The default is 0.0: no smoothing, no mask preparation, and no smooth/ outputs.
+For example, 4.0 enables a 4 mm FWHM Gaussian in the final analysis space.
+Use the same smoothing recipe for decoder training and online scoring.
+
+Order: unwarp -> MC -> regression/normalization -> EPI/T1/MNI output -> smoothing -> scoring.
+This is spatial smoothing of each volume independently; no temporal smoothing.
+
+The mask is the corrected session whole-brain EPI mask, not a grey-matter mask
+or the decoder's nonzero weights. EPI output uses it directly. T1/MNI output
+uses that mask transformed once per run onto the actual final reference grid,
+with the same transform chain as BOLD and nearest-neighbor interpolation.
+No additional segmentation is run. The prepared binary mask is saved in smooth/mask.nii.
+
+The algorithm matches smooth_masked in the supplied volume_smooth.py:
+Gaussian(mask * volume) / Gaussian(mask) inside the mask, zero outside;
+float64, per-axis FWHM-to-sigma conversion, zero padding, truncate=4,
+and original-value fallback where the denominator is below 1e-6.
+The denominator and buffers are cached once. This whole-brain version permits
+mixing between tissue types inside the mask, as requested.
+
+Enabled outputs (under func/<run>/):
+  smooth/vol_XXXXX_smooth.nii       final denoised/normalized scoring input
+  smooth/vol_XXXXX_smooth_orig.nii  optional original-score comparison input
+Earlier-step files remain unchanged. Files are published atomically for PCA readers.
+The volume streamer's "score_input" option shows the final smoothed stream;
+"mc" and "unwarped" still show the unsmoothed corrected volumes.
+
+PCA readers using the final reg/t1/mni stream follow smoothing when enabled in
+the run metadata. PCA preparation supports --pca-input smooth; auto mode selects
+it for enabled runs, as does reg/t1 when that mode matches the final analysis space.
+Preparation merges only *_smooth.nii (not the mask or *_smooth_orig.nii).
+Choosing an earlier intermediate PCA stream explicitly still uses that stream.
+Existing PCA models are not retrained automatically.
+
+FWHM, mask/reference identities, and transforms are recorded for reproducibility.
+Use a fresh run output directory when changing smoothing settings. SMOOTH timing
+logs include per-volume filtering and output writes; validate total latency by replay.
+
 
 Environments
 ------------

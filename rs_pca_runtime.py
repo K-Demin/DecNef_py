@@ -1011,6 +1011,20 @@ def condition_for_index(
 
 
 def volume_path_for_kind(run_dir: Path, volume_idx: int, volume_kind: str) -> Path:
+    # Follow the final smoothing stage for the selected final denoised stream.
+    # Metadata is written before processing begins, so polling never grabs an
+    # unsmoothed file while its smoothed counterpart is still being produced.
+    metadata = run_dir / "session_metadata.json"
+    if volume_kind in {"reg", "t1", "mni", "smooth"} and metadata.exists():
+        info = json.loads(metadata.read_text(encoding="utf-8"))
+        if volume_kind == "smooth" and float(info.get("smoothing_fwhm_mm", 0)) <= 0:
+            raise ValueError("PCA smooth input requested, but smoothing is disabled for this run.")
+        space = info.get("regression", {}).get("analysis_space", "mni")
+        final_kind = "reg" if space == "epi" else space
+        if float(info.get("smoothing_fwhm_mm", 0)) > 0 and volume_kind == final_kind:
+            volume_kind = "smooth"
+    if volume_kind == "smooth":
+        return run_dir / "smooth" / f"vol_{volume_idx:05d}_smooth.nii"
     if volume_kind == "reg":
         return run_dir / "reg" / f"vol_{volume_idx:05d}_reg.nii"
     if volume_kind == "mc":
