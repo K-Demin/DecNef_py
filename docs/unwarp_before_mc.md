@@ -26,10 +26,9 @@ Output names remain compatible with existing consumers:
 | `raw/vol_*.nii` | Raw distorted BOLD |
 | `unwarped/vol_*_uw_native.nii` | Unwarped BOLD before MC, when intermediate saving is enabled (also written by file fallback) |
 | `mc/vol_*_mc.nii` | Unwarped and motion-corrected BOLD |
-| `unwarped/vol_*_mc_uw.nii` | Same fully corrected BOLD, retaining the historical suffix for PCA/stream consumers |
 | `reg/vol_*_reg.nii` | Downstream denoised/normalized volume |
 
-The legacy `mc_uw` suffix does not describe the new operation order. FD now describes registration of corrected BOLD; DVARS uses corrected and aligned BOLD with the corrected reference mask.
+Fully corrected volumes are written once, in `mc/`. The `unwarped` PCA/stream option is a compatibility alias for this product; historical runs can still be read from their old `unwarped/vol_*_mc_uw.nii` paths. No duplicate is written for new runs. FD describes registration of corrected BOLD; DVARS uses corrected and aligned BOLD with the corrected reference mask.
 
 ## Geometry and supported correction
 
