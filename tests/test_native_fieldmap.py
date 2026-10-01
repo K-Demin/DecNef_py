@@ -73,3 +73,21 @@ def test_same_sign_pair_is_rejected(tmp_path):
     (pair / "PA.json").write_text('{"PhaseEncodingDirection":"j"}')
     with pytest.raises(ValueError, match="opposite signs"):
         calibration_spec(pair / "AP.nii", pair / "PA.nii")
+
+
+def test_launcher_accepts_native_subdirectory(tmp_path):
+    from rs_realtime_parallel import _check_rt_fieldmap_exists
+
+    pair = make_pair(tmp_path / "pair-ap001_pa002")
+    assert not list(pair.glob("*EstFieldMap*"))
+    _check_rt_fieldmap_exists(pair)
+
+
+def test_launcher_rejects_legacy_only_and_incomplete_calibration(tmp_path):
+    from rs_realtime_parallel import _check_rt_fieldmap_exists
+
+    pair = make_pair(tmp_path / "pair")
+    native_paths(pair)[1].unlink()
+    (pair / "pyhysco_epi-EstFieldMap.nii").touch()
+    with pytest.raises(FileNotFoundError, match="native_unwarp_v1"):
+        _check_rt_fieldmap_exists(pair)

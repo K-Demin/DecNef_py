@@ -156,15 +156,13 @@ Running the pipeline
    - Run SynthMorph:
         - anat/warp_T1_to_MNI_synth.nii.gz
         - anat/T1_warped_to_MNI_synth.nii.gz
-   - Motion-correct the AP/PA fieldmap series to func/trans/rt_ref_epi.nii
-     using MCFLIRT -reffile, then average them:
-        - fmap/AP_mc.nii.gz
-        - fmap/PA_mc.nii.gz
-        - fmap/AP_mean.nii
-        - fmap/PA_mean.nii
-   - Estimate the fieldmap on that same RT motion-reference grid:
-        - PyHySCO: fmap/pyhysco_epi-EstFieldMap.nii
-        - ANTs fallback: fmap/AP2PA_epi_* transforms
+   - Average raw AP/PA independently, without motion correction.
+     Raw AP.nii[.gz] and PA.nii[.gz] stay in the selected fmap/pair-* folder
+     (or fmap/ when no explicit pair is selected). Derived products are in
+     that folder's native_unwarp_v1/ subdirectory:
+        - AP_mean.nii and PA_mean.nii
+        - pyhysco_native-EstFieldMap.nii
+        - calibration.json
    - For each run:
         - func/run-XX/epi_first.nii
         - func/run-XX/epi_mc.nii
@@ -177,7 +175,7 @@ Running the pipeline
         - func/run-XX/epi_in_MNI.nii.gz
         - optional: func/run-XX/qc_epi_in_MNI.png (if QC plotting is enabled)
    - For realtime reuse, create day-level references in func/trans:
-        - rt_ref_epi.nii and rt_ref_epi_mask.nii (legacy filenames; distorted MC grid)
+        - rt_ref_epi.nii and rt_ref_epi_mask.nii (legacy aliases; corrected data in new preparations)
         - epi_unwarped_mean.nii and epi_mask_mean.nii (unwarped analysis grid)
 
 
@@ -187,16 +185,14 @@ Motion Correction
 The preprocessing script now performs RTPSpy motion correction itself.
 
 For each func/run-XX, the script writes func/run-XX/epi_mc.nii and motion.1D.
-The first run establishes func/trans/rt_ref_epi.nii, the distorted-space motion
-reference used for both AP/PA fieldmap preparation and realtime volumes. AP and
-PA are motion-corrected to that same reference, averaged, and used to estimate
-the fieldmap. The fieldmap is then applied to the motion-corrected EPI. The
-unwarped result is averaged into func/run-XX/epi_unwarped_mean.nii.gz, which is
-the reference used for EPI-to-T1 registration and nuisance-mask grids.
+The first run unwarps raw BOLD, motion-corrects it to its first corrected volume,
+and establishes func/trans/epi_unwarped_mean.nii as the fixed corrected session
+reference. EPI-to-T1 registration and nuisance masks use this corrected reference.
+AP and PA are averaged without motion correction and remain in acquisition geometry.
 
-For realtime, rt_pipeline.py uses func/trans/rt_ref_epi.nii as the
-distorted-space RTPSpy motion reference. Each incoming volume is motion-corrected
-to that reference first, then the rt_ref_epi-aligned fieldmap is applied.
+For realtime, rt_pipeline.py first unwarps each incoming raw volume using the
+selected pair's native_unwarp_v1/pyhysco_native-EstFieldMap.nii, then motion-corrects
+it to func/trans/epi_unwarped_mean.nii[.gz].
 Regression, voxel normalization, EPI-to-T1/MNI transforms, and decoder scoring
 all operate on the unwarped analysis stream.
 
@@ -209,8 +205,8 @@ and transforms needed by rt_pipeline.py. During realtime:
 
 - compute_stage converts each incoming DICOM to a raw NIfTI.
 - commit_stage runs stateful processing in scan order:
-    - RTPSpy motion correction to rt_ref_epi.nii
-    - fieldmap unwarp using pyhysco_epi-EstFieldMap.nii or AP2PA_epi_* transforms
+    - fieldmap unwarp using the selected pair's native_unwarp_v1/pyhysco_native-EstFieldMap.nii
+    - RTPSpy motion correction to epi_unwarped_mean.nii[.gz]
     - FD/DVARS censor bookkeeping
     - nuisance regression and voxel normalization on the unwarped stream
     - optional EPI->T1 or EPI->T1->MNI transform

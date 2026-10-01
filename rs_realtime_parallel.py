@@ -18,6 +18,7 @@ import numpy as np
 
 from rt_global_settings import load_regressor_settings
 import rs_pca_runtime as pca_rt
+from fmri_rt_preproc.native_fieldmap import load_calibration, native_paths
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("rs_realtime_parallel")
@@ -355,17 +356,14 @@ def _fieldmap_pair_dir(
     return fmap_root / f"pair-ap{ap_block:03d}_pa{pa_block:03d}"
 
 def _check_rt_fieldmap_exists(fmap_dir: Path) -> None:
-    candidates = [
-        fmap_dir / "pyhysco_epi-EstFieldMap.nii",
-        fmap_dir / "pyhysco_epi-EstFieldMap.nii.gz",
-        fmap_dir / "pyhysco-EstFieldMap.nii",
-        fmap_dir / "pyhysco-EstFieldMap.nii.gz",
-    ]
-    if not any(p.exists() for p in candidates):
+    """Use the same native calibration layout and validity checks as realtime."""
+    try:
+        load_calibration(fmap_dir)
+    except (OSError, ValueError) as exc:
         raise FileNotFoundError(
-            "No PyHySCO fieldmap found for realtime unwarping.\n"
-            f"Expected one of:\n  " + "\n  ".join(str(p) for p in candidates)
-        )
+            f"Native PyHySCO calibration is missing or invalid in {native_paths(fmap_dir)[0]}.\n"
+            f"Rebuild the selected AP/PA pair. Details: {exc}"
+        ) from exc
 
 
 def _release_mouse_cursor(win) -> None:
@@ -815,7 +813,7 @@ def main() -> None:
         )
 
         _check_rt_fieldmap_exists(fieldmap_dir)
-        log.info("[FMAP] RT will use fieldmap dir: %s", fieldmap_dir)
+        log.info("[FMAP] RT will use fieldmap: %s", native_paths(fieldmap_dir)[1])
 
         cfg = RTSessionConfig(
             subject=args.sub,
