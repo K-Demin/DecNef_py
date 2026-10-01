@@ -1705,13 +1705,9 @@ def process_volume(
     mc_img = nib.Nifti1Image(mc_data, ref_img.affine)  # fixed corrected reference grid
     nib.save(mc_img, str(mc_nii))
 
-    # Preserve the historical fully-corrected product for PCA/stream consumers.
-    # Despite the legacy suffix, this file now records UNWARP -> MC.
-    mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
+    # One on-disk product for fully corrected BOLD, shared by all consumers.
+    mc_unwarped_nii = mc_nii
     mc_unwarped_img = mc_img
-    mc_unwarped_img.set_filename(str(mc_unwarped_nii))
-    if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)) or cfg.enable_original_score:
-        nib.save(mc_unwarped_img, str(mc_unwarped_nii))
 
     # ----- 2b) MOTION + FD (ONLINE) -----
     # RtpVolreg exposes [roll pitch yaw dS dL dP]: rotations in degrees,
@@ -1994,7 +1990,7 @@ def process_volume(
     stream_paths = {
         "raw": raw_nii,
         "mc": mc_nii,
-        "unwarped": mc_unwarped_nii if mc_unwarped_nii.exists() else None,
+        "unwarped": mc_nii,  # compatibility alias for fully corrected BOLD
         "reg": reg_nii,
         "score_input": score_input_nii,
     }

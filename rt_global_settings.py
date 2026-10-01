@@ -56,9 +56,9 @@ class RegressorSettings:
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
-    save_intermediate_unwarped: bool = True
+    save_intermediate_unwarped: bool = True  # pre-MC unwarped intermediate only
     enable_volume_streamer: bool = False
-    volume_stream_kind: str = "unwarped"  # "raw", "mc", "unwarped", "reg", or "score_input"
+    volume_stream_kind: str = "unwarped"  # "unwarped" aliases fully corrected "mc"
     volume_stream_every_n: int = 1
     volume_stream_max_queue: int = 2
     volume_stream_window_title: str = "RT volume QC"

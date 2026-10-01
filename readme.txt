@@ -283,12 +283,12 @@ Per-volume output folders (under `func/<run_id>/`)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - `raw/`: raw incoming NIfTI volumes before RT motion correction.
-- `mc/`: motion-corrected volumes in native EPI space.
-- `unwarped/`: motion-corrected volumes after fieldmap unwarp, before nuisance regression.
+- `mc/`: unwarped, motion-corrected volumes in the fixed corrected EPI reference space; saved once and shared by PCA, streaming, and original-score consumers.
+- `unwarped/`: optional `_uw_native` intermediate volumes after unwarping, before motion correction.
 - `reg/`: nuisance-cleaned (and voxel-normalized) volumes in native EPI space; this is the source volume that is later warped when `analysis_space` is `t1` or `mni`.
 - `t1/` (only when `analysis_space = "t1"`):
   - `vol_XXXXX_t1.nii`: the `reg/` volume warped to T1/decoder space (used for denoised scoring).
-  - `vol_XXXXX_t1_orig.nii`: the `unwarped/` volume warped to T1/decoder space (used as the non-denoised comparison score).
+  - `vol_XXXXX_t1_orig.nii`: the fully corrected `mc/` volume warped to T1/decoder space (used as the non-denoised comparison score).
 - `mni/` (only when `analysis_space = "mni"`): equivalent pair (`*_mni.nii` and `*_mni_orig.nii`) in MNI/decoder space.
 
 CLI flags still work and can override values for a single run.

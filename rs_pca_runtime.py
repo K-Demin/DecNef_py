@@ -1016,7 +1016,12 @@ def volume_path_for_kind(run_dir: Path, volume_idx: int, volume_kind: str) -> Pa
     if volume_kind == "mc":
         return run_dir / "mc" / f"vol_{volume_idx:05d}_mc.nii"
     if volume_kind == "unwarped":
-        return run_dir / "unwarped" / f"vol_{volume_idx:05d}_mc_uw.nii"
+        # New runs save fully corrected BOLD only in mc/. Historical MC-first
+        # runs need their post-unwarp product because their mc/ data are distorted.
+        legacy = run_dir / "unwarped" / f"vol_{volume_idx:05d}_mc_uw.nii"
+        if not (run_dir / "preprocessing_order.json").exists() and legacy.exists():
+            return legacy
+        return run_dir / "mc" / f"vol_{volume_idx:05d}_mc.nii"
     if volume_kind == "t1":
         return run_dir / "t1" / f"vol_{volume_idx:05d}_t1.nii"
     if volume_kind == "mni":

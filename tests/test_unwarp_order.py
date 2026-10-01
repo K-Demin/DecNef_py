@@ -22,7 +22,8 @@ from test_native_fieldmap import make_pair
 
 @pytest.mark.parametrize("fallback", [False, True])
 @pytest.mark.parametrize("save_intermediate", [False, True])
-def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fallback, save_intermediate):
+@pytest.mark.parametrize("original_score", [False, True])
+def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fallback, save_intermediate, original_score):
     pair = make_pair(tmp_path / "pair")
     raw = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
     ramp = np.arange(3, dtype=np.float32)[:, None, None] + 1
@@ -35,7 +36,7 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     handler = headless._mk_handler(tmp_path)
     cfg = handler.cfg
     cfg.fmap_dir, cfg.rt_motion_ref_epi = pair, ref
-    cfg.enable_original_score = False
+    cfg.enable_original_score = original_score
     for name in ("mc", "reg", "unwarp"):
         folder = tmp_path / name
         folder.mkdir()
@@ -67,7 +68,8 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     handler.volreg = SimpleNamespace(do_proc=mc, _motion=np.zeros((1, 6)))
     handler.biopac_receiver = None
     handler.motion_regressor.get_regressors = lambda idx: ([], None)
-    handler.volume_streamer = SimpleNamespace(publish=lambda *args: None)
+    streamed = []
+    handler.volume_streamer = SimpleNamespace(publish=lambda idx, path: streamed.append(path))
     monkeypatch.setattr(rt, "apply_pyhysco_fieldmap", file_apply)
     settings = SimpleNamespace(epi_phase_encoding="PA", fieldmap_method="pyhysco",
         save_intermediate_unwarped=save_intermediate, enable_fd_censor_reg=False,
@@ -75,9 +77,25 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", settings)
     assert rt.process_volume(cfg, handler, source, 1, raw_nii=source, volume_timestamp=1.)
     assert events == ["unwarp", "mc"]
+    assert streamed == [cfg.rt_mc_dir / "vol_00001_mc.nii"]
+    assert not list(cfg.rt_unwarp_dir.glob("*_mc_uw.nii"))
+    np.testing.assert_array_equal(nib.load(streamed[0]).get_fdata(), expected)
     np.testing.assert_array_equal(handler.prev_mc_for_dvars, expected)
     np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
     np.testing.assert_array_equal(nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata(), expected)
+
+
+def test_pca_unwarped_alias_and_historical_runs(tmp_path):
+    from rs_pca_runtime import volume_path_for_kind
+
+    mc = tmp_path / "mc" / "vol_00001_mc.nii"
+    assert volume_path_for_kind(tmp_path, 1, "unwarped") == mc
+    legacy = tmp_path / "unwarped" / "vol_00001_mc_uw.nii"
+    legacy.parent.mkdir()
+    legacy.touch()
+    assert volume_path_for_kind(tmp_path, 1, "unwarped") == legacy
+    (tmp_path / "preprocessing_order.json").write_text('{"order":"unwarp_then_mc_v1"}')
+    assert volume_path_for_kind(tmp_path, 1, "unwarped") == mc
 
 
 def test_prepare_calibration_never_registers_ap_pa(tmp_path):
