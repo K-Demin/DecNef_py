@@ -7,6 +7,7 @@ import time
 
 from fmri_rt_preproc.config import SubjectDayConfig
 from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
+from fmri_rt_preproc.native_fieldmap import find_source
 from fmri_rt_preproc.utils import ensure_dir, run  # <- to call fslmerge
 
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +39,7 @@ def _convert_dicoms_if_needed(dicom_dir: Path, out_prefix: str) -> list[Path]:
     run([
         "dcm2niix",
         "-z", "y",
-        "-b", "n",
+        "-b", "y",
         "-f", out_prefix,
         "-o", str(dicom_dir),
         str(dicom_dir),
@@ -148,8 +149,12 @@ def _stage_convert_to_target(
         log.info("Found existing file %s; skipping conversion", dest_path)
         return dest_path
 
+    alternate = dest_path.with_suffix("") if dest_path.suffix == ".gz" else dest_path.with_suffix(".nii.gz")
+    if alternate.exists():
+        return alternate
+
     # Stage DICOMs in an isolated folder so conversions do not mix across runs.
-    dest_prefix = dest_path.stem
+    dest_prefix = dest_path.name.removesuffix(".gz").removesuffix(".nii")
     staging_dir = dest_path.parent / f".{dest_prefix}_dicoms"
     ensure_dir(staging_dir)
 
@@ -179,6 +184,9 @@ def _stage_convert_to_target(
 
     # Normalize the converted file to the expected name (e.g., AP.nii.gz)
     chosen = converted[0]
+    chosen_json = chosen.with_name(chosen.name.removesuffix(".gz").removesuffix(".nii") + ".json")
+    if chosen_json.exists():
+        shutil.copy2(chosen_json, dest_path.parent / (dest_prefix + ".json"))
     if chosen != dest_path:
         if dest_path.exists():
             dest_path.unlink()
@@ -286,19 +294,11 @@ def _find_fieldmap(fmap_dir: Path, prefix: str) -> Path:
     """Locate AP/PA fieldmap, converting DICOMs if necessary."""
 
     ensure_dir(fmap_dir)
-    candidates = sorted(fmap_dir.glob(f"{prefix}*.nii*"))
-    if not candidates:
-        converted = _convert_dicoms_if_needed(fmap_dir, prefix)
-        candidates = sorted(converted)
-
-    if not candidates:
-        raise FileNotFoundError(
-            f"No {prefix} fieldmap found in {fmap_dir}. "
-            f"Expected {prefix}*.nii* or DICOM files."
-        )
-
-    log.info("Using %s fieldmap: %s", prefix, candidates[0])
-    return candidates[0]
+    try:
+        return find_source(fmap_dir, prefix)
+    except FileNotFoundError:
+        _convert_dicoms_if_needed(fmap_dir, prefix)
+        return find_source(fmap_dir, prefix)
 
 
 def main():

@@ -12,12 +12,14 @@ It runs:
 - Cortical / GM mask generation (without CSF)
 - Skull-stripping of T1 and EPI (SynthStrip)
 - T1 -> MNI registration via SynthMorph
-- AP/PA-based distortion correction via ANTs (AP->PA warp)
-- EPI unwarping + motion correction (via AFNI/RTPSpy, external)
+- PyHySCO distortion correction from native AP/PA means (no AP/PA motion correction)
+- Raw BOLD unwarping, then motion correction to the fixed corrected session reference
 - EPI(mean) -> T1 -> MNI registration via ANTs
 - Optional composed transforms for online use
 
 All heavy transforms for realtime are precomputed offline.
+
+Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
 
 Environments

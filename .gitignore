@@ -1,1 +1,4 @@
 /BIOPAC Hardware API 2.2.5 Research/
+.venv/
+__pycache__/
+.pytest_cache/

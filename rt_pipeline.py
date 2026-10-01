@@ -18,6 +18,11 @@ import nibabel as nib
 import numpy as np
 import torch
 
+from fmri_rt_preproc.native_fieldmap import (
+    PIPELINE_ORDER, native_paths, load_calibration, find_source,
+    validate_bold, require_same_grid, source_identity,
+)
+
 from motion_fd import fd_from_rtpspy_delta
 
 from watchdog.observers import Observer
@@ -516,15 +521,15 @@ class RTSessionConfig:
     @property
     def rt_distorted_motion_ref_epi(self) -> Path:
         """
-        Distorted-space real-time reference used for online RTPSpy motion correction.
-        Created offline from the MC-first mean EPI.
+        Legacy filename retained for external callers; not the online MC target.
+        Older sessions contain distorted data; new preparations contain corrected data.
         """
         return self.trans_dir / "rt_ref_epi.nii"
 
     @property
     def rt_distorted_motion_ref_mask(self) -> Path:
         """
-        Brain mask in the distorted motion-reference grid.
+        Legacy reference-mask filename; not the online DVARS mask.
         """
         return self.trans_dir / "rt_ref_epi_mask.nii"
 
@@ -544,13 +549,13 @@ class RTSessionConfig:
 
     @property
     def rt_motion_ref_epi(self) -> Path:
-        """Backward-compatible alias for the distorted motion reference."""
-        return self.rt_distorted_motion_ref_epi
+        """Corrected reference used for motion correction after unwarping."""
+        return self.rt_unwarped_analysis_ref_epi
 
     @property
     def rt_motion_ref_mask(self) -> Path:
-        """Backward-compatible alias for the distorted motion-reference mask."""
-        return self.rt_distorted_motion_ref_mask
+        """Corrected reference mask used after unwarping and motion correction."""
+        return self.rt_unwarped_analysis_ref_mask
 
     @property
     def rt_ref_epi(self) -> Path:
@@ -677,7 +682,7 @@ def _build_pyhysco_applier(
 
     epi_pe = str(getattr(REGRESSOR_SETTINGS, "epi_phase_encoding", "PA")).upper()
     polarity = 1 if epi_pe == "AP" else -1
-    phase_encoding_direction = 1 if epi_pe == "AP" else 2
+    phase_encoding_direction = load_calibration(fmap_dir)["phase_encoding_axis"]
     device = str(getattr(REGRESSOR_SETTINGS, "pyhysco_device", "cuda"))
     backend = str(getattr(REGRESSOR_SETTINGS, "pyhysco_backend", "grid_sample")).lower()
     applier = PreloadedPyHyscoApplier(
@@ -699,32 +704,12 @@ def _build_pyhysco_applier(
 
 
 def _resolve_pyhysco_fieldmap(fmap_dir: Path) -> Path:
-    aligned = _prefer_uncompressed_nifti(fmap_dir / "pyhysco_epi-EstFieldMap.nii")
-    if aligned.exists():
-        return aligned
-    return _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
-
-
-def _resolve_ants_unwarp_inputs(cfg: RTSessionConfig, fmap_dir: Path, epi_pe: str) -> tuple[Path, Path, Path]:
-    if epi_pe == "AP":
-        aligned_warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_epi_1Warp.nii")
-        legacy_warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1Warp.nii")
-        legacy_ref = _prefer_uncompressed_nifti(fmap_dir / "AP_mean.nii")
-    else:
-        aligned_warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_epi_1InverseWarp.nii")
-        legacy_warp = _prefer_uncompressed_nifti(fmap_dir / "AP2PA_1InverseWarp.nii")
-        legacy_ref = _prefer_uncompressed_nifti(fmap_dir / "PA_mean.nii")
-
-    aligned_affine = fmap_dir / "AP2PA_epi_0GenericAffine.mat"
-    if aligned_warp.exists() and aligned_affine.exists():
-        return aligned_warp, aligned_affine, cfg.rt_distorted_motion_ref_epi
-
-    legacy_affine = fmap_dir / "AP2PA_0GenericAffine.mat"
-    return legacy_warp, legacy_affine, legacy_ref
+    return native_paths(fmap_dir)[1]
 
 
 def maybe_init_pyhysco_applier(cfg: RTSessionConfig) -> Optional[PreloadedPyHyscoApplier]:
-    return _build_pyhysco_applier(cfg=cfg, prototype_vol_path=cfg.rt_distorted_motion_ref_epi)
+    # Prototype is calibration-local, independent of the session motion target.
+    return _build_pyhysco_applier(cfg, native_paths(cfg.fmap_dir)[0] / "AP_mean.nii")
 
 
 def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
@@ -846,24 +831,18 @@ def _prefer_uncompressed_nifti(path_nii: Path) -> Path:
 
 
 def _preferred_pyhysco_fieldmap(fmap_dir: Path) -> Path:
-    aligned = _prefer_uncompressed_nifti(fmap_dir / "pyhysco_epi-EstFieldMap.nii")
-    if aligned.exists():
-        return aligned
-    return _prefer_uncompressed_nifti(fmap_dir / "pyhysco-EstFieldMap.nii")
+    return native_paths(fmap_dir)[1]
+
 
 def _fieldmap_ready(cfg: RTSessionConfig) -> bool:
-    method = str(REGRESSOR_SETTINGS.fieldmap_method).lower()
-    epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
-    fmap_dir = cfg.fmap_dir
+    if str(REGRESSOR_SETTINGS.fieldmap_method).lower() != "pyhysco":
+        raise ValueError("unwarp -> MC supports PyHySCO only; select fieldmap_method=pyhysco.")
+    try:
+        load_calibration(cfg.fmap_dir)
+        return True
+    except (OSError, ValueError):
+        return False
 
-    if method == "pyhysco":
-        return _preferred_pyhysco_fieldmap(fmap_dir).exists()
-
-    if method == "ants":
-        warp, affine, _ = _resolve_ants_unwarp_inputs(cfg, fmap_dir, epi_pe)
-        return warp.exists() and affine.exists()
-
-    raise ValueError(f"Unknown fieldmap_method={method!r}")
 
 def ensure_fieldmap_only(cfg: RTSessionConfig) -> None:
     """
@@ -873,27 +852,14 @@ def ensure_fieldmap_only(cfg: RTSessionConfig) -> None:
     It does not run full preprocessing.
     It does not require structural block.
     It does not require a separate EPI block.
-    It uses the existing func/trans/rt_ref_epi.nii reference.
+    It averages raw AP/PA without motion correction or a session reference.
     """
 
-    # No explicit AP/PA pair: use legacy/common fmap folder.
-    if cfg.ap_block is None and cfg.pa_block is None:
-        log.info("[FMAP] No AP/PA pair specified; using default fmap dir: %s", cfg.fmap_dir)
-        return
-
-    if cfg.ap_block is None or cfg.pa_block is None:
+    if (cfg.ap_block is None) != (cfg.pa_block is None):
         raise ValueError("Set both --ap-block and --pa-block, or neither.")
-
     if _fieldmap_ready(cfg):
-        log.info("[FMAP] Fieldmap already ready in %s", cfg.fmap_dir)
+        log.info("[FMAP] Native fieldmap ready in %s", cfg.fmap_dir)
         return
-
-    ref_epi = cfg.rt_distorted_motion_ref_epi
-    if not ref_epi.exists():
-        raise FileNotFoundError(
-            f"[FMAP] Cannot build AP/PA fieldmap: missing RT reference EPI: {ref_epi}. "
-            "Run the base preprocessing once so func/trans/rt_ref_epi.nii exists."
-        )
 
     log.warning(
         "[FMAP] Fieldmap missing for AP/PA pair ap=%s pa=%s in %s; building fieldmap only.",
@@ -913,8 +879,11 @@ def ensure_fieldmap_only(cfg: RTSessionConfig) -> None:
     ap_path = cfg.fmap_dir / "AP.nii.gz"
     pa_path = cfg.fmap_dir / "PA.nii.gz"
 
-    _stage_convert_to_target(cfg.incoming_dir, int(cfg.ap_block), ap_path)
-    _stage_convert_to_target(cfg.incoming_dir, int(cfg.pa_block), pa_path)
+    if cfg.ap_block is not None:
+        _stage_convert_to_target(cfg.incoming_dir, int(cfg.ap_block), ap_path)
+        _stage_convert_to_target(cfg.incoming_dir, int(cfg.pa_block), pa_path)
+    ap_path = find_source(cfg.fmap_dir, "AP")
+    pa_path = find_source(cfg.fmap_dir, "PA")
 
     # Minimal config object for FMRIRealtimePreprocessor._prepare_fieldmap().
     fieldmap_cfg = SimpleNamespace(
@@ -931,7 +900,7 @@ def ensure_fieldmap_only(cfg: RTSessionConfig) -> None:
     )
 
     pipe = FMRIRealtimePreprocessor(fieldmap_cfg)
-    pipe._prepare_fieldmap(ref_epi)
+    pipe._prepare_fieldmap()
 
     if not _fieldmap_ready(cfg):
         raise FileNotFoundError(
@@ -962,6 +931,9 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "reference_score_run": cfg.reference_score_run,
             "reference_score_stats": cfg.reference_score_stats,
             "enable_original_score": cfg.enable_original_score,
+            "preprocessing_order": PIPELINE_ORDER,
+            "fieldmap_dir": str(cfg.fmap_dir),
+            "motion_reference": str(cfg.rt_motion_ref_epi),
             "tr": REGRESSOR_SETTINGS.TR,
             "regression": {
                 "enable_motion_regression": REGRESSOR_SETTINGS.enable_motion_regression,
@@ -1123,14 +1095,14 @@ class DICOMHandler(FileSystemEventHandler):
         self.volreg.ignore_init = 0
         self.volreg.save_proc = False
 
-        # --- RT motion correction reference: distorted/MC-first mean EPI ---
+        # --- Motion reference: corrected session mean, fixed across runs ---
         self.ref_set = False
-        ref_epi = self.cfg.rt_distorted_motion_ref_epi
+        ref_epi = self.cfg.rt_motion_ref_epi
         if not ref_epi.exists():
             raise FileNotFoundError(
                 f"RT reference EPI not found at {ref_epi}. "
                 f"Run the offline preprocessing pipeline first so "
-                f"rt_ref_epi.nii is created in {self.cfg.trans_dir}."
+                f"epi_unwarped_mean.nii is created in {self.cfg.trans_dir}."
             )
         self.volreg.set_ref_vol(str(ref_epi))
         self.ref_set = True
@@ -1150,10 +1122,10 @@ class DICOMHandler(FileSystemEventHandler):
         self.last_dvars_val = float("nan")
         self.last_dvars_z = float("nan")
 
-        # --- NEW: load distorted-space mask for DVARS on MC volumes ---
+        # --- DVARS uses corrected, motion-aligned volumes and mask ---
         self.dvars_mask = None
         if REGRESSOR_SETTINGS.enable_dvars_censor_reg:
-            mpath = cfg.rt_distorted_motion_ref_mask
+            mpath = cfg.rt_motion_ref_mask
             if not mpath.exists():
                 log.warning(f"[DVARS] Mask missing at {mpath}; DVARS censor disabled.")
             else:
@@ -1592,7 +1564,7 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
                 "-z", "n",  # no gzip
                 "-s", "y",
                 "-a", "y",
-                "-b", "n",
+                "-b", "y",
                 "-v", "0",
                 "-f", f"vol_{volume_idx:05d}",
                 "-o", str(raw_dir),
@@ -1676,8 +1648,8 @@ def process_volume(
     """
     For each incoming DICOM:
       1) DICOM -> raw NIfTI (single volume)
-      2) Motion correction with RTPSpy -> mc NIfTI
-      3) Fieldmap unwarp of MC volume
+      2) Fieldmap unwarp of raw volume
+      3) Motion correction of unwarped volume -> mc NIfTI
       4) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
     """
 
@@ -1689,13 +1661,36 @@ def process_volume(
     elif volume_timestamp is None:
         volume_timestamp = time.time()
 
+    # Unwarp raw BOLD in calibration geometry before estimating motion.
+    uw_t0 = time.time()
+    raw_img = nib.load(str(raw_nii))
+    validate_bold(raw_img, cfg.fmap_dir, str(REGRESSOR_SETTINGS.epi_phase_encoding).upper(), raw_nii)
+    ref_img = nib.load(str(cfg.rt_motion_ref_epi))
+    require_same_grid(raw_img, ref_img)
+    raw_data = np.asarray(raw_img.dataobj, dtype=np.float32)
+    unwarp_dir = cfg.rt_unwarp_dir
+    local_unwarped = unwarp_dir / f"vol_{volume_idx:05d}_uw_native.nii"
+    corrected = None
+    if handler.pyhysco_applier is not None:
+        try:
+            corrected = handler.pyhysco_applier.apply_volume(raw_data)
+        except Exception:
+            log.exception("[FMAP] Preloaded apply failed; using file-based PyHySCO.")
+    if corrected is None:
+        if not unwarp_volume(raw_nii, local_unwarped, cfg):
+            return False
+        corrected = np.asarray(nib.load(str(local_unwarped)).dataobj, dtype=np.float32).copy()
+    img = nib.Nifti1Image(corrected, raw_img.affine)
+    if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)):
+        nib.save(img, str(local_unwarped))
+    log_step("FMAP", volume_idx, start_t=uw_t0)
+
     # ---------- 2) Motion correction (RtpVolreg) ----------
     t0 = time.time()
     mc_dir = cfg.rt_mc_dir
     mc_nii = mc_dir / f"vol_{volume_idx:05d}_mc.nii"
 
-    # MC FIRST: use RAW as input to MC
-    img = nib.load(str(raw_nii))
+    # MC input is now corrected BOLD.
     data = np.asanyarray(img.dataobj).astype(np.float32)
 
     # Create a temporary NIfTI for RtpVolreg to work on
@@ -1707,8 +1702,16 @@ def process_volume(
 
     # Extract corrected data and save with a FRESH header
     mc_data = np.asanyarray(tmp_img.dataobj).astype(np.float32)
-    mc_img = nib.Nifti1Image(mc_data, img.affine)  # new clean header
+    mc_img = nib.Nifti1Image(mc_data, ref_img.affine)  # fixed corrected reference grid
     nib.save(mc_img, str(mc_nii))
+
+    # Preserve the historical fully-corrected product for PCA/stream consumers.
+    # Despite the legacy suffix, this file now records UNWARP -> MC.
+    mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
+    mc_unwarped_img = mc_img
+    mc_unwarped_img.set_filename(str(mc_unwarped_nii))
+    if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)) or cfg.enable_original_score:
+        nib.save(mc_unwarped_img, str(mc_unwarped_nii))
 
     # ----- 2b) MOTION + FD (ONLINE) -----
     # RtpVolreg exposes [roll pitch yaw dS dL dP]: rotations in degrees,
@@ -1804,53 +1807,6 @@ def process_volume(
     # update prev for next DVARS
     handler.prev_mc_for_dvars = mc_data.copy()
 
-
-    # ---------- 2c) Fieldmap unwarp AFTER MC ----------
-    uw_t0 = time.time()
-    unwarp_dir = cfg.rt_unwarp_dir
-    unwarp_dir.mkdir(parents=True, exist_ok=True)
-    mc_unwarped_nii = unwarp_dir / f"vol_{volume_idx:05d}_mc_uw.nii"
-    use_fast_unwarp = handler.pyhysco_applier is not None
-    if use_fast_unwarp:
-        try:
-            mc_unwarped_data = handler.pyhysco_applier.apply_volume(mc_data)
-            mc_unwarped_img = nib.Nifti1Image(
-                mc_unwarped_data.astype(np.float32, copy=False),
-                mc_img.affine,
-                mc_img.header.copy(),
-            )
-            # RTPSpy regression path expects fmri_img.get_filename() to be non-None.
-            # Keep an explicit filename even when running in-memory fast mode.
-            mc_unwarped_img.set_filename(str(mc_unwarped_nii))
-
-            if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)):
-                nib.save(mc_unwarped_img, str(mc_unwarped_nii))
-                if not mc_unwarped_nii.exists():
-                    raise RuntimeError(f"Failed to save unwarped QC volume: {mc_unwarped_nii}")
-                log.info("[FMAP] saved %s", mc_unwarped_nii.name)
-            elif not handler._pyhysco_unwarped_save_notice_emitted:
-                log.info(
-                    "[FMAP] in-memory mode (save_intermediate_unwarped=False) for preloaded PyHySCO."
-                )
-                handler._pyhysco_unwarped_save_notice_emitted = True
-        except Exception as exc:
-            log.error(
-                "[FMAP] Preloaded PyHySCO apply failed for vol %05d: %s. Falling back to file-based unwarp.",
-                volume_idx,
-                exc,
-            )
-            use_fast_unwarp = False
-    if not use_fast_unwarp:
-        if not mc_unwarped_nii.exists():
-            ok = unwarp_volume(mc_nii, mc_unwarped_nii, cfg)
-            if not ok:
-                log.error(f"[FMAP] Failed unwarp for MC volume {mc_nii}")
-                return False
-        mc_unwarped_img = nib.load(str(mc_unwarped_nii))
-    if cfg.enable_original_score and not mc_unwarped_nii.exists():
-        nib.save(mc_unwarped_img, str(mc_unwarped_nii))
-        mc_unwarped_img.set_filename(str(mc_unwarped_nii))
-    log_step("FMAP", volume_idx, start_t=uw_t0)
 
     # ---------- 2d) Motion regression (RTPS_py) ----------
     reg_t0 = time.time()
@@ -2138,55 +2094,33 @@ def process_volume(
 
 
 def unwarp_volume(raw_nii: Path, out_nii: Path, cfg: RTSessionConfig):
-    fmap_dir = cfg.fmap_dir
-    method = str(REGRESSOR_SETTINGS.fieldmap_method).lower()
-    epi_pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
-
-    if method == "pyhysco":
-        pyhysco_field = _preferred_pyhysco_fieldmap(fmap_dir)
-        if not pyhysco_field.exists():
-            log.error("[FMAP] Missing PyHySCO fieldmap: %s", pyhysco_field)
-            return False
-        polarity = 1 if epi_pe == "AP" else -1
-        pyhysco_ped = 1 if epi_pe == "AP" else 2
-        apply_pyhysco_fieldmap(
-            epi_path=raw_nii,
-            fieldmap_path=pyhysco_field,
-            out_path=out_nii,
-            phase_encoding_direction=pyhysco_ped,
-            polarity=polarity,
-        )
-        return True
-
-    warp, affine, ref_img = _resolve_ants_unwarp_inputs(cfg, fmap_dir, epi_pe)
-
-    # NOTE: this fallback expects the input to already be motion-corrected.
-    # AP2PA_epi_* transforms are estimated from AP/PA already motion-corrected
-    # to rt_ref_epi.nii and write into the distorted EPI motion-reference grid.
-    # Legacy AP2PA_* transforms write into the AP/PA fieldmap grid.
-
-    if not warp.exists() or not affine.exists():
-        log.error("[FMAP] Missing ANTs warp or affine for method=%s", method)
-        return False
-
-    cmd = [
-        "bash", "-lc",
-        f"""
-        export ANTS_USE_GPU=1
-        export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-        export OMP_NUM_THREADS=$(nproc)
-        antsApplyTransforms \
-            -d 3 \
-            -e 3 \
-            -i {raw_nii} \
-            -r {ref_img} \
-            -o {out_nii} \
-            -t {warp} \
-            -t {affine} --float 1
-        """
-    ]
-    run(cmd)
+    if str(REGRESSOR_SETTINGS.fieldmap_method).lower() != "pyhysco":
+        raise ValueError("unwarp -> MC supports PyHySCO only.")
+    pe = str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()
+    spec = validate_bold(nib.load(str(raw_nii)), cfg.fmap_dir, pe, raw_nii)
+    apply_pyhysco_fieldmap(
+        epi_path=raw_nii, fieldmap_path=_preferred_pyhysco_fieldmap(cfg.fmap_dir),
+        out_path=out_nii, phase_encoding_direction=spec["phase_encoding_axis"],
+        polarity=1 if pe == "AP" else -1,
+    )
     return True
+
+
+def validate_run_provenance(cfg):
+    """Do not mix old MC-first outputs or a different field/reference in a run."""
+    folder = cfg.rt_work_dir
+    marker = folder / "preprocessing_order.json"
+    payload = {"order": PIPELINE_ORDER, "calibration": load_calibration(cfg.fmap_dir),
+               "field": source_identity(_preferred_pyhysco_fieldmap(cfg.fmap_dir)),
+               "reference": source_identity(cfg.rt_motion_ref_epi),
+               "epi_phase_encoding": str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()}
+    if marker.exists():
+        if json.loads(marker.read_text()) != payload:
+            raise ValueError("Run preprocessing/calibration/reference changed. Use a fresh run output directory.")
+    elif any((folder / name).exists() and any((folder / name).glob("*.nii*"))
+             for name in ("mc", "unwarped", "reg", "t1", "mni")):
+        raise ValueError("Legacy processed run detected. Use a fresh output directory for unwarp -> MC replay.")
+    marker.write_text(json.dumps(payload, indent=2))
 
 
 # ---------- Main ----------
@@ -2205,6 +2139,7 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
 
     ensure_fieldmap_only(cfg)
+    validate_run_provenance(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
     write_session_metadata(cfg, decoder_template)
