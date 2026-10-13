@@ -8,16 +8,16 @@ import time
 from pathlib import Path
 
 STAGES = {
-    "DICOM": "DICOM conversion", "FMAP": "PyHySCO unwarping",
-    "MC": "Motion correction + FD", "QC": "DVARS / censor flags",
-    "REG": "Cumulative GLM / scaling", "TRANS": "Spatial resampling",
-    "SMOOTH": "Masked smoothing", "MASK": "Analysis mask",
-    "SCORE": "Decoder + score output", "OUTPUT": "QC / preview output",
-    "OTHER": "Other processing overhead",
+    "DICOM": "DICOM — DICOM to NIfTI", "FMAP": "FMAP — unwarping (PyHySCO)",
+    "MC": "MC — motion correction + FD", "QC": "DVARS — signal-change / censor checks",
+    "REG": "REG — denoising", "TRANS": "TRANS — spatial resampling",
+    "SMOOTH": "SMOOTH — masked smoothing", "MASK": "MASK — analysis mask",
+    "SCORE": "SCORE — decoder + score output", "OUTPUT": "OUTPUT — status logs / preview",
+    "OTHER": "OTHER — processing overhead",
 }
 FIELDS = [
     "volume", "source", "cached_input", "attempts", "reg_ready", "status",
-    "arrival_interval_ms", "idle_wait_ms", "worker_queue_ms", "order_queue_ms",
+    "arrival_interval_ms", "idle_wait_ms", "worker_queue_ms", "order_queue_ms", "file_write_ms",
     "processing_ms", "latency_ms", *[f"{s}_ms" for s in STAGES],
 ]
 
@@ -51,6 +51,27 @@ class SpeedRecorder:
                     row["idle_wait_ms"] = 0. if busy else 1000 * (now - self.last_done)
                 self.last_arrival = now
             self.rows[volume] = row
+
+    def file_event(self, volume, event):
+        """Created→closed callback interval, when both precede row completion.
+
+        Some filesystems do not emit close notifications. Missing events and
+        backlog files stay unknown. Event-delivery delay is included; this is
+        not scanner-to-disk transfer time.
+        """
+        if event not in {"created", "closed"}:
+            raise ValueError("Expected a created or closed file event.")
+        self.arrive(volume)
+        with self.lock:
+            row = self.rows[volume]
+            if row["source"] != "live" or "done" in row:
+                return
+            key = f"file_{event}"
+            if key in row:
+                return
+            row[key] = self.clock()
+            if event == "closed" and "file_created" in row:
+                row["file_write_ms"] = 1000 * (row[key] - row["file_created"])
 
     def conversion_start(self, volume, cached=False):
         with self.lock:
@@ -104,6 +125,49 @@ class SpeedRecorder:
                 csv.DictWriter(f, FIELDS, extrasaction="ignore").writerow(row)
 
 
+def median_ci(values, *, sample_indices=None, n_resamples=2000, seed=0):
+    """Median and approximate 95% moving-block-bootstrap CI, in input units.
+
+    Adjacent samples are resampled together (ceil(n**(1/3)) per block),
+    retaining short-range timing dependence. This assumes approximate local
+    stationarity; use the per-volume CSV to inspect drift across the run.
+    https://arch.readthedocs.io/en/stable/bootstrap/timeseries-bootstraps.html
+    """
+    import numpy as np
+    data = np.asarray(values, dtype=float)
+    positions = np.arange(len(data)) if sample_indices is None else np.asarray(sample_indices)
+    valid = np.isfinite(data)
+    data, positions = data[valid], positions[valid]
+    n = len(data)
+    median = float(np.median(data)) if n else float("nan")
+    if n < 8 or np.any(np.diff(positions) != 1):
+        return median, float("nan"), float("nan")
+    block = int(np.ceil(n ** (1 / 3)))
+    rng = np.random.default_rng(seed)
+    estimates = np.empty(n_resamples)
+    for begin in range(0, n_resamples, 64):
+        count = min(64, n_resamples - begin)
+        starts = rng.integers(0, n - block + 1, (count, math.ceil(n / block)))
+        indices = (starts[..., None] + np.arange(block)).reshape(count, -1)[:, :n]
+        estimates[begin:begin + count] = np.median(data[indices], axis=1)
+    low, high = np.percentile(estimates, [2.5, 97.5])
+    return median, float(low), float(high)
+
+
+def select_profile_rows(rows):
+    """Compare one acquisition/cache cohort, preferentially ready, fresh live data."""
+    good = [r for r in rows if r["status"] == "ok"]
+    ready = [r for r in good if r["reg_ready"] == "True"]
+    candidates = ready or good
+    for source, cached in [("live", False), ("backlog", False), ("live", True), ("backlog", True)]:
+        chosen = [r for r in candidates if r["source"] == source
+                  and (r["cached_input"] == "True") == cached]
+        if chosen:
+            label = f"{source}, {'reused NIfTI' if cached else 'fresh conversion'}, "
+            return chosen, label + ("ready volumes" if ready else "warm-up only")
+    return [], "no successful volumes"
+
+
 def plot_speed(csv_path, tr=1.0, output=None):
     """Render measured data only. Returns None when no finished volumes exist."""
     csv_path = Path(csv_path)
@@ -133,97 +197,56 @@ def plot_speed(csv_path, tr=1.0, output=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    def values(key, subset=rows):
-        return np.array([float(r[key]) if r.get(key) != "" else np.nan for r in subset])
+    measured, cohort = select_profile_rows(rows)
+    def values(key):
+        return np.array([float(r[key]) if r.get(key) not in (None, "") else np.nan
+                         for r in measured])
 
-    good = [r for r in rows if r["status"] == "ok"]
-    ready = [r for r in good if r["reg_ready"] == "True"]
-    measured = ready or good
-    title_suffix = "regression-ready volumes" if ready else "completed volumes (warm-up)"
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
                          "axes.spines.top": False, "axes.spines.right": False})
     fig = plt.figure(figsize=(16, 9), facecolor="#f5f8fc")
-    # Fixed 16:9 margins leave room for long stage labels and a slide-sized font.
-    ax_bar = fig.add_axes([.215, .18, .265, .61])
-    ax_run = fig.add_axes([.595, .555, .37, .235])
-    ax_input = fig.add_axes([.595, .18, .37, .235])
-    for ax in (ax_bar, ax_run, ax_input):
-        ax.set_facecolor("#f5f8fc")
-        ax.grid(axis="x" if ax is ax_bar else "y", color="#dae2ec", linewidth=.7)
-        ax.set_axisbelow(True)
-    fig.text(.045, .94, "Real-time processing · measured speed", fontsize=25,
+    ax = fig.add_axes([.32, .24, .63, .58])
+    ax.set_facecolor("#f5f8fc")
+    ax.grid(axis="x", color="#dae2ec", linewidth=.7)
+    ax.set_axisbelow(True)
+    fig.text(.045, .94, "Per-stage duration", fontsize=25,
              weight="bold", color="#102b46")
-    backlog = sum(r["source"] == "backlog" for r in rows)
-    cached = sum(r["cached_input"] == "True" for r in rows)
-    failed = len(rows) - len(good)
-    fig.text(.045, .892,
-             f"{len(good)} completed  ·  {failed} failed  ·  {backlog} backlog  ·  "
-             f"{cached} reused NIfTI  ·  configured TR {tr:g} s", color="#52667c")
-
-    stages = [s for s in STAGES if measured and np.any(values(f"{s}_ms", measured) > 0)]
-    if stages:
-        med = [np.median(values(f"{s}_ms", measured)) for s in stages]
-        p90 = [np.percentile(values(f"{s}_ms", measured), 90) for s in stages]
-        y = np.arange(len(stages))
-        ax_bar.barh(y, med, color="#167d9b", height=.56, label="Median")
-        ax_bar.scatter(p90, y, s=34, color="#ed9856", zorder=3, label="90th percentile")
-        limit = max(p90) * 1.34 or 1.
-        for yi, m, p in zip(y, med, p90):
-            fmt = lambda value: f"{value:.1f}" if value < 10 else f"{value:.0f}"
-            ax_bar.text(p + limit*.025, yi, f"{fmt(m)} / {fmt(p)}", va="center", fontsize=10)
-        ax_bar.set_yticks(y, [STAGES[s] for s in stages])
-        ax_bar.invert_yaxis()
-        ax_bar.set_xlim(0, limit)
-        ax_bar.legend(loc="lower right", frameon=True, facecolor="#f5f8fc",
-                      edgecolor="none", fontsize=10)
-    else:
-        ax_bar.text(.1, .5, "No completed stage timings", transform=ax_bar.transAxes)
-    ax_bar.set_title(f"Per-stage duration\n{title_suffix}", loc="left", fontsize=12,
-                     weight="bold", pad=16)
-    ax_bar.set_xlabel("Milliseconds · median / P90")
-
-    x = values("volume")
-    processing = values("processing_ms") / 1000
-    latency = values("latency_ms") / 1000
-    ok = np.array([r["status"] == "ok" for r in rows])
-    warmup = ok & np.array([r["reg_ready"] != "True" for r in rows])
-    ax_run.plot(x, np.where(ok, latency, np.nan), color="#8d9aab", linewidth=1.1,
-                label="Detection → completion")
-    ax_run.plot(x, np.where(ok, processing, np.nan), color="#167d9b", linewidth=1.6,
-                label="Processing (incl. file I/O)")
-    ax_run.scatter(x[warmup], processing[warmup], s=20, color="#ed9856", label="Warm-up", zorder=4)
-    if np.any(~ok):
-        ax_run.scatter(x[~ok], latency[~ok], marker="x", color="#b94252", label="Failed")
-    ax_run.axhline(tr, color="#b94252", linestyle="--", linewidth=1, label="TR budget")
-    ax_run.set(title="Per-volume processing and latency", ylabel="Seconds", xlabel="Volume")
-    ax_run.set_ylim(bottom=0)
-    ax_run.set_ylim(0, max(float(np.nanmax(latency)), tr, .001) * 1.35)
-    ax_run.legend(loc="upper left", fontsize=9, frameon=True,
-                  facecolor="#f5f8fc", edgecolor="none", ncol=2)
-
-    live = [r for r in rows if r["source"] == "live"]
-    live_x = values("volume", live)
-    if any(r["arrival_interval_ms"] != "" for r in live):
-        ax_input.plot(live_x, values("arrival_interval_ms", live)/1000,
-                      color="#7066af", linewidth=1.5, label="Incoming-file interval")
-        ax_input.plot(live_x, values("idle_wait_ms", live)/1000,
-                      color="#b2bcc9", linewidth=1.2, label="Idle waiting for next file")
-        queue = values("worker_queue_ms", live) + values("order_queue_ms", live)
-        ax_input.plot(live_x, queue/1000, color="#ed9856", linewidth=1.1, label="Worker + ordering queue")
-        input_peak = np.concatenate([values("arrival_interval_ms", live),
-                                     values("idle_wait_ms", live), queue]) / 1000
-        ax_input.set_ylim(0, max(float(np.nanmax(input_peak)), .001) * 1.5)
-        ax_input.legend(loc="upper left", fontsize=9, frameon=True,
-                        facecolor="#f5f8fc", edgecolor="none")
-    else:
-        ax_input.text(.03, .48, "Waiting for at least two live arrivals.\n"
-                      "Existing files do not measure scanner cadence.", transform=ax_input.transAxes,
-                      color="#52667c")
-    ax_input.set(title="Incoming volumes and waiting", ylabel="Seconds", xlabel="Volume")
-    ax_input.set_ylim(bottom=0)
-    fig.text(.045, .055, "Processing includes file I/O and attempted work. Detection-to-completion also includes queues and retry backoff.\n"
-             "Incoming intervals start at file detection, not scanner triggers. Interrupted work may be absent. Cumulative GLM cost can grow during the run.",
-             fontsize=10, color="#52667c", linespacing=1.6)
+    failed = sum(r["status"] != "ok" for r in rows)
+    fig.text(.045, .89, f"Median with 95% CI  ·  {cohort}  ·  n = {len(measured)}  ·  TR {tr:g} s"
+             f"  ·  {failed} failed excluded", color="#52667c")
+    inputs = [
+        ("idle_wait_ms", "WAIT — idle until next volume"),
+        ("file_write_ms", "FILE — creation → close notifications"),
+        ("worker_queue_ms", "WATCHDOG — detection → conversion start"),
+        ("order_queue_ms", "ORDER — waiting for prior volumes"),
+    ]
+    metrics = inputs + [(f"{s}_ms", label) for s, label in STAGES.items()
+                        if np.any(values(f"{s}_ms") > 0)]
+    positions = [int(r["volume"]) for r in measured]
+    summaries = [median_ci(values(key), sample_indices=positions) for key, _ in metrics]
+    ends = [max(m, hi) if np.isfinite(hi) else m for m, _, hi in summaries]
+    limit = max([e for e in ends if np.isfinite(e)] or [1.]) * 1.45 or 1.
+    for y, ((key, _), (med, low, high), end) in enumerate(zip(metrics, summaries, ends)):
+        count = int(np.isfinite(values(key)).sum())
+        if not count:
+            ax.text(limit*.012, y, "not observed", va="center", color="#7a8796")
+            continue
+        ax.barh(y, med, color="#ce935c" if y < len(inputs) else "#167d9b", height=.55)
+        if np.isfinite(low):
+            ax.hlines(y, low, high, color="#102b46", linewidth=2, zorder=4)
+            ax.vlines([low, high], y-.13, y+.13, color="#102b46", linewidth=1.6, zorder=4)
+        fmt = lambda value: f"{value:.1f}" if value < 10 else f"{value:.0f}"
+        interval = f"[{fmt(low)}, {fmt(high)}]" if np.isfinite(low) else "CI unavailable"
+        ax.text(end + limit*.012, y, f"{fmt(med)}  {interval}   n={count}", va="center", fontsize=10)
+    ax.axhline(len(inputs)-.5, color="#c4cfdc", linewidth=1)
+    ax.set_yticks(range(len(metrics)), [label for _, label in metrics])
+    ax.invert_yaxis()
+    ax.set_xlim(0, limit)
+    ax.set_xlabel("Duration (ms) · median [95% confidence interval]", labelpad=12)
+    fig.text(.045, .055, "Whiskers: approximate 95% block-bootstrap CI of the median (2,000 resamples). CI unavailable for n < 8 or gaps; assumes approximate stationarity.\n"
+             "Input intervals overlap. FILE includes event-delivery delay; transfer before detection is unmeasured. Do not sum these intervals.\n"
+             "Processing rows include their file I/O. Full per-volume timings remain in speed_test.csv.",
+             fontsize=9, color="#52667c", linespacing=1.5)
     output = Path(output) if output else csv_path.with_suffix(".png")
     fig.savefig(output, dpi=180, facecolor=fig.get_facecolor())
     plt.close(fig)

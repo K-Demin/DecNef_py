@@ -1333,16 +1333,16 @@ class DICOMHandler(FileSystemEventHandler):
         # We still enqueue as a fallback for filesystems that don't emit
         # close events, but the preferred path is `on_closed` below.
         log.info(f"[WATCHDOG] File created: {path}")
-        self.enqueue_path(path)
+        self.enqueue_path(path, file_event="created")
 
     def on_closed(self, event):
         if event.is_directory:
             return
         path = Path(event.src_path)
         log.info(f"[WATCHDOG] File closed: {path}")
-        self.enqueue_path(path)
+        self.enqueue_path(path, file_event="closed")
 
-    def enqueue_path(self, path: Path, backlog: bool = False) -> None:
+    def enqueue_path(self, path: Path, backlog: bool = False, file_event: Optional[str] = None) -> None:
         parsed = parse_dicom_name(path.name)
         if parsed is None:
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
@@ -1352,10 +1352,12 @@ class DICOMHandler(FileSystemEventHandler):
         if run_id != self.current_run:
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
-        if scan in self._processed_scans or scan in self._pending_scans:
-            return
         if self.speed is not None:
             self.speed.arrive(scan, backlog=backlog)
+            if file_event is not None:
+                self.speed.file_event(scan, file_event)
+        if scan in self._processed_scans or scan in self._pending_scans:
+            return
         if self._online_mode and not self._biopac_run_started:
             if not self._biopac_started:
                 self.start_biopac()
@@ -1882,7 +1884,7 @@ def process_volume(
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "cumulative GLM", start_t=reg_t0, speed=speed)
+        log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
     else:
         cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
         reg_ready = True

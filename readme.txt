@@ -317,13 +317,34 @@ The run folder (sub-<subject>/<day>/func/<run>/) receives:
   speed_test.csv   per-volume measurements, flushed as volumes finish
   speed_test.png   16:9 report generated after stopping, outside the TR loop
 
-The plot includes median/P90 stage times, processing and detection-to-completion
-latency across the run, and incoming-file intervals/idle waiting/queue delays.
-Stages include DICOM conversion, PyHySCO, MC+FD, QC, cumulative GLM (including any
-physiology wait), spatial resampling, masking/smoothing, decoder and output I/O.
-Warm-up volumes are marked; stage summaries use regression-ready volumes when
-available. Cumulative GLM is multiple linear regression refitted on all available
-run history, so inspect timings late in the run as well as near the start.
+The plot is one per-stage duration chart. Labels follow the script: DICOM
+conversion, FMAP unwarping, MC plus FD, REG denoising (including any physiology
+wait), TRANS spatial resampling, SMOOTH/MASK, SCORE and output I/O. The internal
+QC timing is labeled DVARS: signal-change and censor checks (FD and DVARS flags).
+Disabled stages with no measured work are omitted.
+
+The same chart includes incoming-volume overhead:
+  WAIT       idle time until the next incoming volume is detected
+  FILE       creation-to-close callback interval, when both events are observed
+  WATCHDOG   detection to conversion-worker start, including worker queueing
+  ORDER      conversion completion to ordered processing start
+These input intervals can overlap and should not be added together. FILE includes
+event-delivery delay and is not a pure transfer-time measurement. It is
+blank/not observed if the filesystem supplies no close event, the creation event
+was missed, or the close arrives after the completed CSV row was flushed.
+
+Summaries use ready volumes when available, preferring fresh live conversions.
+Backlog and reused-NIfTI measurements are separate cohorts, never pooled into
+the selected summary. The subtitle identifies the cohort and each row gives n.
+Whiskers are approximate 95% moving-block-bootstrap confidence intervals
+of each stage's median, using 2,000 resamples and blocks of ceil(n^(1/3)) adjacent
+measurements. A fixed seed makes regeneration repeatable; fewer than 8 observations
+or nonconsecutive volume indices are labeled CI unavailable. Missing observations
+are not treated as adjacent TRs. These are uncertainty intervals for the within-run
+median, not a range containing 95% of individual TR times. The bootstrap assumes
+approximate stationarity and short-range dependence. Per-volume timings in the
+CSV allow inspection of drift; the intervals do not predict a future run.
+Method: https://arch.readthedocs.io/en/stable/bootstrap/timeseries-bootstraps.html
 
 Existing files are marked backlog, reused raw NIfTIs are marked cached, and
 failed volumes have their own status. Backlog detection intervals do not measure
