@@ -66,6 +66,8 @@ class RegressorSettings:
     volume_stream_every_n: int = 1
     volume_stream_max_queue: int = 2
     volume_stream_window_title: str = "RT volume QC"
+    volume_stream_window_x: int = 50
+    volume_stream_window_y: int = 50
     pyhysco_device: str = "cuda"
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 

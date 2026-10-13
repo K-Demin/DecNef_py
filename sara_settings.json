@@ -1,8 +1,4 @@
 {
-  "smoothing_fwhm_mm": 0.0,
-  "analysis_mask": "whole_brain",
-  "analysis_mask_file": null,
-  "analysis_mask_space": "final",
   "_comment_smoothing": "Final mask: whole_brain, cortical_gm, or custom (binary analysis_mask_file; space final/epi/t1/mni). FWHM in mm; 0 skips filtering, cortex/custom still writes masked/. Positive FWHM writes smooth/.",
   "_comment": "Global realtime defaults shared by rt_pipeline.py, rt_psychopy_parallel.py, and rs_realtime_parallel.py.",
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
@@ -49,6 +45,15 @@
   "epi_phase_encoding": "PA",
   "_comment_resampler": "New way to apply transforms using our own written CUDE script",
   "use_gpu_resampler": true,
-  "gpu_resampler_device": "cuda"
-
+  "gpu_resampler_device": "cuda",
+  "enable_volume_streamer": true,
+  "volume_stream_kind": "unwarped",
+  "volume_stream_every_n": 1,
+  "volume_stream_max_queue": 2,
+  "volume_stream_window_title": "BrainStreamer live EPI",
+  "volume_stream_window_x": 50,
+  "volume_stream_window_y": 50,
+  "analysis_mask": "cortical_gm",
+  "analysis_mask_space": "final",
+  "smoothing_fwhm_mm": 6.0
 }

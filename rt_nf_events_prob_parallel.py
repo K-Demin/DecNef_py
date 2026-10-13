@@ -1,0 +1,996 @@
+#!/usr/bin/env python
+import argparse
+import csv
+import json
+import logging
+from multiprocessing import Queue
+from queue import Empty
+from pathlib import Path
+import multiprocessing as mp
+import time
+from typing import Optional
+
+import numpy as np
+
+from rt_global_settings import load_regressor_settings
+
+
+log = logging.getLogger(__name__)
+
+# python rt_nf_events_parallel.py \
+#   --sub 00086 \
+#   --day 3 \
+#   --run 4 \
+#   --incoming-root /path/to/incoming \
+#   --base-data /SSD2/DecNef \
+#   --n-trials 20 \
+#   --baseline-trs 20 \
+#   --iti-trs 3 \
+#   --cue-trs 4 \
+#   --scans-trs 3 \
+#   --delay-trs 3 \
+#   --feedback-trs 3 \
+#   --score-delay 3 \
+#   --settings-file jane_settings.json
+#   --rs XXX\
+
+
+#
+
+def _merge_session_metadata(run_dir: Path, payload: dict) -> None:
+    metadata_path = run_dir / "session_metadata.json"
+    data = {}
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+    data.update(payload)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+
+
+def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
+    reg_path = run_dir / "regression_status_rt.csv"
+    if not reg_path.exists():
+        return None
+    with open(reg_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+            return None
+        reg_ready_map: dict[int, bool] = {}
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                reg_ready_map[vol] = bool(int(row["reg_ready"]))
+            except (TypeError, ValueError):
+                continue
+    return reg_ready_map
+
+
+def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    scores_path = run_dir / "scores.csv"
+    motion_path = run_dir / "motion_rt.1D"
+    if not scores_path.exists() or not motion_path.exists():
+        return
+
+    reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
+    if prefer_reg_ready and reg_ready_map is None:
+        return
+
+    first_reg_ready_vol = None
+    if reg_ready_map:
+        ready_vols = [vol for vol, ready in reg_ready_map.items() if ready]
+        if ready_vols:
+            first_reg_ready_vol = min(ready_vols)
+
+    qc_exclude_until_vol = 0
+    metadata_path = run_dir / "session_metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+            qc_exclude_until_vol = max(
+                int(metadata.get("voxel_norm_ref_volumes", 0) or 0),
+                int(metadata.get("pre_trial_scans", 0) or 0),
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            qc_exclude_until_vol = 0
+
+    vols = []
+    scores = []
+    with open(scores_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                vol = int(row["volume_idx"])
+                score = float(row["score_raw"])
+            except (TypeError, ValueError):
+                continue
+            if reg_ready_map is not None and not reg_ready_map.get(vol, False):
+                continue
+            if first_reg_ready_vol is not None and vol <= first_reg_ready_vol:
+                continue
+            if vol <= qc_exclude_until_vol:
+                continue
+            vols.append(vol)
+            scores.append(score)
+
+    if not scores:
+        return
+
+    motion = np.loadtxt(motion_path)
+    if motion.ndim == 1:
+        motion = motion[None, :]
+
+    motion_vols = np.arange(1, motion.shape[0] + 1)
+    include_motion = np.isin(motion_vols, np.asarray(vols, dtype=int))
+    motion = motion[include_motion]
+    motion_vols = motion_vols[include_motion]
+
+    if motion.shape[0] == 0:
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    axes[0].plot(vols, scores, label="Decoder score (regressed)")
+    axes[0].set_xlabel("Volume")
+    axes[0].set_ylabel("Score")
+    axes[0].legend(loc="upper right")
+
+    for idx in range(min(motion.shape[1], 6)):
+        axes[1].plot(motion_vols, motion[:, idx], label=f"Motion {idx + 1}")
+    axes[1].set_xlabel("Volume")
+    axes[1].set_ylabel("Motion")
+    axes[1].legend(loc="upper right", ncol=3, fontsize=8)
+
+    fig.tight_layout()
+    out_png = run_dir / "qc_scores_motion.png"
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def _append_acquisition_speed(csv_path: Path, row: dict) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "volume_idx",
+                "estimated_trigger_timestamp",
+                "watchdog_timestamp",
+                "analysis_timestamp",
+                "trigger_to_watchdog_s",
+                "watchdog_to_analysis_s",
+            ],
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -> None:
+    from biopac_rt.biopac_receiver import BiopacRetroTSReceiver
+
+    receiver = BiopacRetroTSReceiver(config)
+    receiver.start()
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.1)
+    finally:
+        receiver.stop()
+
+
+def _make_runwise_zscore_scorer(intercept: float, min_volumes: int, sd_floor: float = 1e-6):
+    """DecoderScorer subclass: run-wise voxel z-scoring (Busch et al., 2026, eq. 1), then f = w.z + b.
+
+    For each decoder voxel, the value of volume t is z-scored with the mean and SD of
+    the previous regression-ready volumes 1..t-1 of the *current* run:
+        z_t = (x_t - mean(x_1..x_{t-1})) / sd(x_1..x_{t-1})
+    No reference run is used. f = dot(w, z_t) + b is the decoder log-odds, with b the
+    intercept saved at decoder building (decoder_extras.json).
+
+    Hooks into rt_pipeline without changing it: rt_pipeline calls accumulate_baseline()
+    for every reg_ready volume while baseline_count < n_baseline, then score_from_array().
+    Volumes that are not reg_ready are not scored (NaN) and not added to the statistics.
+    The first `min_volumes` reg_ready volumes only build the statistics (score NaN).
+    """
+    from decoder_score import DecoderScorer
+
+    class RunwiseZScoreScorer(DecoderScorer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.bias = float(intercept)
+            self.n_baseline = 10 ** 12  # keep rt_pipeline calling accumulate_baseline() all run
+            self.rz_n = 0
+            self.rz_mean = None
+            self.rz_m2 = None
+            self._pending = None
+            self._coverage_logged = False
+
+        def accumulate_baseline(self, vol_arr):
+            # Called just before score_from_array() for reg_ready volumes only.
+            self._pending = np.asanyarray(vol_arr, dtype=np.float64)[self.mask].ravel()
+            self.baseline_count += 1
+
+        def finalize_baseline(self):
+            return
+
+        def score_from_array(self, vol_arr):
+            vox, self._pending = self._pending, None
+            if vox is None:
+                return float("nan")  # not reg_ready (or score_original call): not scored, not counted
+            score = float("nan")
+            if self.rz_n >= min_volumes:
+                sd = np.sqrt(self.rz_m2 / (self.rz_n - 1))
+                ok = sd > sd_floor
+                z = np.zeros_like(vox)
+                z[ok] = (vox[ok] - self.rz_mean[ok]) / sd[ok]
+                score = float(np.dot(z, self.w.astype(np.float64)) + self.bias)
+                if not self._coverage_logged:
+                    self._coverage_logged = True
+                    log.info("[ZSCORE] first scored volume: %d/%d decoder voxels have signal (SD > %.0e)",
+                             int(ok.sum()), ok.size, sd_floor)
+                    if ok.mean() < 0.8:
+                        log.warning("[ZSCORE] only %.0f%% of decoder voxels have signal; check FOV/registration.",
+                                    100 * ok.mean())
+            # Welford update with the current volume, so the next volume uses 1..t
+            if self.rz_mean is None:
+                self.rz_mean = np.zeros_like(vox)
+                self.rz_m2 = np.zeros_like(vox)
+            self.rz_n += 1
+            delta = vox - self.rz_mean
+            self.rz_mean += delta / self.rz_n
+            self.rz_m2 += delta * (vox - self.rz_mean)
+            return score
+
+    return RunwiseZScoreScorer
+
+
+def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
+    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+    import rt_pipeline
+
+    settings = dict(settings)
+    runwise = settings.pop("_runwise_zscore")
+    rt_pipeline.DecoderScorer = _make_runwise_zscore_scorer(
+        runwise["intercept"], runwise["min_volumes"]
+    )
+    for key, value in settings.items():
+        if hasattr(REGRESSOR_SETTINGS, key):
+            setattr(REGRESSOR_SETTINGS, key, value)
+    run_rt_pipeline(cfg, score_queue)
+
+
+def _release_mouse_cursor(win) -> None:
+    try:
+        win.mouseVisible = True
+    except Exception as exc:
+        log.warning("Could not show PsychoPy mouse cursor: %s", exc)
+
+    handles = [getattr(win, "winHandle", None)]
+    backend = getattr(win, "backend", None)
+    if backend is not None:
+        handles.append(getattr(backend, "winHandle", None))
+
+    for handle in handles:
+        if handle is None or not hasattr(handle, "set_exclusive_mouse"):
+            continue
+        try:
+            handle.set_exclusive_mouse(False)
+        except Exception as exc:
+            log.warning("Could not release exclusive mouse control: %s", exc)
+
+
+def _build_presentation_window(visual, color):
+    default_size = (1000, 700)
+    window_kwargs = {
+        "size": default_size,
+        "color": color,
+        "units": "pix",
+        "screen": 0,
+        "fullscr": False,
+    }
+    try:
+        import pyglet
+
+        screens = pyglet.canvas.get_display().get_screens()
+
+        if len(screens) > 1:
+            second_screen = screens[1]
+            window_kwargs.update(
+                {
+                    "size": (second_screen.width, second_screen.height),
+                    "screen": 1,
+                    "fullscr": True,
+                }
+            )
+
+    except Exception as exc:
+        log.warning("Could not detect external monitor; using default window size: %s", exc)
+
+    try:
+        win = visual.Window(**window_kwargs)
+    except Exception as exc:
+        # PsychoPy can fail on fullscreen/monitor-size combinations depending on
+        # backend and local monitor settings. Retry with a conservative setup so
+        # the presentation can still run.
+        log.warning("Primary PsychoPy window config failed; retrying with safe defaults: %s", exc)
+        win = visual.Window(
+            size=default_size,
+            color=color,
+            units="pix",
+            screen=0,
+            fullscr=False,
+        )
+    _release_mouse_cursor(win)
+    return win
+
+
+def _append_trial_score(csv_path: Path, row: dict) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "trial",
+                "score_window_start_tr",
+                "score_window_end_tr",
+                "n_scores_used",
+                "trial_score_raw",
+                "trial_score",
+                "score_missing",
+            ],
+        )
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _score_to_percentile(score_raw: float, reference_stats: Optional[dict]) -> float:
+    """Feedback 0-100 = 100 * sigmoid(f) = decoder probability of the target class (%).
+
+    score_raw = f = mean over the trial window of w.z_t + b (log-odds; voxels z-scored
+    within the run). reference_stats is unused (kept for the original call signature).
+    """
+    if not np.isfinite(score_raw):
+        return float("nan")
+    f = float(np.clip(score_raw, -50.0, 50.0))  # avoid exp overflow
+    return float(100.0 / (1.0 + np.exp(-f)))
+
+
+def run_nf_events_presentation(
+    score_queue: Queue,
+    skip_first_trs: int,
+    baseline_trs: int,
+    n_trials: int,
+    iti_trs: int,
+    cue_trs: int,
+    scans_trs: int,
+    delay_trs: int,
+    feedback_trs: int,
+    score_delay: int,
+    tr_seconds: float,
+    trial_scores_path: Path,
+    reference_stats: Optional[dict] = None,
+) -> None:
+    from psychopy import core, event, visual
+
+    stage_sum = iti_trs + cue_trs + scans_trs + delay_trs + feedback_trs
+    if stage_sum <= 0:
+        raise ValueError("At least one per-trial stage duration must be > 0")
+
+    win = _build_presentation_window(visual, color=[-0.004, -0.004, -0.004])
+    waiting_text = visual.TextStim(
+        win,
+        text="Waiting for scanner trigger ('s')...",
+        color="black",
+        height=36,
+    )
+    fixation = visual.ShapeStim(
+        win,
+        vertices="cross",
+        size=[0.1 * win.size[1], 0.1 * win.size[1]],
+        lineWidth=1.0,
+        fillColor="white",
+        lineColor="white",
+    )
+    feedback_circle = visual.Circle(
+        win,
+        radius=1,
+        lineWidth=10,
+        fillColor=[-0.5, 0.7, -0.5],
+        lineColor=[-0.5, 0.7, -0.5],
+    )
+    # Scale circles relative to the presentation window; reference and
+    # feedback share the same maximum radius at a perfect score.
+    max_reference_radius = 0.60 * min(win.size)
+    max_feedback_radius = max_reference_radius
+    max_reference_circle = visual.Circle(
+        win,
+        radius=max_reference_radius,
+        fillColor=[-0.004,-0.004,-0.004], #same as background
+        lineColor=[0.85, 0.85, 0.85],
+        lineWidth=10,
+    )
+    missing_score_text = visual.TextStim(
+        win,
+        text="",
+        color=[0.9, 0.2, 0.2],
+        pos=(0, -int(0.35 * min(win.size))),
+        height=30,
+    )
+
+    max_seen_vol = 0
+    score_by_exp_tr: dict[int, float] = {}
+    first_nonbaseline_tr = baseline_trs + 1
+    first_trigger_timestamp: Optional[float] = None
+    acquisition_speed_path = trial_scores_path.parent / "acquisition_speed_rt.csv"
+
+    def _exp_tr_for_volume(vol_idx: int) -> Optional[int]:
+        if vol_idx <= 0:
+            return None
+        return vol_idx
+
+    def _analysis_tr_for_volume(vol_idx: int) -> Optional[int]:
+        exp_tr = _exp_tr_for_volume(vol_idx)
+        if exp_tr is None:
+            return None
+        analysis_tr = exp_tr - skip_first_trs
+        if analysis_tr <= 0:
+            return None
+        return analysis_tr
+
+    def drain_queue() -> None:
+        nonlocal max_seen_vol
+        try:
+            while True:
+                message = score_queue.get_nowait()
+                vol_idx = int(message.get("volume_idx", 0) or 0)
+                if vol_idx > 0:
+                    max_seen_vol = max(max_seen_vol, vol_idx)
+                if first_trigger_timestamp is not None and vol_idx > 0:
+                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * tr_seconds)
+                    watchdog_timestamp = message.get("watchdog_timestamp")
+                    analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
+                    if watchdog_timestamp is not None and analysis_timestamp is not None:
+                        _append_acquisition_speed(
+                            acquisition_speed_path,
+                            {
+                                "volume_idx": vol_idx,
+                                "estimated_trigger_timestamp": f"{estimated_trigger_timestamp:.6f}",
+                                "watchdog_timestamp": f"{float(watchdog_timestamp):.6f}",
+                                "analysis_timestamp": f"{float(analysis_timestamp):.6f}",
+                                "trigger_to_watchdog_s": f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}",
+                                "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
+                            },
+                        )
+                exp_tr = _analysis_tr_for_volume(vol_idx)
+                if exp_tr is None:
+                    continue
+
+                # Baseline TRs are for normalization / denoising warmup and
+                # must never leak into trial-scoring windows.
+                if exp_tr < first_nonbaseline_tr:
+                    continue
+                # Accept only explicitly regressed samples.
+                if bool(message.get("reg_ready", False)) and message.get("score_raw") is not None:
+                    try:
+                        value = float(message["score_raw"])
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(value):  # NaN during z-score warm-up
+                        score_by_exp_tr[exp_tr] = value
+        except Empty:
+            pass
+
+    # Wait for manual trigger.
+    while True:
+        win.fullscr = True
+        _release_mouse_cursor(win)
+        drain_queue()
+        waiting_text.draw()
+        win.flip()
+        keys = event.getKeys()
+        if "s" in keys:
+            first_trigger_timestamp = time.time()
+            break
+        if "escape" in keys:
+            win.close()
+            return
+        core.wait(0.02)
+
+    current_end = 0
+    schedule: list[dict] = []
+    if baseline_trs > 0:
+        current_end += baseline_trs
+        schedule.append({"trial": 0, "stage": "baseline", "start_tr": 1, "end_tr": current_end})
+
+    trial_windows: dict[int, tuple[int, int]] = {}
+    for trial in range(1, n_trials + 1):
+        iti_start = current_end + 1
+        current_end += iti_trs
+        iti_end = current_end
+
+        cue_start = current_end + 1
+        current_end += cue_trs
+        cue_end = current_end
+
+        scans_start = current_end + 1
+        current_end += scans_trs
+        scans_end = current_end
+
+        delay_start = current_end + 1
+        current_end += delay_trs
+        delay_end = current_end
+
+        fb_start = current_end + 1
+        current_end += feedback_trs
+        fb_end = current_end
+
+        schedule.extend(
+            [
+                {"trial": trial, "stage": "iti", "start_tr": iti_start, "end_tr": iti_end},
+                {"trial": trial, "stage": "cue", "start_tr": cue_start, "end_tr": cue_end},
+                {"trial": trial, "stage": "scans", "start_tr": scans_start, "end_tr": scans_end},
+                {"trial": trial, "stage": "delay", "start_tr": delay_start, "end_tr": delay_end},
+                {"trial": trial, "stage": "feedback", "start_tr": fb_start, "end_tr": fb_end},
+            ]
+        )
+
+        score_start = cue_start + max(0, score_delay)
+        score_start = min(score_start, scans_end)
+        trial_windows[trial] = (score_start, scans_end)
+
+    trial_scores: dict[int, float] = {}
+
+    for stage in schedule:
+        trial = stage["trial"]
+        stage_name = stage["stage"]
+        stage_end = stage["end_tr"]
+
+        while True:
+            drain_queue()
+            current_exp_tr = _analysis_tr_for_volume(max_seen_vol) or 0
+
+            win.color = [-0.004,-0.004,-0.004]  # gray background
+            if stage_name == "cue":
+                fixation.draw()
+            elif stage_name == "feedback" and trial > 0:
+                if trial not in trial_scores:
+                    s_start, s_end = trial_windows[trial]
+                    used = [score_by_exp_tr[tr] for tr in range(s_start, s_end + 1) if tr in score_by_exp_tr]
+                    trial_score_raw = float(np.mean(used)) if used else float("nan")
+                    trial_score = _score_to_percentile(trial_score_raw, reference_stats)
+                    trial_scores[trial] = trial_score
+                    score_missing = int(len(used) == 0)
+                    _append_trial_score(
+                        trial_scores_path,
+                        {
+                            "trial": trial,
+                            "score_window_start_tr": s_start,
+                            "score_window_end_tr": s_end,
+                            "n_scores_used": len(used),
+                            "trial_score_raw": trial_score_raw,
+                            "trial_score": trial_score,
+                            "score_missing": score_missing,
+                        },
+                    )
+                    if score_missing:
+                        log.warning(
+                            "Trial %02d score not received in time for TR window [%d, %d]",
+                            trial,
+                            s_start,
+                            s_end,
+                        )
+                    print(
+                        f"Trial {trial:02d} score over TRs [{s_start}, {s_end}] "
+                        f"from {len(used)} samples: log-odds={trial_score_raw:.4f} prob%={trial_score:.4f}"
+                    )
+
+                t_score = trial_scores[trial]
+                if np.isnan(t_score):
+                    radius = 0.0
+                else:
+                    rating = float(np.clip(t_score, 0.0, 100.0))
+                    radius = max_feedback_radius * (rating / 100.0)
+                feedback_circle.setRadius(radius, log=False)
+                # print(feedback_circle.fillColor)
+                feedback_circle.fillColor = [-0.5, 0.7, -0.5]
+                feedback_circle.lineColor = [-0.5, 0.7, -0.5]
+                # Draw both circles on every feedback frame. Draw the filled
+                # feedback first, then the outline reference on top so both are
+                # visible even when the score reaches the maximum radius.
+                max_reference_circle.draw()
+                feedback_circle.draw()
+                missing_score_text.text = "Score not received in time" if np.isnan(t_score) else ""
+                if missing_score_text.text:
+                    missing_score_text.draw()
+
+            win.flip()
+
+            if "escape" in event.getKeys():
+                win.close()
+                return
+
+            if current_exp_tr >= stage_end:
+                break
+            core.wait(0.02)
+
+    win.close()
+
+
+def main() -> None:
+    mp.set_start_method("spawn", force=True)
+    parser = argparse.ArgumentParser(
+        description="Run rt_pipeline in parallel with an event-based NF PsychoPy presentation."
+    )
+    parser.add_argument("--sub", required=True, help="Subject ID, e.g. 00086")
+    parser.add_argument("--day", required=True, help="Day/session, e.g. 3")
+    parser.add_argument("--run", required=True, help="Run number, e.g. 4")
+    parser.add_argument(
+        "--incoming-root",
+        required=False,
+        default="/home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya",
+        help="Folder where scanner writes DICOMs in real-time.",
+    )
+    parser.add_argument(
+        "--base-data",
+        required=False,
+        default="/SSD2/DecNef_py/data",
+        help="Base preproc data folder (same as offline pipeline).",
+    )
+    parser.add_argument(
+        "--epi-block",
+        type=int,
+        help="Block/run id for the EPI DICOMs inside incoming-root (defaults to --run).",
+    )
+    parser.add_argument(
+        "--wait-epi-min",
+        type=int,
+        default=20,
+        help="Minimum EPI DICOMs to wait for before running offline preproc.",
+    )
+    parser.add_argument(
+        "--max-trs",
+        type=int,
+        default=None,
+        help="Stop the run after this many TRs (or press ESC).",
+    )
+    parser.add_argument(
+        "--decoder-template",
+        required=False,
+        help="Optional decoder template path to override the default.",
+    )
+    parser.add_argument(
+        "--n-trials",
+        type=int,
+        default=20,
+        help="Number of NF trials to run.",
+    )
+    parser.add_argument(
+        "--skip-first-trs",
+        type=int,
+        default=0,
+        help="TRs to skip entirely after trigger (excluded from baseline/trials/scoring).",
+    )
+    parser.add_argument("--baseline-trs", type=int, default=None, help="Baseline duration before trial 1 (TRs).")
+    parser.add_argument("--iti-trs", type=int, default=3, help="ITI duration (TRs).")
+    parser.add_argument("--cue-trs", type=int, default=4, help="Cue duration (TRs).")
+    parser.add_argument("--scans-trs", type=int, default=3, help="Scans-collection duration (TRs).")
+    parser.add_argument("--delay-trs", type=int, default=3, help="Delay duration (TRs).")
+    parser.add_argument("--feedback-trs", type=int, default=3, help="Feedback duration (TRs).")
+    parser.add_argument(
+        "--rs",
+        dest="reference_score_run",
+        help="Ignored (no reference run): voxels are z-scored within each NF run.",
+    )
+    parser.add_argument(
+        "--decoder-extras-json",
+        default=None,
+        help="decoder_extras.json saved with the weights; its 'intercept' is the bias b.",
+    )
+    parser.add_argument(
+        "--decoder-intercept",
+        type=float,
+        default=None,
+        help="Override the intercept b (otherwise read from --decoder-extras-json).",
+    )
+    parser.add_argument(
+        "--zscore-min-volumes",
+        type=int,
+        default=10,
+        help="Reg-ready volumes used to start the run-wise voxel z-scoring before the first score "
+             "(Busch et al.: 10).",
+    )
+    parser.add_argument(
+        "--score-delay",
+        type=int,
+        default=3,
+        help="TRs to wait after cue onset before score-window accumulation starts.",
+    )
+    parser.add_argument(
+        "--biopac-enable",
+        action="store_true",
+        help="Enable BIOPAC RetroTS regressors via TCP/file input.",
+    )
+    parser.add_argument("--biopac-host", default="0.0.0.0", help="Host to bind BIOPAC receiver.")
+    parser.add_argument("--biopac-port", type=int, default=15000, help="Port to bind BIOPAC receiver.")
+    parser.add_argument(
+        "--biopac-timeout",
+        type=float,
+        default=0.3,
+        help="Seconds to wait for physio regressors before zero-fill.",
+    )
+    parser.add_argument(
+        "--biopac-phys-reg",
+        default="RICOR8",
+        choices=["RICOR8", "RVT5", "RVT+RICOR13"],
+        help="Physio regressor family to expect from BIOPAC stream.",
+    )
+    parser.add_argument(
+        "--biopac-handshake",
+        action="store_true",
+        default=True,
+        help="Send a handshake with TR to the BIOPAC streamer.",
+    )
+    parser.add_argument(
+        "--biopac-start-online",
+        action="store_true",
+        default=False,
+        help="Defer BIOPAC receiver start until after offline DICOM processing.",
+    )
+    parser.add_argument(
+        "--biopac-mode",
+        default="tcp",
+        choices=["tcp", "file"],
+        help="BIOPAC input mode: tcp (listen on socket) or file (tail CSV).",
+    )
+    parser.add_argument(
+        "--biopac-file",
+        default=None,
+        help="Path to BIOPAC regressors CSV when using --biopac-mode=file.",
+    )
+    parser.add_argument(
+        "--biopac-poll",
+        type=float,
+        default=0.05,
+        help="Polling interval (seconds) for file-backed BIOPAC buffer.",
+    )
+    parser.add_argument(
+        "--biopac-listener",
+        action="store_true",
+        help="Spawn a dedicated BIOPAC listener process that writes regressors to CSV.",
+    )
+    parser.add_argument(
+        "--settings-file",
+        default=None,
+        help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
+    )
+    parser.add_argument(
+        "--ap-block",
+        type=int,
+        default=None,
+        help="AP b0 block to use",
+    )
+    parser.add_argument(
+        "--pa-block",
+        type=int,
+        default=None,
+        help="PA b0 block to use",
+    )
+
+    args = parser.parse_args()
+    from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
+
+    if args.settings_file:
+        loaded = load_regressor_settings(args.settings_file)
+        REGRESSOR_SETTINGS.update(vars(loaded))
+
+    baseline_trs = (
+        int(args.baseline_trs)
+        if args.baseline_trs is not None
+        else int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
+    )
+    if args.skip_first_trs < 0:
+        raise ValueError("--skip-first-trs must be >= 0")
+    if baseline_trs < 0:
+        raise ValueError("--baseline-trs must be >= 0")
+
+    for name in ["n_trials", "iti_trs", "cue_trs", "scans_trs", "delay_trs", "feedback_trs", "score_delay"]:
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+
+    from biopac_rt.biopac_receiver import BiopacReceiverConfig
+
+    cfg = RTSessionConfig(
+        subject=args.sub,
+        day=args.day,
+        run=args.run,
+        incoming_root=Path(args.incoming_root),
+        base_data=Path(args.base_data),
+        decoder_template=Path(args.decoder_template) if args.decoder_template else None,
+        reference_score_run=args.reference_score_run,
+        ap_block=args.ap_block,
+        pa_block=args.pa_block
+    )
+
+    if args.reference_score_run:
+        log.warning("--rs %s ignored: voxels are z-scored within this run (no reference run).",
+                    args.reference_score_run)
+    cfg.reference_score_run = None
+    cfg.reference_score_stats = None
+
+    # Decoder weights + intercept (bias b from decoder building)
+    if not args.decoder_template:
+        raise ValueError("--decoder-template is required (the weights file matching the intercept).")
+    if not Path(args.decoder_template).exists():
+        raise FileNotFoundError(f"Decoder template not found: {args.decoder_template}")
+    extras = {}
+    if args.decoder_extras_json:
+        extras_path = Path(args.decoder_extras_json)
+        if not extras_path.exists():
+            raise FileNotFoundError(f"Decoder extras JSON not found: {extras_path}")
+        extras = json.loads(extras_path.read_text())
+        if extras.get("scaler_folded", False):
+            raise ValueError("Weights were exported with the scaler folded in; use unfolded weights "
+                             "(voxels are z-scored online).")
+        neg_w = "_negated" in Path(args.decoder_template).name
+        neg_j = "_negated" in extras_path.name
+        if neg_w != neg_j:
+            raise ValueError("Decoder weights and extras JSON do not match (one is '_negated', the other is not).")
+    if args.decoder_intercept is not None:
+        intercept = float(args.decoder_intercept)
+    elif "intercept" in extras:
+        intercept = float(extras["intercept"])
+    else:
+        raise ValueError("No intercept: pass --decoder-extras-json (with 'intercept') or --decoder-intercept.")
+    if args.zscore_min_volumes < 2:
+        raise ValueError("--zscore-min-volumes must be >= 2")
+
+    # Files made by the preparation run (offline preproc in rs/task_realtime_parallel.py).
+    # Fail here, before PsychoPy opens, rather than inside the pipeline process.
+    required = [cfg.rt_unwarped_analysis_ref_epi]
+    if str(REGRESSOR_SETTINGS.analysis_space).lower() == "t1":
+        required.append(cfg.trans_dir / "epi2t1_Composite.h5")
+    missing = [str(p) for p in required if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing preparation-run outputs (run rs_realtime_parallel.py or task_realtime_parallel.py "
+            f"for this day first): {missing}"
+        )
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if space == "mni":
+        required.append(cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        missing = [str(p) for p in required if not p.exists()]
+        if missing:
+            raise FileNotFoundError(f"Missing preparation-run outputs for MNI scoring: {missing}")
+    log.info("[ZSCORE] run-wise voxel z-scoring, start after %d reg-ready volumes; intercept b=%+.4f",
+             args.zscore_min_volumes, intercept)
+    # Reg-ready starts after the baseline TRs; the first score comes zscore_min_volumes later.
+    first_scored_tr = baseline_trs + args.zscore_min_volumes
+    # Scanner volume index of trial 1's first score TR (skipped TRs come before the baseline).
+    first_window_start = args.skip_first_trs + baseline_trs + args.iti_trs + 1 + args.score_delay
+    if first_scored_tr > first_window_start:
+        msg = (f"[ZSCORE] trial 1 score window starts at TR {first_window_start}, but the first z-scored "
+               f"score is expected at TR ~{first_scored_tr}; trial 1 will use fewer TRs (or none). "
+               f"Use --zscore-min-volumes {max(2, first_window_start - baseline_trs)} for a full trial-1 window, "
+               f"or treat trial 1 as practice.")
+        log.warning(msg)
+        print(msg)
+
+    settings_payload = vars(REGRESSOR_SETTINGS).copy()
+    # Baseline TRs define the warmup window for voxel-wise normalization and
+    # denoising startup; keep pipeline normalization in sync with presentation.
+    settings_payload["voxel_norm_ref_volumes"] = max(1, baseline_trs)
+    settings_payload["_runwise_zscore"] = {"intercept": intercept, "min_volumes": int(args.zscore_min_volumes)}
+    settings_payload.update(
+        {
+            "enable_biopac_physio": args.biopac_enable,
+            "biopac_host": args.biopac_host,
+            "biopac_port": args.biopac_port,
+            "biopac_timeout": args.biopac_timeout,
+            "biopac_phys_reg": args.biopac_phys_reg,
+            "biopac_handshake": args.biopac_handshake,
+            "biopac_start_online_only": args.biopac_start_online,
+            "biopac_mode": args.biopac_mode,
+            "biopac_file": Path(args.biopac_file) if args.biopac_file else None,
+            "biopac_poll_interval": args.biopac_poll,
+        }
+    )
+
+    run_dir = cfg.rt_work_dir
+    trial_scores_path = run_dir / "trial_scores.csv"
+    _merge_session_metadata(
+        run_dir,
+        {
+            "psychopy": {
+                "script": "rt_nf_events_prob_parallel.py",
+                "feedback": "100*sigmoid(mean_trial(w.z_t) + b); z_t: voxel z-score within run vs volumes 1..t-1",
+                "zscore_min_volumes": int(args.zscore_min_volumes),
+                "decoder_intercept": intercept,
+                "decoder_extras_json": args.decoder_extras_json,
+                "n_trials": args.n_trials,
+                "skip_first_trs": args.skip_first_trs,
+                "baseline_trs": baseline_trs,
+                "iti_trs": args.iti_trs,
+                "cue_trs": args.cue_trs,
+                "scans_trs": args.scans_trs,
+                "delay_trs": args.delay_trs,
+                "feedback_trs": args.feedback_trs,
+                "score_delay": args.score_delay,
+                "trial_scores_csv": str(trial_scores_path),
+                "decoder_template": str(args.decoder_template) if args.decoder_template else None,
+            }
+        },
+    )
+
+    ctx = mp.get_context("spawn")
+    score_queue = ctx.Queue(maxsize=200)
+    biopac_process = None
+    biopac_stop = None
+
+    if args.biopac_listener:
+        if not args.biopac_enable:
+            raise ValueError("--biopac-listener requires --biopac-enable")
+        if args.biopac_mode != "file":
+            raise ValueError("--biopac-listener requires --biopac-mode=file")
+        biopac_output = settings_payload["biopac_file"] or (run_dir / "biopac_regressors_rx.csv")
+        settings_payload["biopac_file"] = biopac_output
+        biopac_stop = ctx.Event()
+        expected_regressors = {"RICOR8": 8, "RVT5": 5, "RVT+RICOR13": 13}.get(args.biopac_phys_reg, 8)
+        biopac_cfg = BiopacReceiverConfig(
+            host=args.biopac_host,
+            port=args.biopac_port,
+            timeout=args.biopac_timeout,
+            expected_regressors=expected_regressors,
+            handshake_tr=REGRESSOR_SETTINGS.TR if args.biopac_handshake else None,
+            subject=args.sub,
+            day=args.day,
+            run=args.run,
+            output_path=biopac_output,
+        )
+        biopac_process = ctx.Process(target=_run_biopac_listener, args=(biopac_cfg, biopac_stop))
+        biopac_process.start()
+
+    pipeline_process = ctx.Process(target=_run_pipeline_with_settings, args=(cfg, score_queue, settings_payload))
+    pipeline_process.start()
+
+    try:
+        run_nf_events_presentation(
+            score_queue=score_queue,
+            skip_first_trs=args.skip_first_trs,
+            baseline_trs=baseline_trs,
+            n_trials=args.n_trials,
+            iti_trs=args.iti_trs,
+            cue_trs=args.cue_trs,
+            scans_trs=args.scans_trs,
+            delay_trs=args.delay_trs,
+            feedback_trs=args.feedback_trs,
+            score_delay=args.score_delay,
+            tr_seconds=float(REGRESSOR_SETTINGS.TR),
+            trial_scores_path=trial_scores_path,
+            reference_stats=cfg.reference_score_stats,
+        )
+    finally:
+        if pipeline_process.is_alive():
+            pipeline_process.terminate()
+        pipeline_process.join(timeout=5)
+        if biopac_stop is not None:
+            biopac_stop.set()
+        if biopac_process is not None:
+            biopac_process.join(timeout=5)
+        _plot_qc(run_dir)
+
+
+if __name__ == "__main__":
+    main()

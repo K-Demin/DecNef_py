@@ -1,0 +1,46 @@
+
+python rs_realtime_parallel.py \
+    --sub 00088 \
+    --day 1 \
+    --run 4 \
+    --wait-epi-min 20 \
+    --ap-block 2 \
+    --pa-block 3 \
+    --epi-block 4 \
+    --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260810.20260810_00085.OLGA/ \
+    --settings-file olga_settings.json \
+    --base-data /SSD2/DecNef_py/data \
+    --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz \
+    --max-trs 600
+
+
+python rt_nf_events_parallel.py \
+   --sub 00088 \
+   --day 1 \
+   --run 10 \
+   --ap-block 8\
+   --pa-block 9 \
+   --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260810.20260810_00085.OLGA/  \
+   --base-data /SSD2/DecNef_py/data \
+   --baseline-trs 30 \
+   --n-trials 40 \
+   --iti-trs 3 \
+   --cue-trs 4 \
+   --scans-trs 3 \
+   --delay-trs 3 \
+   --feedback-trs 3 \
+   --score-delay 3 \
+   --settings-file olga_settings.json \
+   --rs 4 \
+   --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz\
+
+
+   python rt_robot_parallel.py \
+  --sub 00088 --day 1 --run 13 \
+  --ap-block 11 --pa-block 12 \
+  --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20260810.20260810_00085.OLGA/  \
+  --base-data /SSD2/DecNef_py/data \
+  --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-01_ses-01_face-scene_sig_decoder.nii.gz\
+  --rs 4 \
+  --max-trs 670 \
+  --settings-file sara_settings.json

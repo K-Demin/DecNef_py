@@ -38,8 +38,11 @@ def get_game_params(params: dict) -> dict:
         "performance_criteria",
         "use_aggressive_leveling",
         "block_pre_delay",
+        "win_type",
+        "refresh_rate",
     ]
-    [game_params.pop(i) for i in var_list]
+    for name in var_list:
+        game_params.pop(name, None)
 
     return game_params
 
@@ -80,7 +83,7 @@ def setup_logging(log_file: str | Path | None = None):
     return logger
 
 
-def get_window_info(win, logger):
+def get_window_info(win, logger, refresh_rate=None):
     """Get window configuration and frame rate.
 
     Args:
@@ -101,6 +104,15 @@ def get_window_info(win, logger):
     logger.info(f"actual window size: {actual[0]}x{actual[1]}")
     logger.info(f"screen scaling: {scale_factor:.2f}x ({scaling_label})")
 
+    if refresh_rate is not None:
+        fps = float(refresh_rate)
+        if fps <= 0:
+            raise ValueError("refresh_rate must be greater than zero")
+        logger.info(f"using configured frame rate: {fps:.1f} Hz")
+        return configured, actual, fps
+
+    logger.info("measuring display frame rate...")
+    print("[BrainPong] Measuring display refresh rate...", flush=True)
     fps = win.getActualFrameRate()
     if fps is None or fps <= 0:
         fps = 60.0

@@ -1,20 +1,15 @@
-# Sample configuration for a pilot
-# 
-# These parameters configure a 6s paddle control lag paired with a 6-7s receive 
-# speed, with a 2-minute active trial duration and 6s between trials.
-# point_increment and paddle_size will be ignored if levels are provided. 
-#
-# Note that size and speed parameters are in normalized units; these values are 
-# normalized to window size and therefore maintain the same relative size/speed 
-# invariant of window size
-# ----------------------------------------------------------------------------
+# Binary sign controller pilot. Paddle height is visual only and fixed across levels.
+# Brain input uses the latest normalized TR, z > 0 => TOP; otherwise BOTTOM.
+# Keyboard behavior uses a fixed 6 s delay; NF has no additional delay.
+# Legacy paddle_lag/response settings are accepted but bypassed by binary control.
+# Speeds and trial timing retain the existing values (speeds are per display frame).
 
 # Window settings
 win_size: [1200, 800]
 fullscr: true
 
 # Input configuration
-#input_method: press
+keyboard_delay_sec: 6.0 # keyboard mode only: 1=TOP, 2=BOTTOM after 6 s
 paddle_response_mode: hold # hrf or hold
 
 # Difficulty and scoring
@@ -25,7 +20,7 @@ performance_criteria: 0.75
 use_aggressive_leveling: true
 
 # Paddle settings
-paddle_size: 0.3
+paddle_size: 0.8
 paddle_lag: 360
 step_size: 5 #0.5 for 'press' mode
 
@@ -36,10 +31,14 @@ receive_speed: 0.0025
 
 # Timing parameters
 reset_timer: 0
-reset_delay: 2.0
+reset_delay: 1.0
 time_limit: 120.0 #2 min
 pre_delay: 6
 block_pre_delay: 30
 
 # Opponent settings
 opponent_handicap: 0
+agent_miss_prob: 0.95
+agent_miss_mode: random # random = independent per agent attempt; adaptive = tracks target rate across attempts
+agent_miss_offset: 0.15
+agent_tracking_noise: 0.0

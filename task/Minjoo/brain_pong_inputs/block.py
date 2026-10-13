@@ -7,6 +7,7 @@ from psychopy import visual
 
 from .utils import setup_logging, get_window_info
 from .pong import Pong
+from .binary import BalancedTargets
 
 
 WIN_SIZE = [1200, 800]
@@ -29,9 +30,13 @@ def save_block_data(data, fname):
             "rallies": "uint16",
             "start_points": "uint16",
             "end_points": "uint16",
+            "agent_points": "uint16",
             "total_hits": "uint16",
             "total_possible": "uint16",
             "performance": "float32",
+            "agent_miss_prob": "float32",
+            "n_rally_wins": "uint16",
+            "n_rally_total": "uint16",
         }
     )
     df.to_csv(fname, index=False, sep="\t")
@@ -76,6 +81,7 @@ class TrialBlock:
         use_aggressive_leveling: bool = False,
         game_runner: Callable | None = None,
         show_instructions: bool = True,
+        refresh_rate: float | None = None,
     ):
         # params
         self.block_num = block_num
@@ -121,9 +127,17 @@ class TrialBlock:
         self.block_instruction = f"\nBLOCK: {block_num} POINTS: {init_points}\n"
 
         self.game_params = game_params
+        if game_params and game_params.get("input_method") == "keyboard":
+            delay = float(game_params.get("keyboard_delay_sec", 6.0))
+            self.block_instruction += (
+                f"\n1: TOP    2: BOTTOM\nResponses appear {delay:g} seconds after each key press.\n"
+                "Press SPACE to start.\n"
+            )
 
-        _, _, refresh_rate = get_window_info(self.win, self.logger)
-        self.refresh_rate = refresh_rate
+        _, _, measured_refresh_rate = get_window_info(
+            self.win, self.logger, refresh_rate=refresh_rate
+        )
+        self.refresh_rate = measured_refresh_rate
 
         self.logger.info("=== PARAMS: ===")
         self.logger.info(f"block_num: {self.block_num}")
@@ -142,15 +156,14 @@ class TrialBlock:
         if self._apply_levels:
             self.block_instruction += f"LEVEL: {self.init_level}\n"
 
-    def _adjust_difficulty(self, performance: float):
+    def _adjust_difficulty(self, player_won):
         if not self._apply_levels:
             return
 
-        if performance > self.performance_criteria:
+        if player_won is True:
             self.current_level = min(self.current_level + 1, self._max_level)
-        else:
-            if self.use_aggressive_leveling:
-                self.current_level = max(self.current_level - 1, 0)
+        elif player_won is False:
+            self.current_level = max(self.current_level - 1, 0)
 
     def run(self):
         """Run all trials in the block.
@@ -163,20 +176,22 @@ class TrialBlock:
         self.total_points = self.init_points
         self.current_level = self.init_level
         block_data = []
+        target_schedule = self.game_params.get("target_schedule") or BalancedTargets()
 
         trial_pfx = f"block{self.block_num:02d}_trial"
 
         for trial in range(1, self.n_trials + 1):
             self.logger.info(f"=== NEW TRIAL: {trial}/{self.n_trials} ===")
             game_params = self.game_params.copy()
+            game_params["target_schedule"] = target_schedule
+            game_params["run_id"] = game_params.get("run_id", str(self.block_num))
+            game_params["trial_id"] = trial
+            trial_start_points = 0
 
             if self._apply_levels:
                 game_params["level"] = self.current_level
-                game_params["paddle_size"] = self.level_dict[self.current_level][
-                    "paddle_size"
-                ]
-                game_params["point_increment"] = self.level_dict[self.current_level][
-                    "point_increment"
+                game_params["agent_miss_prob"] = self.level_dict[self.current_level][
+                    "agent_miss_prob"
                 ]
 
             if self.block_pre_delay and (trial == 1):
@@ -186,7 +201,7 @@ class TrialBlock:
                 self.win,
                 self.logger,
                 save_file=Path(self.data_dir, f"{trial_pfx}{trial:02d}.tsv"),
-                init_points=self.total_points,
+                init_points=trial_start_points,
                 **game_params,
             )
             if self.game_runner is None:
@@ -203,7 +218,21 @@ class TrialBlock:
                     self.refresh_rate,
                 )
 
-            # fill in trial data
+            if game.player_points > game.agent_points:
+                player_won = True
+            elif game.player_points < game.agent_points:
+                player_won = False
+            else:
+                player_won = None
+
+            start_level = game_params["level"] if self._apply_levels else self.current_level
+            agent_miss_prob = (
+                self.level_dict[start_level]["agent_miss_prob"]
+                if self._apply_levels
+                else None
+            )
+            self._adjust_difficulty(player_won)
+
             data = {
                 "block_number": self.block_num,
                 "trial_number": trial,
@@ -211,16 +240,31 @@ class TrialBlock:
                 "paddle_size": game_params["paddle_size"],
                 "start_time": game.start_time,
                 "rallies": game.rally,
-                "start_points": self.total_points,
-                "end_points": game.points,
+                "start_points": trial_start_points,
+                "end_points": game.player_points,
+                "agent_points": game.agent_points,
+                "player_won": player_won,
+                "agent_miss_prob": agent_miss_prob,
+                "n_rally_wins": sum(1 for w in game.rally_outcomes if w),
+                "n_rally_total": len(game.rally_outcomes),
                 "total_possible": game.total_possible,
                 "total_hits": game.total_hits,
                 "performance": game.performance,
+                "participant_hits": game.participant_hits,
+                "participant_misses": game.participant_misses,
+                "participant_hit_rate": game.performance,
+                "opponent_hits": game.agent_hits,
+                "opponent_misses": game.agent_misses,
+                "participant_score": game.player_points,
+                "opponent_score": game.agent_points,
+                "round_result": "WIN" if player_won is True else ("LOSS" if player_won is False else "DRAW"),
+                "level_before": start_level,
+                "level_after": self.current_level,
             }
             block_data.append(data)
 
-            self._adjust_difficulty(game.performance)
-            self.total_points = game.points
+            # Kept for compatibility with callers, but each new trial starts at 0.
+            self.total_points = game.player_points
 
             if not completed:
                 self.logger.info("esc - ending experiment")

@@ -202,6 +202,34 @@ class BrainPongScoreAdapter:
         raise ValueError(f"Unsupported feedback_transform={self.feedback_transform!r}")
 
 
+class BinaryBrainPongScoreAdapter(BrainPongScoreAdapter):
+    """Latest reference-normalized TR, with no delay, averaging or sign inversion.
+
+    Continuous raw/z values remain in the state. Only feedback_value is binary.
+    Legacy feedback configuration cannot change this pilot's control policy.
+    """
+
+    def __init__(self, decoder_cfg: dict[str, Any], feedback_cfg: dict[str, Any]):
+        super().__init__(decoder_cfg, {
+            **feedback_cfg,
+            "zscore_mode": "reference",
+            "initial_ignore_volumes": 0,
+            "feedback_delay_volumes": 0,
+            "smoothing_window": 1,
+            "feedback_transform": "identity",
+        })
+
+    def direction_sign(self) -> float:
+        return 1.0
+
+    def current_state(self, now: Optional[float] = None) -> BrainPongScoreState:
+        state = super().current_state(now)
+        state.feedback_value = 1.0 if state.score_z is not None and state.score_z > 0 else -1.0
+        state.details["controller"] = "binary_sign"
+        state.details["threshold"] = 0.0
+        return state
+
+
 class PaddleDynamics:
     """Update a normalized paddle position from signed feedback."""
 

@@ -1090,7 +1090,15 @@ class DICOMHandler(FileSystemEventHandler):
                 kind=str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")),
                 every_n=int(getattr(REGRESSOR_SETTINGS, "volume_stream_every_n", 1)),
                 max_queue=int(getattr(REGRESSOR_SETTINGS, "volume_stream_max_queue", 2)),
-                window_title=str(getattr(REGRESSOR_SETTINGS, "volume_stream_window_title", "RT volume QC")),
+                window_title=str(
+                    getattr(
+                        REGRESSOR_SETTINGS,
+                        "volume_stream_window_title",
+                        "RT volume QC",
+                    )
+                ),
+                window_x=int(getattr(REGRESSOR_SETTINGS, "volume_stream_window_x", 50)),
+                window_y=int(getattr(REGRESSOR_SETTINGS, "volume_stream_window_y", 50)),
             ),
             logger=log,
         )

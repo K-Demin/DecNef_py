@@ -15,6 +15,7 @@ import time
 from typing import Optional
 
 import numpy as np
+from scipy.stats import norm
 
 from rt_global_settings import load_regressor_settings
 import rs_pca_runtime as pca_rt
@@ -395,36 +396,426 @@ def _release_mouse_cursor(win) -> None:
 # scaled to pixels so it stays centered on any monitor.
 # ==========================================================================
 
-# ---- robot tuning constants (safe to tune) --------------------------------
-# OUR level (power meter): meter fills at the (delayed) line value per second.
-OUR_LEVEL_COST = 3500.0     # meter units for the first level-up
-COST_GROWTH = 0.20          # each level costs this much more (0 = constant)
-# ENEMY level (win streak):
-WIN_STREAK = 3              # consecutive wins that level the enemy up
-# fight strength (both sides):
-STR_BASE = 50.0             # strength at level 1
-STR_STEP = 12.0             # strength gained per level
-GAME_HP = 100.0
-DMG_K = 0.22                # damage per hit = DMG_K * strength
-ATTACK_INTERVAL = 0.5       # seconds between hits
-DMG_JITTER = 0.30           # +/- randomness per hit (equal levels ~= chance)
-MAX_LEVEL = 12              # safety cap for both sides
+# ---- block-design game constants (safe to tune) ---------------------------
+# A run is: rest lead, then N_ROUNDS x (ACTIVE_S active + REST_S rest).
+ACTIVE_S = 45.0
+REST_S = 15.0                # line still shown and scored; robots still; meter at 50
+N_ROUNDS_DEFAULT = 6
+RESULT_S = 3.0               # "ROUND WON!/LOST" shown at the start of each rest, then "REST"
+
+# Meter: restarts at METER_START every round. Every second it moves by
+# METER_GAIN x (displayed - 50), clipped to 0..100 -- up while the line is
+# above the midline, down while it is below. It sets YOUR robot's size and
+# the strength of every hit it lands.
+METER_START = 50.0
+METER_GAIN = 0.10
+
+# Fight: both robots hit every ATTACK_INTERVAL s for the whole active period.
+# Your hit = the meter at that moment; the enemy's hit = ENEMY_STRENGTH[level].
+# Each hit is multiplied by U(1-DMG_JITTER, 1+DMG_JITTER). Whoever deals more
+# total damage over the active period wins the round.
+ATTACK_INTERVAL = 1.2
+DMG_JITTER = 0.30
+
+# Enemy level = staircase in blocks of up to 3 rounds ("best of 3"). Within a
+# block, the first side to reach LEVEL_STREAK decides it: LEVEL_STREAK round
+# wins -> level up, LEVEL_STREAK round losses -> level down, then a new block
+# starts. WW, WLW, LWW = up; LL, LWL, WLL = down. So every block ends with a
+# level change, after 2 or 3 rounds. The level and the running block tally
+# carry over between runs of the same day (robot_level_state.json in the day
+# folder); each new day starts at level 1.
+# (Checked by simulation against the old 2-in-a-row rule: same settled levels
+# and accuracy, ~2.3 instead of ~2.0 level changes per run.)
+N_LEVELS = 10
+LEVEL_STREAK = 2
+ENEMY_STRENGTH = {1: 38.7, 2: 44.4, 3: 49.9, 4: 55.7, 5: 61.3,
+                  6: 67.0, 7: 72.1, 8: 76.7, 9: 80.5, 10: 83.1}
+# Calibration, by simulation with realistic noise: t(5) innovations matched to
+# 4 subjects' measured display SD 28 / 3.6% pinned and z MAD-SD 1.375, lag-1
+# autocorrelation 0.35 (ASSUMED -- run measure_autocorr.py), arcsine scale 1.0,
+# no smoothing, 8 runs x 6 rounds per day.
+#   Each level L is set so that a participant whose mean displayed score is
+#   45 + 2.5*(L-1) wins exactly 50% of rounds against it. The level a
+#   participant settles at therefore tracks their mean: 50 -> 3, 52.5 -> 4,
+#   57.5 -> 6, 67.5 -> 10. Averaged over the last 4 runs of a day, a
+#   participant at chance ends at 3.01 (L2/L3/L4 = 22/55/22%).
+#   Re-simulate if METER_GAIN, DMG_JITTER, ATTACK_INTERVAL, the mapping or the
+#   smoothing change -- the strengths are only valid for these settings.
+
 # trace geometry:
 WINDOW_SEC = 14.0           # seconds of signal across the screen
 N_TRACE = 240
 SAMPLE_DT = WINDOW_SEC / N_TRACE
 
 
-def our_cost(lvl):
-    return OUR_LEVEL_COST * (1 + COST_GROWTH * (lvl - 1))
+def _map_z_to_display(z, mapping, z_center=50.0, z_gain=10.0, scale=1.0):
+    """
+    Map a (possibly smoothed) z-score onto the 0-100 line.
+
+    arcsine (default)
+        arcsin(sqrt(norm.cdf(z/scale))) * 2/pi * 100.
+        Variance-stabilizing transform of the percentile. Compared with a
+        plain cdf it gives up some steepness at the centre in exchange for
+        far less pinning at 0 and 100. Measured over 4 subjects (13k volumes,
+        per TR, no smoothing): SD 28, 3.6% pinned, 25 display units per z at
+        the centre, against the cdf's SD 34, 13.1% pinned, 39 units per z.
+        `scale` divides z first; 1.0 is plain arcsine, larger values shrink
+        the spread further (1.2 roughly halves the pinning).
+
+    cdf
+        norm.cdf(z/scale) * 100 -- the displayed number is a percentile
+        against the resting-state reference. Same mapping as
+        rt_nf_events_parallel.py, so event and continuous scores are directly
+        comparable. Note the event task feeds it a 4-TR mean, which is why it
+        does not pin there; per TR it pins ~13% of the time at the measured
+        z spread of ~1.4, so use scale ~2 if you pick this.
+    """
+    zz = float(z) / max(1e-6, float(scale))
+    if mapping == "cdf":
+        return max(0.0, min(100.0, float(norm.cdf(zz)) * 100.0))
+    p = min(1.0, max(0.0, float(norm.cdf(zz))))
+    return max(0.0, min(100.0, float(np.arcsin(np.sqrt(p))) * (2.0 / np.pi) * 100.0))
 
 
-def strength(lvl):
-    return STR_BASE + STR_STEP * (lvl - 1)
+def robot_scale(power, base):
+    """Robot size from fighting power on the 0-100 scale. Both robots use the
+    same rule, so equal power means equal size: your robot looking bigger than
+    the enemy means you are currently out-hitting it."""
+    return base * (0.55 + 0.9 * max(0.0, min(100.0, float(power))) / 100.0)
 
 
-def scale_for(lvl, base):
-    return base * min(0.72 + 0.12 * (lvl - 1), 2.2)
+def _wav_with_channels(src, n_ch, out_dir):
+    """Write a copy of `src` with exactly `n_ch` channels, return its path.
+
+    Mono -> stereo duplicates the channel; stereo -> mono averages them.
+    Uses the stdlib `wave` module, so it only handles PCM wav (what
+    make_jingle.py writes). Returns None if the file cannot be converted.
+    """
+    import wave
+    try:
+        with wave.open(str(src), "rb") as w:
+            ch, sw, sr, n = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+            raw = w.readframes(n)
+        if ch == n_ch:
+            return Path(src)
+        dt = {1: np.uint8, 2: np.int16, 4: np.int32}.get(sw)
+        if dt is None:
+            return None
+        a = np.frombuffer(raw, dtype=dt).reshape(-1, ch).astype(np.float64)
+        if n_ch == 1:
+            out = a.mean(axis=1, keepdims=True)
+        elif n_ch <= ch:
+            out = a[:, :n_ch]
+        else:
+            # pad up: repeat the existing channels so every output channel has
+            # audio and the frame count (and so the duration) is unchanged
+            idx = [i % ch for i in range(n_ch)]
+            out = a[:, idx]
+        out = out.astype(dt)
+        dest = Path(out_dir) / (Path(src).stem + "_%dch.wav" % n_ch)
+        with wave.open(str(dest), "wb") as w:
+            w.setnchannels(n_ch); w.setsampwidth(sw); w.setframerate(sr)
+            w.writeframes(out.ravel().tobytes())
+        return dest
+    except Exception as exc:
+        log.warning("[AUDIO] Could not convert %s to %d channel(s): %s", src, n_ch, exc)
+        return None
+
+
+def _probe_output_channels_ptb():
+    """Output channel counts reported by PsychToolbox, if it is installed."""
+    from psychtoolbox import audio
+    return [int(d["NrOutputChannels"]) for d in audio.get_devices()
+            if int(d.get("NrOutputChannels", 0)) > 0]
+
+
+def _probe_output_channels_sd():
+    """Output channel counts reported by sounddevice, if it is installed."""
+    import sounddevice as sd
+    out = []
+    try:
+        out.append(int(sd.query_devices(kind="output")["max_output_channels"]))
+    except Exception:
+        pass
+    for d in sd.query_devices():
+        if int(d.get("max_output_channels", 0)) > 0:
+            out.append(int(d["max_output_channels"]))
+    return out
+
+
+class _AplaySound:
+    """A Sound-like object (.play() / .stop()) that pipes a wav straight to
+    ALSA with `aplay`, bypassing PsychoPy, PortAudio and PsychToolbox.
+
+    Needed on machines where PortAudio cannot open the card the headphones are
+    actually on -- on the SIN RT PC it only enumerates the NVIDIA HDMI outputs
+    and the USB CODEC, never the motherboard analog jack, so PsychoPy cannot
+    reach the headphone amp even though `aplay -D plughw:0,0` plays fine.
+
+    The jingle is background music, not a timed stimulus, so the extra ~20-50 ms
+    of process-start latency does not matter. Volume is baked into the samples
+    because aplay has no volume control of its own.
+    """
+
+    def __init__(self, cmd, device):
+        self.cmd = cmd
+        self.device = device
+        self.proc = None
+        self.pgid = None
+
+    def play(self):
+        import os
+        import subprocess
+        self.stop()
+        # a shell loop so the music continues even if a round overruns the
+        # pre-built file; start_new_session puts the shell and every aplay it
+        # spawns in their own process group, so stop() can kill all of them
+        self.proc = subprocess.Popen(
+            ["/bin/sh", "-c", self.cmd],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            self.pgid = os.getpgid(self.proc.pid)
+        except Exception:
+            self.pgid = None
+
+    def stop(self):
+        import os
+        import signal
+        p, pgid = self.proc, self.pgid
+        self.proc = self.pgid = None
+        if p is None:
+            return
+        # The shell may be between two aplay calls, so killing it is not enough
+        # -- and if it survives the TERM it starts another one. Signal the whole
+        # group, then make sure nothing is left.
+        def killgrp(sig):
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, sig)
+                else:
+                    p.send_signal(sig)
+                return True
+            except Exception:
+                return False
+
+        killgrp(signal.SIGTERM)
+        try:
+            p.wait(timeout=1.0)
+        except Exception:
+            pass
+        for _ in range(10):                      # up to ~0.5 s
+            if pgid is None or not killgrp(0):   # signal 0 = does the group exist
+                break
+            time.sleep(0.05)
+        else:
+            killgrp(signal.SIGKILL)
+            try:
+                p.wait(timeout=1.0)
+            except Exception:
+                pass
+
+    # PsychoPy's Sound has these; the task never calls them, but be safe
+    def setVolume(self, *a, **k):
+        pass
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
+
+
+def _aplay_jingle(jingle_path, volume, out_dir, device, active_s=None):
+    """Build the looped, volume-scaled wav and return (_AplaySound, how)."""
+    import shlex
+    import shutil
+    import subprocess
+    import tempfile
+    import wave
+
+    if shutil.which("aplay") is None:
+        raise RuntimeError("aplay not found on this machine (install alsa-utils)")
+    dev = device or "default"
+
+    with wave.open(str(jingle_path), "rb") as w:
+        ch, sw, sr, n = (w.getnchannels(), w.getsampwidth(),
+                         w.getframerate(), w.getnframes())
+        raw = w.readframes(n)
+    if sw != 2:
+        raise RuntimeError("aplay backend needs a 16-bit wav, got %d-bit" % (sw * 8))
+    a = np.frombuffer(raw, dtype=np.int16).reshape(-1, ch)
+
+    # enough repeats to cover one active period with slack, so a round plays
+    # through without the seam of a restart
+    want_s = float(active_s or ACTIVE_S) + 15.0
+    reps = max(1, int(np.ceil(want_s / (n / float(sr)))))
+    v = float(np.clip(volume, 0.0, 1.0))
+    scaled = np.clip(a.astype(np.float64) * v, -32768, 32767).astype(np.int16)
+    # Keep the big looped file out of the run folder (it is ~12 MB and is not
+    # data), and reuse it between runs instead of rebuilding it every time.
+    cache = Path(tempfile.gettempdir()) / (
+        "robot_%s_v%03d_x%d.wav" % (Path(jingle_path).stem, int(round(v * 100)), reps))
+    if not (cache.is_file() and cache.stat().st_size > 44):
+        out = np.tile(scaled, (reps, 1))
+        tmp = cache.with_suffix(".tmp.wav")
+        with wave.open(str(tmp), "wb") as w:
+            w.setnchannels(ch); w.setsampwidth(sw); w.setframerate(sr)
+            w.writeframes(out.ravel().tobytes())
+        tmp.replace(cache)
+    dest = cache
+
+    # Check the device opens now, while an error can still be shown, instead of
+    # finding out mid-run. This plays 0.1 s of SILENCE: `--dump-hw-params` is
+    # not usable for this, because on some alsa-utils versions it dumps the
+    # parameters and then goes on to play the whole file.
+    sil = Path(tempfile.gettempdir()) / ("robot_silence_%dhz_%dch.wav" % (sr, ch))
+    if not sil.is_file():
+        with wave.open(str(sil), "wb") as w:
+            w.setnchannels(ch); w.setsampwidth(sw); w.setframerate(sr)
+            w.writeframes(np.zeros((int(sr * 0.1), ch), dtype=np.int16).ravel().tobytes())
+    try:
+        probe = subprocess.run(["aplay", "-q", "-D", dev, str(sil)],
+                               capture_output=True, text=True, timeout=8)
+        rc, err = probe.returncode, (probe.stderr or "").strip().splitlines()
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("aplay did not return within 8 s on %s -- the device "
+                           "is probably blocked by another program" % dev)
+    if rc != 0:
+        raise RuntimeError("aplay could not open %s: %s"
+                           % (dev, err[-1] if err else "exit code %d" % rc))
+
+    cmd = 'while :; do aplay -q -D %s %s || exit 1; done' % (
+        shlex.quote(dev), shlex.quote(str(dest)))
+    snd = _AplaySound(cmd, dev)
+    return snd, "aplay -D %s, %d ch, %d x %.1f s (volume baked in at %.2f)" % (
+        dev, ch, reps, n / float(sr), v)
+
+
+def _load_jingle(jingle_path, volume, out_dir, audio_lib=None, audio_device=None,
+                 active_s=None):
+    """Open the looping jingle, trying the variants that differ between audio
+    devices, and return (sound_object, description) or (None, error_text).
+
+    PsychToolbox opens the output device with a fixed number of channels and
+    refuses a file that does not match ("Number of columns of audio data matrix
+    doesn't match number of output channels"). Which count it picks depends on
+    the machine, so instead of guessing we try the file as it is, as mono and
+    as stereo, under each requested audio backend, and keep the first that
+    loads.
+    """
+    import importlib
+
+    if audio_lib == "aplay":
+        try:
+            return _aplay_jingle(jingle_path, volume, out_dir, audio_device, active_s)
+        except Exception as exc:
+            log.error("[AUDIO] aplay backend failed: %s", exc)
+            return None, "aplay: %s" % exc
+
+    from psychopy import prefs
+
+    libs = [audio_lib] if audio_lib else ["ptb", "sounddevice", "pygame"]
+
+    # Channel counts to try: mono, stereo, then whatever the output devices
+    # actually report (an HDMI or surround-capable card can want 4, 6 or 8).
+    counts = [1, 2]
+    for probe in (_probe_output_channels_ptb, _probe_output_channels_sd):
+        try:
+            for c in probe():
+                if 0 < c <= 8 and c not in counts:
+                    counts.append(c)
+        except Exception:
+            pass
+    log.info("[AUDIO] Channel counts to try, in order: %s", counts)
+
+    attempts = [(jingle_path, {}, "as-is")]
+    for c in counts:
+        conv = _wav_with_channels(jingle_path, c, out_dir)
+        if conv is None:
+            continue
+        kw = {"stereo": False} if c == 1 else ({"stereo": True} if c == 2 else {})
+        attempts.append((conv, kw, "%d channel%s" % (c, "" if c == 1 else "s")))
+    last = "no audio backend available"
+
+    for lib in libs:
+        try:
+            prefs.hardware["audioLib"] = [lib]
+            if audio_device:
+                prefs.hardware["audioDevice"] = audio_device
+            import psychopy.sound as psound
+            importlib.reload(psound)
+        except Exception as exc:
+            last = "%s: %s" % (lib, exc)
+            log.warning("[AUDIO] backend %s unavailable: %s", lib, exc)
+            continue
+        for path, kwargs, how in attempts:
+            try:
+                snd = psound.Sound(str(path), loops=-1, volume=float(volume), **kwargs)
+                return snd, "%s, %s (%s)" % (lib, how, Path(path).name)
+            except Exception as exc:
+                last = "%s / %s: %s" % (lib, how, exc)
+                log.info("[AUDIO] %s with %s failed: %s", lib, how, exc)
+    return None, last
+
+
+def _load_level_state(path, start_level=None) -> dict:
+    """Enemy level + current block tally carried between runs of the same day."""
+    state = {"level": 1, "block_wins": 0, "block_losses": 0, "last_run": None}
+    if start_level is not None:
+        state["level"] = int(start_level)
+        log.info("[LEVEL] --start-level %d given: ignoring any saved state.", state["level"])
+    elif path is not None and Path(path).exists():
+        try:
+            saved = json.loads(Path(path).read_text())
+            for k in ("level", "block_wins", "block_losses", "last_run"):
+                if k in saved:
+                    state[k] = saved[k]
+            if "block_wins" not in saved and "win_streak" in saved:
+                # file written by the old 2-in-a-row version: keep the level,
+                # start a fresh block
+                log.info("[LEVEL] Old-format state file; keeping the level, starting a new block.")
+            log.info("[LEVEL] Continuing from %s: level %s (block W%s/L%s, last run %s).",
+                     path, state["level"], state["block_wins"], state["block_losses"],
+                     state["last_run"])
+        except Exception as exc:
+            log.warning("[LEVEL] Could not read %s (%s); starting at level 1.", path, exc)
+    else:
+        log.info("[LEVEL] No saved state for this day; starting at level 1.")
+    state["level"] = max(1, min(N_LEVELS, int(state["level"])))
+    state["block_wins"] = int(state.get("block_wins") or 0)
+    state["block_losses"] = int(state.get("block_losses") or 0)
+    return state
+
+
+def _save_level_state(path, state: dict) -> None:
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({**state, "updated_at": _iso_now()}, indent=2))
+    tmp.replace(path)          # atomic: a crash never leaves a half-written file
+
+
+ROUND_FIELDS = [
+    "subject", "day", "run", "round", "active_start_s", "active_end_s",
+    "level_before", "enemy_strength", "our_damage", "enemy_damage", "n_hits",
+    "n_hits_enemy",
+    "result", "block_wins", "block_losses", "level_after", "level_change",
+    "meter_mean", "meter_end", "displayed_mean", "n_score_volumes",
+]
+
+
+def _append_round(csv_path: Path, row: dict) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    exists = csv_path.exists()
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=ROUND_FIELDS)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in ROUND_FIELDS})
 
 
 def _rect(x0, y0, x1, y1):
@@ -467,58 +858,14 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _append_levelup(csv_path: Path, side: str, new_level: int, volume_idx: int,
-                    session_time_s: float) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    exists = csv_path.exists()
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["side", "new_level", "volume_idx", "session_time_s", "timestamp"]
-        )
-        if not exists:
-            writer.writeheader()
-        writer.writerow({
-            "side": side,
-            "new_level": new_level,
-            "volume_idx": volume_idx,
-            "session_time_s": f"{session_time_s:.3f}",
-            "timestamp": _iso_now(),
-        })
-
-
-def _append_outcome(csv_path: Path, outcome: str, our_level: int, enemy_level: int,
-                    streak_after: int, wins_total: int, losses_total: int,
-                    volume_idx: int, session_time_s: float) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    exists = csv_path.exists()
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "outcome", "our_level", "enemy_level", "streak_after",
-            "wins_total", "losses_total", "volume_idx", "session_time_s", "timestamp",
-        ])
-        if not exists:
-            writer.writeheader()
-        writer.writerow({
-            "outcome": outcome,
-            "our_level": our_level,
-            "enemy_level": enemy_level,
-            "streak_after": streak_after,
-            "wins_total": wins_total,
-            "losses_total": losses_total,
-            "volume_idx": volume_idx,
-            "session_time_s": f"{session_time_s:.3f}",
-            "timestamp": _iso_now(),
-        })
-
-
 def _append_robot_timeseries(csv_path: Path, row: dict) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "session_time_s", "volume_idx", "score_raw", "score_z", "reg_ready",
-            "control", "displayed", "meter", "our_level", "enemy_level",
-            "streak", "our_hp", "opp_hp", "wins", "losses",
+            "session_time_s", "volume_idx", "phase", "round", "score_raw", "score_z",
+            "reg_ready", "displayed", "meter", "enemy_level", "our_damage",
+            "enemy_damage", "jingle_on",
         ])
         if not exists:
             writer.writeheader()
@@ -526,7 +873,8 @@ def _append_robot_timeseries(csv_path: Path, row: dict) -> None:
 
 
 def _append_trial_score(csv_path: Path, volume_idx: int, trial_score, score_raw,
-                        score_z, phase: str = "active") -> None:
+                        score_z, phase: str = "active", score_z_smoothed=None,
+                        round_idx=None) -> None:
     """One row per volume. During the active phase, `trial_score` is the on-screen
     feedback value (0-100) the subject saw. During the post-active fixation phase,
     scores are still computed and saved (for analysis) but NOT shown, so
@@ -536,7 +884,8 @@ def _append_trial_score(csv_path: Path, volume_idx: int, trial_score, score_raw,
     exists = csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["volume_idx", "trial_score", "score_raw", "score_z", "phase", "timestamp"]
+            f, fieldnames=["volume_idx", "trial_score", "score_raw", "score_z",
+                           "score_z_smoothed", "phase", "round", "timestamp"]
         )
         if not exists:
             writer.writeheader()
@@ -545,24 +894,33 @@ def _append_trial_score(csv_path: Path, volume_idx: int, trial_score, score_raw,
             "trial_score": "" if trial_score is None else f"{float(trial_score):.4f}",
             "score_raw": "" if score_raw is None else f"{float(score_raw):.4f}",
             "score_z": "" if score_z is None else f"{float(score_z):.4f}",
+            "score_z_smoothed": "" if score_z_smoothed is None else f"{float(score_z_smoothed):.4f}",
             "phase": phase,
+            "round": "" if round_idx is None else int(round_idx),
             "timestamp": _iso_now(),
         })
 
 
 def _write_robot_summary(run_dir: Path, subject: str, day: str, run: str,
-                         duration_s: float, volumes_seen: int, our_level: int,
-                         enemy_level: int, wins: int, losses: int,
-                         feedback_signal: str, feedback_delay: float) -> None:
+                         duration_s: float, volumes_seen: int, rounds: list,
+                         level_start: int, level_end: int, wins: int, losses: int,
+                         feedback_signal: str, feedback_mapping: str,
+                         mapping_scale: float, z_smooth_trs: int,
+                         mean_displayed) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
+    levels = [r["level_after"] for r in rounds]
     with open(run_dir / "robot_summary.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["subject", "day", "run", "duration_s", "volumes_seen",
-                         "our_level", "enemy_level", "wins", "losses",
-                         "feedback_signal", "feedback_delay"])
+                         "rounds_completed", "level_start", "level_end",
+                         "level_mean_after_each_round", "wins", "losses",
+                         "mean_displayed_active", "feedback_signal",
+                         "feedback_mapping", "mapping_scale", "z_smooth_trs"])
         writer.writerow([subject, day, run, f"{duration_s:.1f}", volumes_seen,
-                         our_level, enemy_level, wins, losses,
-                         feedback_signal, feedback_delay])
+                         len(rounds), level_start, level_end,
+                         f"{np.mean(levels):.3f}" if levels else "", wins, losses,
+                         "" if mean_displayed is None else f"{mean_displayed:.2f}",
+                         feedback_signal, feedback_mapping, mapping_scale, z_smooth_trs])
 
 
 def _build_robot_window(visual):
@@ -627,6 +985,39 @@ def _robot_show_message(win, visual, event, core, text, H) -> bool:
         core.wait(0.02)
 
 
+def _print_run_report(subject, day, run, shown_scores, rounds, level_start,
+                      level_end, wins, losses, total_time) -> None:
+    """End-of-run summary to the console and the log. `shown_scores` holds the
+    values that were on screen during the active periods only."""
+    lines = ["", "=" * 62, f" RUN COMPLETE   sub-{subject}  day {day}  run {run}", "=" * 62]
+    if shown_scores:
+        a = np.asarray(shown_scores, dtype=float)
+        lines += [
+            f"  displayed score   mean {a.mean():6.2f}   median {np.median(a):6.2f}"
+            f"   sd {a.std(ddof=1) if len(a) > 1 else float('nan'):5.2f}   n {len(a)}",
+            f"                    above 50: {100.0 * (a > 50).mean():5.1f}% of volumes",
+        ]
+    else:
+        lines.append("  displayed score   (no feedback volumes were shown)")
+    lines.append(f"  enemy level       start {level_start}  ->  end {level_end}")
+    if rounds:
+        lines.append("  rounds            " + "  ".join(
+            f"R{r['round']}:{'W' if r['result'] == 'win' else 'L'}{r['level_after']}"
+            for r in rounds))
+        lv = [r["level_after"] for r in rounds]
+        lines.append(f"  mean level        {np.mean(lv):.2f}  (after each of {len(lv)} rounds)")
+    total = wins + losses
+    lines += [
+        f"  rounds won/lost   {wins} / {losses}"
+        + (f"   ({100.0 * wins / total:.0f}% won)" if total else ""),
+        f"  run time          {total_time:.1f}s",
+        "=" * 62, "",
+    ]
+    text = "\n".join(lines)
+    print(text, flush=True)
+    log.info("Run report:%s", text)
+
+
 def run_robot_task_presentation(
     score_queue,
     condition,
@@ -637,25 +1028,58 @@ def run_robot_task_presentation(
     day="",
     run="",
     tr=1.0,
-    feedback_delay=8.0,
+    rest_lead_s=45.0,
     feedback_signal="z",
+    feedback_mapping="arcsine",
+    mapping_scale=1.0,
+    z_smooth_trs=1,
     z_gain=10.0,
     z_center=50.0,
-    active_feedback_trs=None,
-    rest_baseline_s=20.0,
+    n_rounds=N_ROUNDS_DEFAULT,
+    active_s=ACTIVE_S,
+    rest_s=REST_S,
+    result_s=RESULT_S,
+    rest_baseline_s=0.0,
+    level_state_path=None,
+    start_level=None,
+    jingle_path=None,
+    jingle_volume=0.8,
+    audio_lib=None,
+    audio_device=None,
 ) -> None:
+    """Block-design robot task.
+
+    Timeline (all times locked to the scanner trigger):
+        rest_lead  fixation, `rest_lead_s`
+        round r    active `active_s` (line + fight + jingle), then rest `rest_s`
+                   (line still shown and scored; robots stand still; the meter
+                   returns to the middle and stays there; "REST" shown)
+        tail       optional extra fixation, `rest_baseline_s` (default 0)
+
+    Within a round the meter starts at METER_START and integrates
+    METER_GAIN x (displayed - 50). Both robots land exactly the same number of
+    hits; your hit = meter at that moment, the enemy's = ENEMY_STRENGTH[level].
+    More total damage wins the round. The enemy level is a staircase
+    (best of 3: 2 wins -> up, 2 losses -> down), saved after every round to
+    `level_state_path` so it carries over to the next run of the same day.
+    """
     from psychopy import core, event, visual
     import math
-    import random
-    from collections import deque
 
+    rng = random.Random()
     run_dir = Path(condition_scores_path).parent
-    levelup_path = run_dir / "robot_levelups.csv"
-    outcome_path = run_dir / "robot_outcomes.csv"
     robot_ts_path = run_dir / "robot_timeseries.csv"
     trial_score_path = run_dir / "trial_scores.csv"
+    rounds_path = run_dir / "robot_rounds.csv"
+    day_rounds_path = (Path(level_state_path).parent / "robot_rounds_day.csv"
+                       if level_state_path is not None else None)
     acquisition_speed_path = run_dir / "acquisition_speed_rt.csv"
     logged_trial_vols: set[int] = set()
+
+    # Hits per side per round. Both sides land exactly this many, so neither
+    # robot gets an extra hit from frame timing. Ours fall at k*I, the enemy's
+    # at (k-0.5)*I -- offset only so the lunges alternate on screen.
+    n_hits = int(math.floor((float(active_s) - 1e-6) / ATTACK_INTERVAL))
 
     win = _build_robot_window(visual)
     H, X, XY, (w_px, h_px) = _make_unit_scalers(win)
@@ -663,7 +1087,7 @@ def run_robot_task_presentation(
     LEFT = -RIGHT
     _mouse = event.Mouse(visible=False, win=win)
 
-    # ---- top ECG-style plot geometry (authored in height-fraction, drawn in px) ----
+    # ---- feedback line geometry (height-fraction units, drawn in px) ----
     PLOT_BOT, PLOT_TOP = -0.14, 0.46
     GROUND = -0.46
 
@@ -677,18 +1101,21 @@ def run_robot_task_presentation(
     trace = visual.ShapeStim(win, vertices=np.column_stack([xs, np.full(N_TRACE, H(sy(50)))]),
                              closeShape=False, fillColor=None, lineColor="white", lineWidth=3)
 
-    # ---- POWER meter (fills OUR level) ----
+    # ---- POWER meter: 0..100, starts at the middle mark every round ----
     BAR_X, BAR_W = LEFT + 0.07, 0.05
     BAR_BOT, BAR_TOP = GROUND + 0.02, GROUND + 0.24
     BAR_H = BAR_TOP - BAR_BOT
     bar_out = visual.Rect(win, width=H(BAR_W), height=H(BAR_H), pos=XY(BAR_X, (BAR_BOT + BAR_TOP) / 2),
                           fillColor=(-0.75, -0.75, -0.65), lineColor=(0.1, 0.3, 0.45), lineWidth=2)
     bar_fill = visual.Rect(win, width=H(BAR_W - 0.010), height=0.0, fillColor=(0.0, 0.75, 0.85), lineColor=None)
+    bar_mid = visual.Line(win, start=XY(BAR_X - BAR_W / 2 - 0.010, BAR_BOT + BAR_H / 2),
+                          end=XY(BAR_X + BAR_W / 2 + 0.010, BAR_BOT + BAR_H / 2),
+                          lineColor=(0.9, 0.9, 0.6), lineWidth=2)
     pow_lbl = visual.TextStim(win, text="POWER", pos=XY(BAR_X, BAR_TOP + 0.03), height=H(0.022), color=(0.3, 0.6, 0.7))
-    our_lvl_lbl = visual.TextStim(win, text="LV 1", pos=XY(BAR_X, BAR_BOT - 0.045), height=H(0.030), color=(0.3, 0.85, 1.0), bold=True)
 
-    # ---- win / loss counter ----
-    wl_lbl = visual.TextStim(win, text="W 0   L 0", pos=XY(RIGHT - 0.14, 0.485), height=H(0.030), color=(0.75, 0.75, 0.6), bold=True)
+    # ---- header ----
+    round_lbl = visual.TextStim(win, text="", pos=XY(LEFT + 0.16, 0.485), height=H(0.030), color=(0.75, 0.75, 0.6), bold=True)
+    wl_lbl = visual.TextStim(win, text="", pos=XY(RIGHT - 0.14, 0.485), height=H(0.030), color=(0.75, 0.75, 0.6), bold=True)
 
     # ---- robots ----
     ours = _make_robot(win, visual, (0.05, 0.55, 0.95), (-0.35, 0.05, 0.45), (0.35, 0.95, 1.0))
@@ -697,33 +1124,81 @@ def run_robot_task_presentation(
     BASE_SCALE = 0.16
     ground_line = visual.Line(win, start=XY(LEFT + 0.02, GROUND), end=XY(RIGHT - 0.02, GROUND), lineColor=(-0.5, -0.5, -0.4))
 
-    HP_Y, HP_W = -0.20, 0.22
-
-    def hp_bar(x, col):
-        back = visual.Rect(win, width=H(HP_W), height=H(0.020), pos=XY(x, HP_Y),
-                           fillColor=(-0.7, -0.7, -0.6), lineColor=(-0.3, -0.3, -0.2))
-        fill = visual.Rect(win, width=H(HP_W), height=H(0.015), pos=XY(x, HP_Y), fillColor=col, lineColor=None)
-        return back, fill
-
-    our_hp_bg, our_hp_fg = hp_bar(OUR_X, (0.2, 0.85, 0.3))
-    opp_hp_bg, opp_hp_fg = hp_bar(OPP_X, (0.9, 0.35, 0.2))
-    flash = visual.TextStim(win, text="", pos=XY(0.05, -0.30), height=H(0.055), color=(1.0, 0.9, 0.2), bold=True)
+    # ---- battle bar: your share of the damage dealt so far this round ----
+    BATTLE_Y, BATTLE_W = -0.20, 0.50
+    BATTLE_X = (OUR_X + OPP_X) / 2.0
+    battle_bg = visual.Rect(win, width=H(BATTLE_W), height=H(0.024), pos=XY(BATTLE_X, BATTLE_Y),
+                            fillColor=(0.85, 0.30, 0.20), lineColor=(-0.3, -0.3, -0.2))
+    battle_fg = visual.Rect(win, width=H(BATTLE_W / 2), height=H(0.020), pos=XY(BATTLE_X, BATTLE_Y),
+                            fillColor=(0.15, 0.65, 1.0), lineColor=None)
+    battle_mid = visual.Line(win, start=XY(BATTLE_X, BATTLE_Y - 0.022), end=XY(BATTLE_X, BATTLE_Y + 0.022),
+                             lineColor="white", lineWidth=2)
+    you_lbl = visual.TextStim(win, text="YOU", pos=XY(BATTLE_X - BATTLE_W / 2, BATTLE_Y + 0.036),
+                              height=H(0.022), color=(0.4, 0.8, 1.0), alignText="left")
+    opp_lbl = visual.TextStim(win, text="", pos=XY(BATTLE_X + BATTLE_W / 2 - 0.10, BATTLE_Y + 0.036),
+                              height=H(0.022), color=(0.9, 0.5, 0.4))
     phase_msg = visual.TextStim(win, text="", pos=XY(0, -0.05), height=H(0.045), color=(0.9, 0.9, 0.7), bold=True)
-    you_lbl = visual.TextStim(win, text="YOU  LV 1", pos=XY(OUR_X, HP_Y + 0.032), height=H(0.022), color=(0.4, 0.8, 1.0))
-    opp_lbl = visual.TextStim(win, text="ENEMY  LV 1", pos=XY(OPP_X, HP_Y + 0.032), height=H(0.022), color=(0.9, 0.5, 0.4))
-    pips = [visual.Circle(win, radius=H(0.010), pos=XY(OPP_X - 0.02 + i * 0.02, HP_Y - 0.035),
-                          lineColor=(0.6, 0.35, 0.3), fillColor=(-0.6, -0.6, -0.5)) for i in range(WIN_STREAK)]
-    pips_lbl = visual.TextStim(win, text="enemy powers up in", pos=XY(OPP_X, HP_Y - 0.065), height=H(0.016), color=(0.6, 0.4, 0.35))
-
-    # ---- end-of-run fixation cross (shown during the rest baseline) ----
+    rest_txt = visual.TextStim(win, text="REST", pos=XY(BATTLE_X, BATTLE_Y), height=H(0.050),
+                               color=(0.85, 0.85, 0.7), bold=True)
+    result_txt = visual.TextStim(win, text="", pos=XY(BATTLE_X, BATTLE_Y), height=H(0.055),
+                                 color=(1.0, 0.9, 0.3), bold=True)
     fixation = visual.TextStim(win, text="+", pos=(0, 0), height=H(0.10), color="white", bold=True)
+
+    # ---- enemy level, carried over from earlier runs today ----
+    state = _load_level_state(level_state_path, start_level)
+    level_start = state["level"]
+
+    # ---- jingle ----
+    jingle = None
+    if jingle_path:
+        jingle, how = _load_jingle(jingle_path, jingle_volume, run_dir,
+                                   audio_lib=audio_lib, audio_device=audio_device,
+                                   active_s=active_s)
+        if jingle is not None:
+            log.info("[AUDIO] Jingle loaded: %s (volume %.2f) via %s",
+                     jingle_path, float(jingle_volume), how)
+        else:
+            log.error("[AUDIO] Could not load jingle %s. Last error: %s", jingle_path, how)
+            ok = _robot_show_message(
+                win, visual, event, core,
+                "THE JINGLE FAILED TO LOAD:\n\n%s\n\n"
+                "SPACE = continue WITHOUT sound\nESCAPE = abort" % how, H)
+            if not ok:
+                win.close()
+                return
+            jingle = None
+    jingle_on = False
+
+    def jingle_start():
+        nonlocal jingle_on
+        if jingle is not None and not jingle_on:
+            try:
+                jingle.play()
+                jingle_on = True
+            except Exception as exc:
+                log.error("[AUDIO] play failed: %s", exc)
+
+    def jingle_stop():
+        nonlocal jingle_on
+        if jingle is not None and jingle_on:
+            try:
+                jingle.stop()
+            except Exception as exc:
+                log.error("[AUDIO] stop failed: %s", exc)
+            jingle_on = False
 
     # ---- instructions ----
     proceed = _robot_show_message(
         win, visual, event, core,
-        "Keep the LINE HIGH to charge your POWER meter and LEVEL UP your robot "
-        "(bigger, stronger).\n\n"
-        "The enemy is even at first; win 3 fights in a row and it levels up too.\n\n"
+        "The run starts with a cross - just rest until the robots appear.\n\n"
+        "In each round, keep the LINE ABOVE THE MIDDLE to charge your POWER.\n"
+        "More power = a bigger robot that hits harder.\n\n"
+        "The robots fight while the music plays.\n"
+        "Deal more damage than the enemy to win the round.\n\n"
+        "Win 2 out of 3 rounds and the enemy gets stronger.\n"
+        "Lose 2 out of 3 and it gets weaker.\n\n"
+        "When the music stops the robots stop fighting - rest\n"
+        "until the music comes back.\n\n"
         "Press SPACE when ready.",
         H,
     )
@@ -735,8 +1210,7 @@ def run_robot_task_presentation(
     waiting_text = visual.TextStim(win, text="Waiting for scanner trigger ('s')...",
                                    pos=(0, 0), color="white", height=H(0.040))
     first_trigger_timestamp = None
-    waiting = True
-    while waiting:
+    while True:
         try:
             while True:
                 score_queue.get_nowait()
@@ -747,13 +1221,13 @@ def run_robot_task_presentation(
         keys = event.getKeys()
         if "s" in keys:
             first_trigger_timestamp = time.time()
-            waiting = False
+            break
         if "escape" in keys:
             win.close()
             return
         core.wait(0.01)
 
-    # ---- state ----
+    # ---- run state ----
     clock = core.Clock()
     clock.reset()
     last_t = 0.0
@@ -763,77 +1237,158 @@ def run_robot_task_presentation(
     next_sample = 0.0
     next_log = 0.0
 
-    meter = 0.0
-    our_level = 1
-    enemy_level = 1
-    streak = 0
-    wins, losses = 0, 0
-    our_hp, opp_hp = GAME_HP, GAME_HP
-    our_atk_t, opp_atk_t = ATTACK_INTERVAL, ATTACK_INTERVAL
-    our_lunge, opp_lunge = 0.0, 0.0
-    flash_until, flash_txt = 0.0, ""
-
     seen_vols: set[int] = set()
     current_vol = 0
     reg_ready_seen = False
     last_score_raw = None
     last_score_z = None
+    z_hist: deque = deque(maxlen=max(1, int(z_smooth_trs)))
+    shown_scores: list[float] = []
+    wins, losses = 0, 0
+    rounds_done: list[dict] = []
 
-    # ---- phase machine --------------------------------------------------
-    # active : each score is plotted the instant the pipeline emits it (like
-    #          rt_psychopy_parallel; no artificial hold). A feedback volume is
-    #          counted the moment its score is shown, so reaching
-    #          `active_feedback_trs` means all that many volumes have already had
-    #          their feedback displayed.
-    # rest   : `rest_baseline_s` of fixation cross only.
-    #
-    # active_feedback_trs is counted from the FIRST reg_ready volume, so the ~40
-    # warmup TRs before feedback do not eat into the 6-minute window.
-    phase = "active"
-    active_feedback_count = 0        # unique reg_ready volumes shown as feedback
-    first_feedback_vol = None
-    rest_start_time = None
+    # ---- per-round state ----
+    meter = METER_START
+    our_dmg = opp_dmg = 0.0
+    our_hits = opp_hits = 0
+    meter_area = meter_time = 0.0
+    round_disp: list[float] = []
+    level_before = state["level"]
+    our_lunge = opp_lunge = 0.0
+
+    def start_round(t0):
+        # The line is NOT reset: it runs continuously through the rests.
+        nonlocal meter, our_dmg, opp_dmg, our_hits, opp_hits, meter_area, meter_time
+        nonlocal round_disp, level_before
+        meter = METER_START
+        our_dmg = opp_dmg = 0.0
+        our_hits = opp_hits = 0
+        meter_area = meter_time = 0.0
+        round_disp = []
+        level_before = state["level"]
+        jingle_start()
+        log.info("[ROUND %d/%d] start at %.2fs, enemy level %d",
+                 round_idx, n_rounds, t0, state["level"])
+
+    def land_hits(until, round_start):
+        """Land every hit scheduled up to `until` (both sides capped at n_hits)."""
+        nonlocal our_dmg, opp_dmg, our_hits, opp_hits, our_lunge, opp_lunge
+        while our_hits < n_hits and round_start + (our_hits + 1) * ATTACK_INTERVAL <= until:
+            our_dmg += meter * rng.uniform(1 - DMG_JITTER, 1 + DMG_JITTER)
+            our_hits += 1
+            our_lunge = 0.15
+        while opp_hits < n_hits and round_start + (opp_hits + 0.5) * ATTACK_INTERVAL <= until:
+            opp_dmg += ENEMY_STRENGTH[state["level"]] * rng.uniform(1 - DMG_JITTER, 1 + DMG_JITTER)
+            opp_hits += 1
+            opp_lunge = 0.15
+
+    def end_round(t0, t1):
+        nonlocal wins, losses
+        land_hits(float("inf"), t0)               # land anything still due
+        won = our_dmg > opp_dmg
+        if won:
+            wins += 1
+            state["block_wins"] += 1
+        else:
+            losses += 1
+            state["block_losses"] += 1
+        change = 0
+        block_done = False
+        if state["block_wins"] >= LEVEL_STREAK:          # 2 of up to 3 won
+            block_done = True
+            if state["level"] < N_LEVELS:
+                state["level"] += 1
+                change = 1
+        elif state["block_losses"] >= LEVEL_STREAK:      # 2 of up to 3 lost
+            block_done = True
+            if state["level"] > 1:
+                state["level"] -= 1
+                change = -1
+        # log the tally that decided this round, then start a new block
+        tally_w, tally_l = state["block_wins"], state["block_losses"]
+        if block_done:
+            state["block_wins"] = state["block_losses"] = 0
+        state["last_run"] = str(run)
+        _save_level_state(level_state_path, state)
+
+        row = {
+            "subject": subject, "day": day, "run": run, "round": round_idx,
+            "active_start_s": f"{t0:.2f}", "active_end_s": f"{t1:.2f}",
+            "level_before": level_before,
+            "enemy_strength": ENEMY_STRENGTH[level_before],
+            "our_damage": f"{our_dmg:.1f}", "enemy_damage": f"{opp_dmg:.1f}",
+            "n_hits": our_hits, "n_hits_enemy": opp_hits,
+            "result": "win" if won else "loss",
+            "block_wins": tally_w, "block_losses": tally_l,
+            "level_after": state["level"], "level_change": change,
+            "meter_mean": f"{(meter_area / meter_time) if meter_time > 0 else meter:.2f}",
+            "meter_end": f"{meter:.2f}",
+            "displayed_mean": f"{np.mean(round_disp):.2f}" if round_disp else "",
+            "n_score_volumes": len(round_disp),
+        }
+        _append_round(rounds_path, row)
+        if day_rounds_path is not None:
+            _append_round(day_rounds_path, row)
+        rounds_done.append({**row, "level_after": state["level"]})
+
+        result_txt.text = "ROUND WON!" if won else "ROUND LOST"
+        result_txt.color = (0.4, 1.0, 0.5) if won else (1.0, 0.55, 0.4)
+        jingle_stop()
+        log.info("[ROUND %d/%d] %s  our %.0f vs enemy %.0f  (%d hits each)  level %d -> %d",
+                 round_idx, n_rounds, "WIN" if won else "LOSS", our_dmg, opp_dmg,
+                 our_hits, level_before, state["level"])
+
+    # ---- phase machine (times are scheduled, not taken from the frame, so the
+    #      rounds stay locked to the trigger and never drift) ----
+    phase = "rest_lead" if float(rest_lead_s) > 0 else "active"
+    round_idx = 0 if phase == "rest_lead" else 1
+    phase_start = 0.0
+    if phase == "active":
+        start_round(phase_start)
 
     safety_s = None if duration_s is None else (float(duration_s) + 180.0)
-
-    # Idle guard: if no NEW volume arrives for this long, assume the archive is
-    # exhausted (or acquisition stopped) and end the run instead of hanging with
-    # the line pinned. Generous enough not to fire between real TRs.
     idle_timeout_s = 30.0
-    last_new_vol_time = None   # wall-clock (clock.getTime) of the last new volume
+    last_new_vol_time = None
+    aborted = False
 
     while True:
         now = clock.getTime()
-        dt = min(now - last_t, 0.05)
+        dt = max(0.0, min(now - last_t, 0.5))
         last_t = now
 
         # ---- phase transitions ----
-        if phase == "active" and active_feedback_trs is not None \
-                and active_feedback_count >= active_feedback_trs:
-            # all `active_feedback_trs` volumes have had their score shown -> rest
+        if phase == "rest_lead" and now - phase_start >= float(rest_lead_s):
+            phase_start += float(rest_lead_s)
+            phase, round_idx = "active", 1
+            log.info("[PHASE] rest lead done -> round 1")
+            next_sample = phase_start
+            start_round(phase_start)
+        elif phase == "active" and now - phase_start >= float(active_s):
+            end_round(phase_start, phase_start + float(active_s))
+            meter = METER_START          # back to the middle, frozen through the rest
+            phase_start += float(active_s)
             phase = "rest"
-            rest_start_time = now
-        elif phase == "rest" and rest_start_time is not None \
-                and (now - rest_start_time) >= float(rest_baseline_s):
+        elif phase == "rest" and now - phase_start >= float(rest_s):
+            phase_start += float(rest_s)
+            if round_idx < int(n_rounds):
+                round_idx += 1
+                phase = "active"
+                start_round(phase_start)
+            elif float(rest_baseline_s) > 0:
+                phase = "tail"
+            else:
+                break
+        elif phase == "tail" and now - phase_start >= float(rest_baseline_s):
             break
 
         over_time = (safety_s is not None) and (now >= safety_s)
-        # Idle: at least one volume seen, but nothing new for idle_timeout_s
-        # (archive exhausted / acquisition stopped) -> stop instead of hanging.
-        idle_stop = (last_new_vol_time is not None) \
-            and ((now - last_new_vol_time) >= idle_timeout_s)
+        idle_stop = (last_new_vol_time is not None) and ((now - last_new_vol_time) >= idle_timeout_s)
         if idle_stop:
-            log.warning(
-                "No new volume for %.0fs (last vol %d, active feedback shown %d). "
-                "Ending run (archive exhausted or acquisition stopped).",
-                idle_timeout_s, current_vol, active_feedback_count,
-            )
-        # Fallback when active_feedback_trs is not set: original max_trs behaviour.
-        reached_vols = (active_feedback_trs is None) and (max_trs is not None) \
-            and (len(seen_vols) >= max_trs)
-        run_out_no_trs = (active_feedback_trs is None) and (max_trs is None) \
-            and (duration_s is not None) and (now >= duration_s)
-        if over_time or idle_stop or reached_vols or run_out_no_trs or ("escape" in event.getKeys()):
+            log.warning("No new volume for %.0fs (last vol %d). Ending run.", idle_timeout_s, current_vol)
+        if over_time or idle_stop or ("escape" in event.getKeys()):
+            aborted = True
+            if phase == "active":
+                log.warning("[ROUND %d] interrupted -- not counted, level not changed.", round_idx)
             break
 
         # ---- drain the score queue ----
@@ -845,128 +1400,80 @@ def run_robot_task_presentation(
                     if vol_idx not in seen_vols:
                         last_new_vol_time = now
                     seen_vols.add(vol_idx)
-                    if vol_idx > current_vol:
-                        current_vol = vol_idx
+                    current_vol = max(current_vol, vol_idx)
                 if first_trigger_timestamp is not None and vol_idx > 0:
-                    estimated_trigger_timestamp = first_trigger_timestamp + ((vol_idx - 1) * float(tr))
-                    watchdog_timestamp = message.get("watchdog_timestamp")
-                    analysis_timestamp = message.get("analysis_timestamp", message.get("timestamp"))
-                    if watchdog_timestamp is not None and analysis_timestamp is not None:
-                        _append_acquisition_speed(
-                            acquisition_speed_path,
-                            {
-                                "volume_idx": vol_idx,
-                                "estimated_trigger_timestamp": f"{estimated_trigger_timestamp:.6f}",
-                                "watchdog_timestamp": f"{float(watchdog_timestamp):.6f}",
-                                "analysis_timestamp": f"{float(analysis_timestamp):.6f}",
-                                "trigger_to_watchdog_s": f"{(float(watchdog_timestamp) - estimated_trigger_timestamp):.6f}",
-                                "watchdog_to_analysis_s": f"{(float(analysis_timestamp) - float(watchdog_timestamp)):.6f}",
-                            },
-                        )
-                has_score = "score_raw" in message
-                if has_score and message.get("reg_ready", True):
+                    est_trig = first_trigger_timestamp + ((vol_idx - 1) * float(tr))
+                    wd_ts = message.get("watchdog_timestamp")
+                    an_ts = message.get("analysis_timestamp", message.get("timestamp"))
+                    if wd_ts is not None and an_ts is not None:
+                        _append_acquisition_speed(acquisition_speed_path, {
+                            "volume_idx": vol_idx,
+                            "estimated_trigger_timestamp": f"{est_trig:.6f}",
+                            "watchdog_timestamp": f"{float(wd_ts):.6f}",
+                            "analysis_timestamp": f"{float(an_ts):.6f}",
+                            "trigger_to_watchdog_s": f"{(float(wd_ts) - est_trig):.6f}",
+                            "watchdog_to_analysis_s": f"{(float(an_ts) - float(wd_ts)):.6f}",
+                        })
+                if "score_raw" in message and message.get("reg_ready", True):
                     reg_ready_seen = True
                     sr = float(message["score_raw"])
                     sz = message.get("score_z")
-                    if phase == "active":
-                        last_score_raw = sr
-                        last_score_z = sz
-                        # Plot each score the instant the pipeline emits it (no hold).
-                        if feedback_signal == "z" and sz is not None:
-                            control_target = max(0.0, min(100.0, float(z_center) + float(sz) * float(z_gain)))
+                    if phase in ("active", "rest"):
+                        last_score_raw, last_score_z = sr, sz
+                        if feedback_signal == "z":
+                            if sz is None:
+                                raise RuntimeError(
+                                    "feedback_signal='z' but the pipeline emitted no score_z. "
+                                    "Check that --rs names a run with a usable scores.csv. "
+                                    "Refusing to silently fall back to raw decoder values.")
+                            z_hist.append(float(sz))
+                            sz_used = float(np.mean(z_hist))
+                            control_target = _map_z_to_display(sz_used, feedback_mapping,
+                                                               z_center, z_gain, mapping_scale)
                         else:
+                            sz_used = None
                             control_target = max(0.0, min(100.0, sr))
-                        # count as one shown feedback volume (unique vols only)
                         if vol_idx and vol_idx not in logged_trial_vols:
                             logged_trial_vols.add(vol_idx)
-                            active_feedback_count += 1
-                            if first_feedback_vol is None:
-                                first_feedback_vol = vol_idx
                             _append_condition_score(condition_scores_path, message, condition)
-                            _append_trial_score(trial_score_path, vol_idx, control_target, sr, sz, phase="active")
+                            if phase == "active":          # round stats: active only
+                                shown_scores.append(float(control_target))
+                                round_disp.append(float(control_target))
+                            _append_trial_score(trial_score_path, vol_idx, control_target, sr, sz,
+                                                phase=phase, score_z_smoothed=sz_used,
+                                                round_idx=round_idx)
                     else:
-                        # post-active (fixation) phase: keep SCORING and saving for
-                        # analysis, but do NOT display it (no control_target update).
+                        # rest lead / tail: scored and saved for analysis, not displayed
                         if vol_idx and vol_idx not in logged_trial_vols:
                             logged_trial_vols.add(vol_idx)
                             _append_condition_score(condition_scores_path, message, condition)
-                            _append_trial_score(trial_score_path, vol_idx, None, sr, sz, phase="post_active")
+                            _append_trial_score(trial_score_path, vol_idx, None, sr, sz,
+                                                phase=phase,
+                                                round_idx=round_idx if phase == "rest" else None)
         except Empty:
             pass
 
-        # ---- feedback is live as soon as the first score has arrived ----
-        feedback_live = reg_ready_seen
-
-        # ---- displayed value = current score, no artificial delay ----
         control = control_target if reg_ready_seen else float(z_center)
         disp = control
 
-        g = 0
-        while now >= next_sample and g < 5:
-            ys.append(H(sy(disp)))
-            next_sample += SAMPLE_DT
-            g += 1
-
-        # ---- active game only after the feedback delay has fully elapsed ----
-        if feedback_live:
-            if our_level < MAX_LEVEL:
-                meter += disp * dt
-                need = our_cost(our_level)
-                if meter >= need:
-                    meter -= need
-                    our_level += 1
-                    flash_txt, flash_until = "YOU LEVEL UP!", now + 1.3
-                    _append_levelup(levelup_path, "our", our_level, current_vol, now)
-                meter_prog = min(1.0, meter / our_cost(our_level)) if our_level < MAX_LEVEL else 1.0
-            else:
-                meter_prog = 1.0
-
-            our_str = strength(our_level)
-            opp_str = strength(enemy_level)
-            our_atk_t -= dt
-            if our_atk_t <= 0:
-                our_atk_t = ATTACK_INTERVAL * random.uniform(0.85, 1.15)
-                opp_hp -= DMG_K * our_str * random.uniform(1 - DMG_JITTER, 1 + DMG_JITTER)
-                our_lunge = 0.15
-            opp_atk_t -= dt
-            if opp_atk_t <= 0:
-                opp_atk_t = ATTACK_INTERVAL * random.uniform(0.85, 1.15)
-                our_hp -= DMG_K * opp_str * random.uniform(1 - DMG_JITTER, 1 + DMG_JITTER)
-                opp_lunge = 0.15
+        # ---- line scrolls during active AND rest ----
+        if phase in ("active", "rest"):
+            while now >= next_sample:
+                ys.append(H(sy(disp)))
+                next_sample += SAMPLE_DT
+        # ---- fight: active only ----
+        if phase == "active":
+            if reg_ready_seen:
+                meter = max(0.0, min(100.0, meter + METER_GAIN * (disp - 50.0) * dt))
+            meter_area += meter * dt
+            meter_time += dt
+            land_hits(now, phase_start)
             our_lunge = max(0.0, our_lunge - dt)
             opp_lunge = max(0.0, opp_lunge - dt)
 
-            if opp_hp <= 0:
-                wins += 1
-                streak += 1
-                our_hp = opp_hp = GAME_HP
-                our_atk_t = opp_atk_t = ATTACK_INTERVAL
-                if streak >= WIN_STREAK and enemy_level < MAX_LEVEL:
-                    enemy_level += 1
-                    streak = 0
-                    flash_txt, flash_until = "ENEMY LEVELS UP!", now + 1.3
-                    _append_outcome(outcome_path, "win", our_level, enemy_level, streak, wins, losses, current_vol, now)
-                    _append_levelup(levelup_path, "enemy", enemy_level, current_vol, now)
-                else:
-                    flash_txt, flash_until = "WIN!", now + 0.8
-                    _append_outcome(outcome_path, "win", our_level, enemy_level, streak, wins, losses, current_vol, now)
-            elif our_hp <= 0:
-                losses += 1
-                streak = 0
-                our_hp = opp_hp = GAME_HP
-                our_atk_t = opp_atk_t = ATTACK_INTERVAL
-                flash_txt, flash_until = "LOST!", now + 0.8
-                _append_outcome(outcome_path, "loss", our_level, enemy_level, streak, wins, losses, current_vol, now)
-        else:
-            meter_prog = 0.0
-            our_hp, opp_hp = GAME_HP, GAME_HP
-            our_atk_t = opp_atk_t = ATTACK_INTERVAL
-
         # ---- draw ----
-        if phase == "rest":
-            # fixation cross only; no feedback elements
+        if phase in ("rest_lead", "tail"):
             fixation.draw()
-            win.flip()
         else:
             frame_top.draw(); frame_bot.draw(); mid_line.draw()
             trace.vertices = np.column_stack([xs, np.array(ys)])
@@ -974,76 +1481,79 @@ def run_robot_task_presentation(
             ground_line.draw()
 
             bar_out.draw()
-            fh = (BAR_H - 0.010) * meter_prog
+            fh = (BAR_H - 0.010) * (meter / 100.0)
             bar_fill.height = max(0.0, H(fh))
             bar_fill.pos = XY(BAR_X, BAR_BOT + 0.005 + fh / 2.0)
             bar_fill.draw()
+            bar_mid.draw()
             pow_lbl.draw()
-            our_lvl_lbl.text = "LV %d" % our_level
-            our_lvl_lbl.draw()
 
+            round_lbl.text = "ROUND %d / %d" % (round_idx, int(n_rounds))
+            round_lbl.draw()
             wl_lbl.text = "W %d   L %d" % (wins, losses)
             wl_lbl.draw()
 
             ox = 0.035 * (our_lunge / 0.15)
             px = -0.035 * (opp_lunge / 0.15)
             bob = 0.003 * math.sin(now * 4.0)
-            _place_robot(ours, X(OUR_X + ox), H(GROUND + bob), H(scale_for(our_level, BASE_SCALE)), flip=1)
-            _place_robot(opp, X(OPP_X + px), H(GROUND - bob), H(scale_for(enemy_level, BASE_SCALE)), flip=-1)
-            for p in ours:
-                p.draw()
-            for p in opp:
-                p.draw()
+            _place_robot(ours, X(OUR_X + ox), H(GROUND + bob), H(robot_scale(meter, BASE_SCALE)), flip=1)
+            _place_robot(opp, X(OPP_X + px), H(GROUND - bob),
+                         H(robot_scale(ENEMY_STRENGTH[state["level"]], BASE_SCALE)), flip=-1)
+            for part in ours:
+                part.draw()
+            for part in opp:
+                part.draw()
 
-            for bg, fg, hp, x in ((our_hp_bg, our_hp_fg, our_hp, OUR_X),
-                                  (opp_hp_bg, opp_hp_fg, opp_hp, OPP_X)):
-                bg.draw()
-                frac = max(0.0, min(1.0, hp / GAME_HP))
-                fg.width = max(0.001, H(HP_W * frac))
-                fg.pos = XY(x - HP_W / 2.0 + (HP_W * frac) / 2.0, HP_Y)
-                fg.draw()
-            you_lbl.text = "YOU  LV %d" % our_level
-            opp_lbl.text = "ENEMY  LV %d" % enemy_level
-            you_lbl.draw(); opp_lbl.draw()
-            pips_lbl.draw()
-            for i, pip in enumerate(pips):
-                pip.fillColor = (0.9, 0.5, 0.2) if i < streak else (-0.6, -0.6, -0.5)
-                pip.draw()
-
-            if now < flash_until:
-                flash.text = flash_txt
-                flash.draw()
+            if phase == "active":
+                total = our_dmg + opp_dmg
+                share = 0.5 if total <= 0 else our_dmg / total
+                battle_bg.draw()
+                battle_fg.width = max(0.001, H(BATTLE_W * share))
+                battle_fg.pos = XY(BATTLE_X - BATTLE_W / 2.0 + (BATTLE_W * share) / 2.0, BATTLE_Y)
+                battle_fg.draw()
+                battle_mid.draw()
+                you_lbl.draw()
+            elif now - phase_start < float(result_s):
+                result_txt.draw()                  # win/lose, in place of the battle bar
+            else:
+                rest_txt.draw()
+            opp_lbl.text = "ENEMY  LV %d" % state["level"]
+            opp_lbl.draw()
 
             if not reg_ready_seen:
                 phase_msg.text = "Waiting for scanner..."
                 phase_msg.draw()
+        win.flip()
 
-            win.flip()
-
-        # ---- robot timeseries log (~10 Hz) ----
+        # ---- timeseries log (~10 Hz) ----
         if now >= next_log:
             _append_robot_timeseries(robot_ts_path, {
                 "session_time_s": f"{now:.2f}",
                 "volume_idx": current_vol,
+                "phase": phase,
+                "round": round_idx,
                 "score_raw": "" if last_score_raw is None else f"{last_score_raw:.4f}",
                 "score_z": "" if last_score_z is None else f"{float(last_score_z):.4f}",
                 "reg_ready": int(reg_ready_seen),
-                "control": f"{control:.2f}",
-                "displayed": f"{disp:.2f}",
-                "meter": f"{meter:.1f}",
-                "our_level": our_level,
-                "enemy_level": enemy_level,
-                "streak": streak,
-                "our_hp": f"{our_hp:.1f}",
-                "opp_hp": f"{opp_hp:.1f}",
-                "wins": wins,
-                "losses": losses,
+                "displayed": f"{disp:.2f}" if phase in ("active", "rest") else "",
+                "meter": f"{meter:.2f}" if phase in ("active", "rest") else "",
+                "enemy_level": state["level"],
+                "our_damage": f"{our_dmg:.1f}",
+                "enemy_damage": f"{opp_dmg:.1f}",
+                "jingle_on": int(jingle_on),
             })
-            next_log += 0.1
+            next_log = now + 0.1
 
+    jingle_stop()
     total_time = clock.getTime()
-    _write_robot_summary(run_dir, subject, day, run, total_time, len(seen_vols),
-                         our_level, enemy_level, wins, losses, feedback_signal, feedback_delay)
+    if aborted:
+        log.warning("Run ended early after %d of %d rounds.", len(rounds_done), int(n_rounds))
+    _write_robot_summary(run_dir, subject, day, run, total_time, len(seen_vols), rounds_done,
+                         level_start, state["level"], wins, losses, feedback_signal,
+                         feedback_mapping, mapping_scale, z_smooth_trs,
+                         float(np.mean(shown_scores)) if shown_scores else None)
+    _print_run_report(subject, day, run, shown_scores, rounds_done, level_start,
+                      state["level"], wins, losses, total_time)
     win.close()
 
 
@@ -1213,28 +1723,81 @@ def main() -> None:
         help="Stop after this many minutes (default 6), using TR from settings. Ignored if --max-trs or --active-feedback-trs is set.",
     )
     parser.add_argument(
+        "--rounds",
+        type=int,
+        default=N_ROUNDS_DEFAULT,
+        help="Rounds per run. Each round = --active-sec of feedback + --rest-sec "
+             "of rest (default %d)." % N_ROUNDS_DEFAULT,
+    )
+    parser.add_argument(
+        "--active-sec", type=float, default=ACTIVE_S,
+        help="Active (feedback + fight + jingle) seconds per round (default %g)." % ACTIVE_S,
+    )
+    parser.add_argument(
+        "--rest-sec", type=float, default=REST_S,
+        help="Rest seconds after each round (default %g). The line is still "
+             "shown and scored; the robots stop and the meter sits at the middle." % REST_S,
+    )
+    parser.add_argument(
+        "--result-sec", type=float, default=RESULT_S,
+        help="Seconds 'ROUND WON!/LOST' is shown at the start of each rest before "
+             "'REST' (default %g)." % RESULT_S,
+    )
+    parser.add_argument(
+        "--start-level", type=int, default=None,
+        help="Force the enemy level at the start of this run (1-%d), ignoring the "
+             "level saved from earlier runs today. Omit to continue from the saved "
+             "level (or level 1 on the first run of the day)." % N_LEVELS,
+    )
+    parser.add_argument(
+        "--jingle", type=str, default=None,
+        help="Audio file (wav/ogg/mp3) looped during every active period and "
+             "stopped during rest. Omit for no sound.",
+    )
+    parser.add_argument(
+        "--audio-lib", choices=["ptb", "sounddevice", "pygame", "aplay"], default=None,
+        help="Force one audio backend for the jingle. Default: try ptb, then "
+             "sounddevice, then pygame, and keep the first that works. "
+             "'aplay' skips PsychoPy and sends the wav straight to ALSA -- use "
+             "it when PortAudio cannot open the card the headphones are on.",
+    )
+    parser.add_argument(
+        "--audio-device", type=str, default=None,
+        help="Force a specific output device. For the PsychoPy backends, the "
+             "device NAME as listed by list_audio_devices.py. For --audio-lib "
+             "aplay, the ALSA device string, e.g. plughw:0,0 (see aplay -l). "
+             "Default: the system default output.",
+    )
+    parser.add_argument(
+        "--jingle-volume", type=float, default=0.8,
+        help="Jingle volume, 0-1 (default 0.8). Check it against scanner noise.",
+    )
+    parser.add_argument(
         "--active-feedback-trs",
         type=int,
         default=None,
-        help=(
-            "Number of ACTIVE feedback volumes, counted from the first reg_ready "
-            "volume (so the ~40 TR pipeline warmup does NOT count). At TR=1s, 360 "
-            "= 6 min of feedback. After this many volumes: freeze new input, drain "
-            "the feedback-delay line, then show a fixation rest. Recommended over "
-            "--max-trs / --duration-min for this paradigm."
-        ),
+        help="IGNORED in the block design -- run length is set by --rounds, "
+             "--active-sec and --rest-sec. Kept so old commands still run.",
     )
     parser.add_argument(
         "--rest-baseline-sec",
         type=float,
-        default=20.0,
-        help="Seconds of fixation-cross rest after the delay flush (only used with --active-feedback-trs).",
+        default=0.0,
+        help="Extra fixation at the very end of the run, after the last round's "
+             "rest (default 0: the last round's rest ends the run).",
     )
     parser.add_argument(
-        "--feedback-delay",
+        "--rest-lead-sec",
         type=float,
-        default=8.0,
-        help="Seconds of feedback delay for the robot line (delay-training).",
+        default=45.0,
+        help=(
+            "Seconds of fixation-cross rest at the START of the run, before any "
+            "feedback. This is the run's rest baseline: the pipeline builds its "
+            "voxel-normalization reference from the first "
+            "skip_first_trs + voxel_norm_ref_volumes volumes, so those must be "
+            "acquired at rest, not while the subject is already regulating. "
+            "Values below that warmup are raised automatically. 0 disables."
+        ),
     )
     parser.add_argument(
         "--feedback-signal",
@@ -1252,7 +1815,37 @@ def main() -> None:
         "--z-center",
         type=float,
         default=50.0,
-        help="Line centre (0-100) for z mapping and for the pre-feedback baseline.",
+        help="Line centre (0-100) for the pre-feedback baseline and the "
+             "post-run rest display. Not used by the arcsine or cdf mappings, "
+             "which are both centred on 50 by construction.",
+    )
+    parser.add_argument(
+        "--feedback-mapping",
+        choices=["arcsine", "cdf"],
+        default="arcsine",
+        help="How z becomes the 0-100 line. arcsine (default): "
+             "arcsin(sqrt(cdf(z)))*2/pi*100 -- less pinning at the ends than a "
+             "plain cdf while keeping good resolution near the middle. "
+             "cdf: norm.cdf(z)*100, the percentile against resting state; pins "
+             "~13%% of volumes per TR at the measured z spread, so pair it with "
+             "--mapping-scale 2.",
+    )
+    parser.add_argument(
+        "--mapping-scale",
+        type=float,
+        default=1.0,
+        help="Divide z by this before mapping. 1.0 = off. Raising it narrows "
+             "the displayed spread and reduces pinning at 0/100 (1.2 roughly "
+             "halves it for arcsine; use ~2 with --feedback-mapping cdf).",
+    )
+    parser.add_argument(
+        "--z-smooth-trs",
+        type=int,
+        default=1,
+        help="Average the last N z values before mapping (1 = off, the default). "
+             "Smoothing narrows the displayed distribution and makes the power "
+             "meter far better at separating regulation from noise, but changes "
+             "what the line shows -- pilot both before committing.",
     )
     parser.add_argument(
         "--rs",
@@ -1285,7 +1878,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-input",
-        choices=["auto", "mc", "reg", "t1", "smooth", "masked"],
+        choices=["auto", "mc", "reg", "t1"],
         default="t1",
         help="PCA decoder/output mode folder name.",
     )
@@ -1331,7 +1924,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--pca-volume-kind",
-        choices=["reg", "mc", "unwarped", "t1", "mni", "smooth", "masked"],
+        choices=["reg", "mc", "unwarped", "t1", "mni"],
         default=None,
         help="Realtime volume folder to score with PCA.",
     )
@@ -1415,17 +2008,32 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
-    max_trs = args.max_trs
     if args.active_feedback_trs is not None:
-        # Phase machine controls termination; max_trs is only a hard safety ceiling.
-        # Ceiling = generous warmup allowance + active + rest + margin.
-        tr_val = float(REGRESSOR_SETTINGS.TR)
-        warmup_allow = int(REGRESSOR_SETTINGS.skip_first_trs) + int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
-        rest_trs = int(round(float(args.rest_baseline_sec) / tr_val))
-        safety_ceiling = warmup_allow + int(args.active_feedback_trs) + rest_trs + 60
-        max_trs = safety_ceiling if max_trs is None else max_trs
-    elif max_trs is None and args.duration_min is not None:
-        max_trs = int(round((float(args.duration_min) * 60.0) / float(REGRESSOR_SETTINGS.TR)))
+        log.warning("--active-feedback-trs is ignored in the block design; run length "
+                    "comes from --rounds (%d) x (--active-sec %g + --rest-sec %g).",
+                    args.rounds, args.active_sec, args.rest_sec)
+    if not (1 <= args.rounds <= 50):
+        parser.error("--rounds must be between 1 and 50")
+    if args.start_level is not None and not (1 <= args.start_level <= N_LEVELS):
+        parser.error("--start-level must be between 1 and %d" % N_LEVELS)
+    if args.jingle is not None and not Path(args.jingle).is_file():
+        parser.error("--jingle file not found: %s" % args.jingle)
+    if not (0.0 <= args.jingle_volume <= 1.0):
+        parser.error("--jingle-volume must be between 0 and 1")
+    # The phase machine ends the run; max_trs is only a hard safety ceiling.
+    tr_val = float(REGRESSOR_SETTINGS.TR)
+    planned_s = (float(args.rest_lead_sec)
+                 + args.rounds * (float(args.active_sec) + float(args.rest_sec))
+                 + float(args.rest_baseline_sec))
+    max_trs = args.max_trs
+    if max_trs is None:
+        max_trs = int(round(planned_s / tr_val)) + 60
+    log.info("[RUN] planned length %.0fs = %.0fs rest lead + %d x (%.0f active + %.0f rest)%s "
+             "-> acquire at least %d volumes (safety ceiling %d).",
+             planned_s, float(args.rest_lead_sec), args.rounds, float(args.active_sec),
+             float(args.rest_sec),
+             (" + %.0fs tail" % float(args.rest_baseline_sec)) if args.rest_baseline_sec else "",
+             int(np.ceil(planned_s / tr_val)), max_trs)
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
     base_data = Path(args.base_data)
     subject_root = base_data / f"sub-{args.sub}"
@@ -1458,6 +2066,25 @@ def main() -> None:
 
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)
+
+    # The rest lead must cover the pipeline warmup, otherwise the voxel-norm
+    # reference is built from volumes acquired during regulation. Mirrors the
+    # voxel_norm_ref_volumes = baseline_trs lock in rt_nf_events_parallel.py.
+    rest_lead_s = float(args.rest_lead_sec)
+    if rest_lead_s > 0:
+        tr_s = float(REGRESSOR_SETTINGS.TR)
+        warmup_s = (int(REGRESSOR_SETTINGS.skip_first_trs)
+                    + int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)) * tr_s
+        if rest_lead_s < warmup_s:
+            log.warning(
+                "--rest-lead-sec %.1fs is shorter than the pipeline warmup "
+                "(skip_first_trs %d + voxel_norm_ref_volumes %d = %.1fs at TR=%.2f). "
+                "Raising it to %.1fs so the normalization reference is collected at rest.",
+                rest_lead_s, int(REGRESSOR_SETTINGS.skip_first_trs),
+                int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes), warmup_s, tr_s, warmup_s)
+            rest_lead_s = warmup_s
+        log.info("[PHASE] Rest lead %.1fs (%d TRs) before feedback.",
+                 rest_lead_s, int(round(rest_lead_s / tr_s)))
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
@@ -1633,8 +2260,28 @@ def main() -> None:
                 "fmap_dir": str(cfg.fmap_dir),
                 "duration_min": args.duration_min,
                 "active_feedback_trs": args.active_feedback_trs,
-                "feedback_delay_s": args.feedback_delay,
+                "rest_lead_s": rest_lead_s,
+                "feedback_mapping": args.feedback_mapping,
+                "mapping_scale": args.mapping_scale,
+                "z_smooth_trs": args.z_smooth_trs,
                 "rest_baseline_sec": args.rest_baseline_sec,
+                "design": "block",
+                "rounds": args.rounds,
+                "active_sec": args.active_sec,
+                "rest_sec": args.rest_sec,
+                "meter_start": METER_START,
+                "meter_gain": METER_GAIN,
+                "attack_interval": ATTACK_INTERVAL,
+                "dmg_jitter": DMG_JITTER,
+                "n_levels": N_LEVELS,
+                "level_rule": "best of 3 (2 wins up, 2 losses down)",
+                "result_sec": args.result_sec,
+                "enemy_strength": ENEMY_STRENGTH,
+                "start_level_arg": args.start_level,
+                "jingle": args.jingle,
+                "jingle_volume": args.jingle_volume,
+                "audio_lib": args.audio_lib,
+                "audio_device": args.audio_device,
                 "roi_labels": roi_labels,
                 "direction_labels": direction_labels,
                 "condition_symbols": symbols,
@@ -1745,13 +2392,13 @@ def main() -> None:
         pca_process.start()
 
     if args.feedback_signal == "z" and not args.reference_score_run:
-        log.warning(
-            "Feedback signal is z (normalized to resting state) but no --rs was given: "
-            "the line will fall back to RAW decoder values, which for many decoders are "
-            "far outside 0-100 and will pin the line. Pass --rs <RS run> for normalized feedback."
+        parser.error(
+            "--feedback-signal=z requires --rs <RS run>. Without it the pipeline emits "
+            "no score_z and the display has nothing valid to show."
         )
-    log.info("[DISPLAY] Robot line driven by %s score (z_center=%s, z_gain=%s, delay=%ss).",
-             args.feedback_signal, args.z_center, args.z_gain, args.feedback_delay)
+    log.info("[DISPLAY] Robot line: signal=%s mapping=%s scale=%.2f smooth=%d TR.",
+             args.feedback_signal, args.feedback_mapping, args.mapping_scale,
+             args.z_smooth_trs)
     try:
         run_robot_task_presentation(
             score_queue=score_queue,
@@ -1763,12 +2410,24 @@ def main() -> None:
             day=args.day,
             run=args.run,
             tr=float(REGRESSOR_SETTINGS.TR),
-            feedback_delay=args.feedback_delay,
+            rest_lead_s=rest_lead_s,
             feedback_signal=args.feedback_signal,
+            feedback_mapping=args.feedback_mapping,
+            mapping_scale=args.mapping_scale,
+            z_smooth_trs=args.z_smooth_trs,
             z_gain=args.z_gain,
             z_center=args.z_center,
-            active_feedback_trs=args.active_feedback_trs,
+            n_rounds=args.rounds,
+            active_s=args.active_sec,
+            rest_s=args.rest_sec,
+            result_s=args.result_sec,
             rest_baseline_s=args.rest_baseline_sec,
+            level_state_path=subject_root / str(args.day) / "robot_level_state.json",
+            start_level=args.start_level,
+            jingle_path=args.jingle,
+            jingle_volume=args.jingle_volume,
+            audio_lib=args.audio_lib,
+            audio_device=args.audio_device,
         )
     finally:
         pca_stop.set()

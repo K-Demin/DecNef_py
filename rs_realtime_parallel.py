@@ -121,6 +121,7 @@ def _wait_for_epi_dicoms(
     )
     while True:
         count = _count_epi_dicoms(incoming_dir, epi_block, keep_start, keep_end)
+        print(count, incoming_dir, epi_block, keep_start, keep_end, min_vols)
         if count >= min_vols:
             log.info("Detected %d EPI DICOMs; proceeding with preprocessing.", count)
             return
@@ -420,15 +421,34 @@ def run_fixation_presentation(
     score_queue: Queue,
     max_trs: Optional[int],
     stop_event: mp.Event,
+    fix_size: float = 0.3,
 ) -> None:
     from psychopy import core, event, visual
 
     win = _build_presentation_window(visual, color=[-0.004, -0.004, -0.004])
+
+    try:
+        w, h = win.size
+        aspect_ratio = float(h) / float(w)
+    except Exception:
+        aspect_ratio = 1.0
+
+    fixation = visual.ShapeStim(
+        win,
+        units="norm",
+        vertices="cross",
+        pos=(0, 0),
+        size=(aspect_ratio * fix_size, fix_size),
+        fillColor="white",
+        lineColor="white",
+    )
+
     seen_vols: set[int] = set()
 
     while True:
         win.fullscr = True
         _release_mouse_cursor(win)
+        fixation.draw()
         win.flip()
         try:
             while True:

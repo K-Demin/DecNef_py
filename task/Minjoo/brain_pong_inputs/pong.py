@@ -1,15 +1,15 @@
 from __future__ import annotations
 from pathlib import Path
 import logging
+import math
 import random
-from collections import deque
 from typing import Callable
 
 from psychopy import visual, core, event
 
 import numpy as np
 import pandas as pd
-from scipy.stats import gamma
+from .binary import BalancedTargets, DelayedBinaryKeys, decoder_state, target_position
 
 
 LOGGER = None
@@ -36,7 +36,7 @@ class Pong:
         pre_delay (float): Delay before trial starts in seconds.
         send_speed (float, optional): Ball speed when player hits.
         receive_speed (float, optional): Ball speed when opponent hits.
-        paddle_lag (int): Input lag in frames.
+        paddle_lag (int): Legacy option; binary input bypasses all lag.
         opponent_handicap (float): Opponent speed reduction (0-1).
 
     Attributes:
@@ -68,6 +68,10 @@ class Pong:
         receive_speed: float | None = None,
         paddle_lag: int = 360,
         opponent_handicap: float = 0,
+        agent_miss_prob: float = 0.2,
+        agent_miss_mode: str = "random",
+        agent_miss_offset: float = 0.15,
+        agent_tracking_noise: float = 0.0,
         step_size: float = 1.0, # in percent?
         intended_y: float = 0.0,
         intended_shift: float = 0.0,
@@ -76,15 +80,23 @@ class Pong:
         brain_controller: Callable[[float], float] | None = None,
         frame_callback: Callable | None = None,
         idle_callback: Callable | None = None,
+        rally_callback: Callable | None = None,
+        contact_callback: Callable | None = None,
+        target_schedule: BalancedTargets | None = None,
+        run_id: str = "",
+        trial_id: int = 0,
+        keyboard_delay_sec: float = 6.0,
+        rng: random.Random | None = None,
     ):
         # params
         self.logger = logger
         self.win = win
+        self.rng = rng if rng is not None else random
 
         # Validate input method
-        if input_method not in ["mouse", "brain", "press", "wheel"]:
+        if input_method not in ["mouse", "brain", "press", "wheel", "keyboard"]:
             raise ValueError(
-                f"input_method must be 'mouse' or 'brain' or 'press' or 'wheel', got '{input_method}'"
+                f"input_method must be mouse/brain/press/wheel/keyboard, got '{input_method}'"
             )
 
         if paddle_response_mode not in ["hrf", "hold"]:
@@ -95,11 +107,23 @@ class Pong:
 
         self.input_method = input_method
         self.paddle_response_mode = paddle_response_mode
+        self.keyboard_controller = DelayedBinaryKeys(keyboard_delay_sec)
         self.brain_controller = brain_controller
         self.frame_callback = frame_callback
         self.idle_callback = idle_callback
         self.brain_position = 0.0
-        if self.input_method != "brain":
+        self.z_score = 0.0
+        self.decoder_state = decoder_state(self.z_score)
+        self.target_schedule = target_schedule or BalancedTargets()
+        self.contact_callback = contact_callback
+        self.run_id = run_id
+        self.trial_id = trial_id
+        self.contacts = []
+        self.participant_hits = 0
+        self.participant_misses = 0
+        self.approach_id = 0
+        self.refresh_rate = 60.0
+        if self.input_method not in ("brain", "keyboard"):
             self.mouse = event.Mouse(win=win)
 
         self.reset_timer = reset_timer
@@ -110,6 +134,16 @@ class Pong:
         self.paddle_lag = paddle_lag
         self.level = level
         self.opponent_handicap = 1 - opponent_handicap
+        self.agent_miss_prob = float(agent_miss_prob)
+        if agent_miss_mode not in ["random", "adaptive"]:
+            raise ValueError(
+                "agent_miss_mode must be 'random' or 'adaptive', "
+                f"got '{agent_miss_mode}'"
+            )
+        self.agent_miss_mode = agent_miss_mode
+        self.agent_miss_offset = float(agent_miss_offset)
+        self.agent_tracking_noise = float(agent_tracking_noise)
+        self.rally_callback = rally_callback
         
         # object properties
         self.init_vel = np.array(ball_vel)
@@ -123,11 +157,18 @@ class Pong:
         )
 
         # state variables
-        self.points = init_points
+        self.player_points = init_points
+        self.agent_points = 0
         self.in_play = True
         self.is_left_miss = False
         self.is_right_miss = False
         self.show_miss_message = False
+        self._agent_will_miss = False
+        self._agent_miss_dir = 1.0
+        self.agent_hits = 0
+        self.agent_misses = 0
+        self.rally_outcomes = []
+        self.last_rally_won = None
         self.rally = 1  # 0 = delay
 
         # event tracking - pre-allocate array w/ buffer
@@ -139,17 +180,8 @@ class Pong:
         self.start_time = None
         self.last_hit = None
 
-        # paddle lag buffer - stores input position history
-        self.input_history =[] # np.zeros(paddle_lag+1) #deque(maxlen=max(paddle_lag + 1, 1))
-        self.intended_y = 0.0
+        self.intended_y = target_position(self.decoder_state)
         self.intended_shift = 0.0
-
-        # Do HRF convolution
-        self.window_input = []
-        self.input_move = []
-        self.convolved = []
-        self.hrf_input = []
-
 
         # display setup
         self.win_width, self.win_height = win.winHandle.get_size()
@@ -176,13 +208,29 @@ class Pong:
         self.logger.info(f"  points increment: {point_increment}")
         self.logger.info(f"  time limit: {time_limit}")
         self.logger.info(f"  pre delay: {pre_delay}")
-        self.logger.info(f"  paddle lag: {paddle_lag} frames")
+        self.logger.info("  binary controller: z > 0 TOP, otherwise BOTTOM")
+        if self.input_method == "keyboard":
+            self.logger.info(f"  behavioral input: 1=TOP, 2=BOTTOM; fixed delay={keyboard_delay_sec}s")
+        else:
+            self.logger.info("  no additional input delay")
         self.logger.info(f"  init velo: {ball_vel}")
         self.logger.info(f"  default speed: {default_speed}")
         self.logger.info(f"  send speed: {self.send_speed}")
         self.logger.info(f"  receive speed: {self.receive_speed}")
+        self.logger.info(f"  agent miss prob: {self.agent_miss_prob}")
+        self.logger.info(f"  agent miss mode: {self.agent_miss_mode}")
+        self.logger.info(f"  agent miss offset: {self.agent_miss_offset}")
+        self.logger.info(f"  agent tracking noise: {self.agent_tracking_noise}")
 
         self._reset_game()
+
+    @property
+    def points(self):
+        return self.player_points
+
+    @points.setter
+    def points(self, value):
+        self.player_points = value
 
     def _setup_game_objects(
         self,
@@ -230,8 +278,21 @@ class Pong:
             size=(aspect_ratio, 1.0),
         )
 
-        self.points_text = visual.TextStim(
-            win=self.win, units="norm", text="Points: 0", height=0.05, pos=[0, 0.8]
+        self.score_text = visual.TextStim(
+            win=self.win,
+            units="norm",
+            text="0 : 0",
+            height=0.08,
+            pos=[0, 0.85],
+            color="white",
+        )
+        self.message_text = visual.TextStim(
+            win=self.win,
+            units="norm",
+            text="",
+            height=0.06,
+            pos=[0, 0.72],
+            color="white",
         )
 
         self.level_text = visual.TextStim(
@@ -276,6 +337,8 @@ class Pong:
 
             if self.idle_callback is not None:
                 self.idle_callback(self, elapsed, time_remaining)
+            elif self.input_method == "keyboard":
+                self._update_player_paddle()
 
             if time_remaining <= change_color_time:
                 self.fixation.fillColor = "red"
@@ -299,16 +362,14 @@ class Pong:
         return False
 
     def _reset_game(self):
-        self.ball.pos = [0, 0]
-
-        # always go toward opponent at random angle with send speed
-        ymin, ymax = (0.3, 0.8)
-        angle_y = random.uniform(*random.choice([(-ymax, -ymin), (ymin, ymax)]))
-        direction = np.array([1.0, angle_y])
-        self.ball_vel = direction * (self.send_speed / np.linalg.norm(direction))
+        # Agent serves each rally from the right side toward the player.
+        self.ball.pos = [self.paddle_pos - self.paddle_width, 0]
+        self._start_participant_approach()
+        self._agent_will_miss = False
+        self._agent_miss_dir = self.rng.choice([-1.0, 1.0])
 
         self.logger.info("ball reset")
-        self.left_paddle.pos = [-self.paddle_pos, 0]
+        self.left_paddle.pos = [-self.paddle_pos, target_position(self.decoder_state)]
         self.right_paddle.pos = [self.paddle_pos, 0]
         self.in_play = True
         self.is_left_miss = False
@@ -316,198 +377,171 @@ class Pong:
         self.reset_timer = 0.0
         self.show_miss_message = False
 
-        # reset intended position and input history
-        self.intended_y = 0.0
+        self.intended_y = target_position(self.decoder_state)
         self.intended_shift = 0.0
         self.wheel = 0
-        #self.input_history.clear()
-        self.input_history = list(np.zeros(self.paddle_lag+1))
-        self.clickevent = []
-        self.hrf_kernel = self._make_hrf_kernel()
-        self.peak_hold_kernel = self._make_peak_hold_kernel()
 
-        ## pre-fill buffer with initial position
-        #for _ in range(self.paddle_lag + 1):
-        #    self.input_history.append(0.0)
+    def _start_participant_approach(self):
+        self.target_side = self.target_schedule.next()
+        self.approach_id += 1
+        self._participant_contact_done = False
+        endpoint = np.array([-self.paddle_pos, target_position(self.target_side)])
+        direction = endpoint - np.asarray(self.ball.pos, dtype=float)
+        self.ball_vel = direction * (self.receive_speed / np.linalg.norm(direction))
 
+    def time_to_arrival(self) -> float | None:
+        if not self.in_play or self.ball_vel[0] >= 0 or self._participant_contact_done:
+            return None
+        frames = (-self.paddle_pos - self.ball.pos[0]) / self.ball_vel[0]
+        return max(0.0, float(frames) / self.refresh_rate)
 
-    def _hrf_(self, times):
-        """ Return values for HRF at given times """
-        # Gamma pdf for the peak
-        peak_values = gamma.pdf(times, 6)
-        # Gamma pdf for the undershoot
-        undershoot_values = gamma.pdf(times, 12)
-        # Combine them
-        values = peak_values - 0.35 * undershoot_values
-        # Scale max to 0.6
-        return values / np.max(values)  
+    def _record_participant_contact(self) -> bool:
+        hit = self.decoder_state == self.target_side
+        self.participant_hits += int(hit)
+        self.participant_misses += int(not hit)
+        record = {
+            "timestamp": core.getTime() - (self.start_time or 0.0),
+            "run_id": self.run_id,
+            "trial_id": self.trial_id,
+            "rally": self.rally,
+            "approach_id": self.approach_id,
+            "target_side": self.target_side,
+            "decoder_state_at_contact": self.decoder_state,
+            "z_score_at_contact": self.z_score,
+            "participant_hit": hit,
+            "target_aligned_z": self.z_score if self.target_side == "TOP" else -self.z_score,
+            "level": self.level,
+            "clock_timestamp": core.getTime(),
+            "trial_start_clock": self.start_time,
+            "input_method": self.input_method,
+            "keyboard_delay_sec": self.keyboard_controller.delay_sec if self.input_method == "keyboard" else 0.0,
+        }
+        self.contacts.append(record)
+        if self.contact_callback is not None:
+            self.contact_callback(self, record)
+        return hit
 
-    def _make_hrf_kernel(self):
-        """paddle_lag+1 길이의 HRF 커널 (프레임 기반)"""
-        n = self.paddle_lag + 1
-        hrf_dur = 20.0                         # HRF 20초 동안 자르기 (원하면 조절)
-        dt = hrf_dur / (n - 1)                 # HRF 샘플 간격
-        t = np.arange(0, n) * dt               # 0, dt, 2dt, ...
-        return self._hrf_(t)                   # shape: (n,)
+    def _choose_agent_miss(self) -> bool:
+        if self.agent_miss_mode == "random":
+            return self.rng.random() < self.agent_miss_prob
 
-    def _make_peak_hold_kernel(self):
-        """HRF rising limb that holds at peak instead of returning to baseline."""
-        hrf_kernel = self._make_hrf_kernel()
-        peak_idx = int(np.argmax(hrf_kernel))
-        peak_val = hrf_kernel[peak_idx]
-        hold_kernel = hrf_kernel.copy()
-        hold_kernel[peak_idx:] = peak_val
-        return hold_kernel / peak_val
-
-    def _get_click_response(self):
-        n = min(len(self.clickevent), len(self.hrf_kernel))
-        ev_use = self.clickevent[-n:]
-
-        if self.paddle_response_mode == "hold":
-            k = self.peak_hold_kernel[:n]
-            older_click_sum = sum(self.clickevent[:-n])
-            return older_click_sum + float(np.dot(ev_use[::-1], k))
-
-        k = self.hrf_kernel[:n]
-        return float(np.dot(ev_use[::-1], k))
+        attempts_after_next = self.agent_hits + self.agent_misses + 1
+        target_misses = math.floor(self.agent_miss_prob * attempts_after_next + 0.5)
+        return self.agent_misses < target_misses
 
 
     def _update_player_paddle(self, dt: float = 0.0):
-
-        if self.input_method == "brain":
-            if self.brain_controller is not None:
-                self.brain_position = float(self.brain_controller(dt))
-            self.intended_y = float(np.clip(self.brain_position, -1.0, 1.0))
-            self.left_paddle.pos = [-self.paddle_pos, self.intended_y]
-            self.click = 0
-            return
-
-        if self.input_method == 'mouse':
-            mouse_pos = self.mouse.getPos()
-            self.intended_y = mouse_pos[1] / (self.win_height / 2)
-            self.input_history.append(self.intended_y)
-
-            lagged_y = self.input_history[-self.paddle_lag]
-            self.left_paddle.pos = [-self.paddle_pos, lagged_y] 
-
-        else:
-            if self.input_method == 'press':
-
-                left, middle, right = self.mouse.getPressed()
-
-                if left:
-                    self.click = 1
-                elif right:
-                    self.click = -1
-                else:
-                    self.click = 0
-
-            elif self.input_method == 'wheel':
-
-                wheel = self.mouse.getWheelRel()
-
-                if wheel[1] > 0:
-                    self.click = -1
-                    #wheel = [0, 0]
-                elif wheel[1] < 0:
-                    self.click = 1
-                    #wheel = [0, 0]
-                else:
-                    self.click = 0
-
-
-            self.clickevent.append(self.click)
-
-            self.intended_y = (
-                self._get_click_response() * self.step_size
-            ) / (self.win_height / 2)
-            self.input_history.append(np.clip(self.intended_y, -1, 1)) 
-
-            if len(self.input_history) > self.paddle_lag:
-                delayed_val = self.input_history[-(self.paddle_lag+1)]
-            else:
-                delayed_val = 0.0
-
-            self.left_paddle.pos = [-self.paddle_pos, delayed_val]
-
-
-        # apply most/oldest lagged position to actual paddle
-        
-        # When you need direct n-s delay, uncomment these lines.
+        """Brain input is a normalized z-score; manual inputs simulate its sign."""
+        z = self.z_score
+        self.click = 0
+        if self.input_method == "keyboard":
+            keys = event.getKeys(keyList=["1", "2", "num_1", "num_2"])
+            now = core.getTime() - (self.start_time or 0.0)
+            side = self.keyboard_controller.update(now, keys)
+            self.click = (1 if keys[-1] in ("1", "num_1") else -1) if keys else 0
+            z = 1.0 if side == "TOP" else -1.0
+        elif self.input_method == "brain":
+            z = float(self.brain_controller(dt)) if self.brain_controller else self.brain_position
+        elif self.input_method == "mouse":
+            z = self.mouse.getPos()[1]
+        elif self.input_method == "press":
+            left, _, right = self.mouse.getPressed()
+            self.click = 1 if left else (-1 if right else 0)
+            if self.click:
+                z = float(self.click)
+        elif self.input_method == "wheel":
+            wheel = self.mouse.getWheelRel()[1]
+            self.click = -1 if wheel > 0 else (1 if wheel < 0 else 0)
+            if self.click:
+                z = float(self.click)
+        self.set_brain_position(z)
 
     def set_brain_position(self, position: float) -> None:
-        """Set paddle position supplied by an external neural controller."""
-        self.brain_position = float(np.clip(position, -1.0, 1.0))
+        """Compatibility setter: the supplied value is now z, never a y coordinate."""
+        self.decoder_state = decoder_state(position)
+        self.z_score = float(position)
+        self.brain_position = self.z_score
+        self.intended_y = target_position(self.decoder_state)
+        self.left_paddle.pos = [-self.paddle_pos, self.intended_y]
 
     def _update_opponent_paddle(self):
-        self.right_paddle.pos = [self.paddle_pos, self.ball.pos[1]]
-
-    def _check_paddle_hit(self, paddle):
-        """Check if ball hits a paddle"""
-        ball_x, ball_y = self.ball.pos
-        paddle_x, paddle_y = paddle.pos
-
-        within_x = abs(ball_x - paddle_x) < (self.ball_radius + self.paddle_width / 2)
-        within_y = abs(ball_y - paddle_y) < (self.paddle_height / 2 + self.ball_radius)
-
-        return within_x and within_y
+        target_y = self.ball.pos[1]
+        if self.agent_tracking_noise > 0:
+            target_y += self.rng.gauss(0, self.agent_tracking_noise)
+        if (
+            self._agent_will_miss
+            and self.ball.pos[0] > 0.5
+            and self.ball_vel[0] > 0
+        ):
+            miss_offset = max(
+                self.agent_miss_offset,
+                self.paddle_height / 2 + self.ball_radius + 0.02,
+            )
+            miss_dir = self._agent_miss_dir
+            candidate_y = float(np.clip(target_y + miss_dir * miss_offset, -1.0, 1.0))
+            miss_distance = self.paddle_height / 2 + self.ball_radius
+            if abs(candidate_y - self.ball.pos[1]) <= miss_distance:
+                miss_dir *= -1.0
+                candidate_y = float(
+                    np.clip(target_y + miss_dir * miss_offset, -1.0, 1.0)
+                )
+            target_y = candidate_y
+        self.right_paddle.pos = [
+            self.paddle_pos,
+            float(np.clip(target_y, -1.0, 1.0)),
+        ]
 
     def _check_hits(self):
-        """Detect hit with paddle Reverse velocity i"""
+        """Resolve one decision at the fixed paddle x plane, independent of size."""
         wall, left, right = 0, 0, 0
-        ball_vel = self.ball_vel
-        ball_pos = self.ball.pos
-
-        if abs(ball_pos[1]) > 0.95:
-            ball_vel[1] *= -1
+        if abs(self.ball.pos[1]) > 0.95:
+            self.ball_vel[1] *= -1
             wall = 1
 
-        if ball_vel[0] < 0:
-            # ball moving left - check left paddle
-            if (
-                self._check_paddle_hit(self.left_paddle)
-                and ball_pos[0] > self.left_paddle.pos[0]
-            ):
-                ball_vel[0] = -ball_vel[0]
-                speed = np.sqrt(ball_vel[0] ** 2 + ball_vel[1] ** 2)
-                scale = self.send_speed / speed
-                ball_vel[0] *= scale
-                ball_vel[1] *= scale
-                self.points += self.point_increment
-                left = 1
-                self.logger.info("left hit")
-        else:
-            # ball moving right - check right paddle
-            if (
-                self._check_paddle_hit(self.right_paddle)
-                and ball_pos[0] < self.right_paddle.pos[0]
-            ):
-                ball_vel[0] = -ball_vel[0]
-                speed = np.sqrt(ball_vel[0] ** 2 + ball_vel[1] ** 2)
-                scale = self.receive_speed / speed
-                ball_vel[0] *= scale
-                ball_vel[1] *= scale
-                right = 1
-                self.logger.info("right hit")
-
+        if self.ball_vel[0] < 0:
+            if not self._participant_contact_done and self.ball.pos[0] <= -self.paddle_pos:
+                self._participant_contact_done = True
+                # Snap the small frame overshoot to the categorical visual endpoint.
+                self.ball.pos = [-self.paddle_pos, target_position(self.target_side)]
+                if self._record_participant_contact():
+                    self.ball_vel[0] *= -1
+                    self.ball_vel *= self.send_speed / np.linalg.norm(self.ball_vel)
+                    left = 1
+                    self._agent_will_miss = self._choose_agent_miss()
+                    self._agent_miss_dir = self.rng.choice([-1.0, 1.0])
+                    self.logger.info("left binary hit")
+        elif self.ball.pos[0] >= self.paddle_pos and not self._agent_will_miss:
+            # The planned opponent miss probability is authoritative as well.
+            self.ball.pos = [self.paddle_pos, float(self.ball.pos[1])]
+            self.agent_hits += 1
+            right = 1
+            self._start_participant_approach()
+            self.logger.info("right hit")
         return wall, left, right
 
-    def _update_miss(self):
+    def _update_miss(self, player_won: bool):
         self.in_play = False
         self.reset_timer = 0.0
         self.rally += 1
+        self.last_rally_won = player_won
+        self.rally_outcomes.append(player_won)
+        if self.rally_callback is not None:
+            self.rally_callback(self, player_won)
 
     def _check_miss(self):
         if self.ball.pos[0] < -1.0:
-            self.logger.info("miss left")
+            self.logger.info("miss left (player)")
             self.show_miss_message = True
             self.is_left_miss = True
-            self._update_miss()
+            self.agent_points += 1
+            self._update_miss(player_won=False)
 
         elif self.ball.pos[0] > 1.0:
-            self.logger.info("miss right")
+            self.logger.info("miss right (agent)")
             self.is_right_miss = True
-            self._update_miss()
+            self.agent_misses += 1
+            self.player_points += 1
+            self._update_miss(player_won=True)
 
     def update(self, dt):
         """Update game state for one frame.
@@ -517,13 +551,14 @@ class Pong:
         """
         timestamp = core.getTime() - self.start_time
 
+        # Continue consuming TRs during the short post-miss animation too.
+        self._update_player_paddle(dt)
         if not self.in_play:
             self.reset_timer += dt
             if self.reset_timer >= self.reset_delay:
                 self._reset_game()
             return
 
-        self._update_player_paddle(dt)
         self._update_opponent_paddle()
 
         # update ball position
@@ -534,6 +569,7 @@ class Pong:
 
         hits = self._check_hits()
         self._check_miss()
+        ball_pos = self.ball.pos
 
         if self.event_idx < len(self.events):
             self.events[self.event_idx, 0] = timestamp
@@ -560,11 +596,11 @@ class Pong:
         self.right_paddle.draw()
         self.ball.draw()
 
+        self.score_text.text = f"{self.player_points} : {self.agent_points}"
+        self.score_text.draw()
         if self.show_miss_message:
-            self.points_text.text = "Miss!"
-        else:
-            self.points_text.text = f"Points: {self.points}"
-        self.points_text.draw()
+            self.message_text.text = "You scored!" if self.is_right_miss else "Missed!"
+            self.message_text.draw()
 
     def export(self):
         """Save event data to file.
@@ -572,6 +608,11 @@ class Pong:
         Returns:
             pd.DataFrame: Event data, or None if no events recorded.
         """
+        if self.save_file is not None and self.input_method == "keyboard":
+            key_file = Path(self.save_file).with_name(Path(self.save_file).stem + "_keys.tsv")
+            pd.DataFrame(self.keyboard_controller.records, columns=[
+                "key", "key_timestamp", "requested_state", "scheduled_timestamp", "applied_timestamp",
+            ]).to_csv(key_file, sep="\t", index=False)
         if self.event_idx == 0 or self.save_file is None:
             self.logger.info("no events to save")
             return None
@@ -616,14 +657,19 @@ class Pong:
             }
         )
         df.to_csv(self.save_file, sep="\t", index=False)
+        contact_file = Path(self.save_file).with_name(Path(self.save_file).stem + "_contacts.tsv")
+        columns = ["timestamp", "run_id", "trial_id", "rally", "approach_id", "target_side",
+                   "decoder_state_at_contact", "z_score_at_contact", "participant_hit",
+                   "target_aligned_z", "level", "clock_timestamp", "trial_start_clock",
+                   "input_method", "keyboard_delay_sec"]
+        pd.DataFrame(self.contacts, columns=columns).to_csv(contact_file, sep="\t", index=False)
         self.logger.info(f"saved {len(df)} events to {self.save_file}")
         return df
 
     def compute_performance(self):
         """Calculate performance metrics from event data."""
-        events = self.events[: self.event_idx]
-        self.total_hits = int(np.sum(events[:, -4]))
-        misses = int(np.sum(events[:, -2]))
+        self.total_hits = self.participant_hits
+        misses = self.participant_misses
         self.total_possible = self.total_hits + misses
         self.performance = (
             self.total_hits / self.total_possible
@@ -651,10 +697,11 @@ class Pong:
             bool: True if completed normally, False if escaped.
         """
         if refresh_rate is None:
-            refresh = self.get_fps()
+            refresh = self.win.getActualFrameRate() or 60.0
         else:
             refresh = refresh_rate
 
+        self.refresh_rate = refresh
         if show_instructions and instruction_text is not None:
             instructions = visual.TextStim(
                 self.win,
@@ -663,7 +710,13 @@ class Pong:
             )
             instructions.draw()
             self.win.flip()
+            print(
+                "[BrainPong] Instruction screen is ready. "
+                "Select the PsychoPy window and press SPACE.",
+                flush=True,
+            )
             event.waitKeys(keyList=["space"])
+            print("[BrainPong] SPACE received; starting trial.", flush=True)
 
         self.start_time = core.getTime()
         self.logger.info("trial start")
