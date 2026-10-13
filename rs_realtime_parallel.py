@@ -693,6 +693,10 @@ def main() -> None:
         help="Maximum TR count preallocated by RTPSpy regression.",
     )
 
+    parser.add_argument(
+        "--test-speed", action="store_true",
+        help="Record per-volume stage/input timings and save speed_test.csv + speed_test.png when stopped.",
+    )
     args = parser.parse_args()
     if args.pca_score:
         raise ValueError(
@@ -847,6 +851,7 @@ def main() -> None:
                 else pca_reference_image
             ),
             enable_scoring=enable_scoring,
+            test_speed=args.test_speed,
             ap_block=args.ap_block,
             pa_block=args.pa_block,
         )
@@ -892,6 +897,13 @@ def main() -> None:
             if pipeline_process.is_alive():
                 pipeline_process.terminate()
             pipeline_process.join(timeout=5)
+            if args.test_speed:
+                try:
+                    from rt_speed import plot_speed
+                    speed_plot = plot_speed(cfg.rt_work_dir / "speed_test.csv", REGRESSOR_SETTINGS.TR)
+                    log.info("[SPEED] %s", speed_plot or "No completed volume timings to plot.")
+                except Exception:
+                    log.exception("[SPEED] Plot failed; recorded CSV remains available.")
             _plot_qc(cfg.rt_work_dir)
 
         if args.pca_prep:

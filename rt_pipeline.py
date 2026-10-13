@@ -79,11 +79,13 @@ class ResultEnvelope:
     motion_vec: Optional[np.ndarray] = None
     meta: dict[str, Any] = field(default_factory=dict)
 
-def log_step(step: str, vol: int, extra: str = "", start_t=None):
+def log_step(step: str, vol: int, extra: str = "", start_t=None, speed=None):
     """Compact colored/clean log."""
     v = f"{vol:05d}"
     if start_t is not None:
-        dt = time.time() - start_t
+        dt = time.perf_counter() - start_t
+        if speed is not None:
+            speed.stage(vol, step, dt)
         log.info(f"[{step:<5}] vol {v}  {extra}  ({dt*1000:.1f} ms)")
     else:
         log.info(f"[{step:<5}] vol {v}  {extra}")
@@ -433,6 +435,7 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
+    test_speed: bool = False
 
     # NEW
     ap_block: Optional[int] = None
@@ -1019,6 +1022,10 @@ class DICOMHandler(FileSystemEventHandler):
     ):
         super().__init__()
         self.cfg = cfg
+        self.speed = None
+        if getattr(cfg, "test_speed", False):
+            from rt_speed import SpeedRecorder
+            self.speed = SpeedRecorder(cfg.rt_work_dir / "speed_test.csv")
         self.current_run = int(cfg.run)
         self.next_volume_idx = 1
         self.score_queue = score_queue
@@ -1335,7 +1342,7 @@ class DICOMHandler(FileSystemEventHandler):
         log.info(f"[WATCHDOG] File closed: {path}")
         self.enqueue_path(path)
 
-    def enqueue_path(self, path: Path) -> None:
+    def enqueue_path(self, path: Path, backlog: bool = False) -> None:
         parsed = parse_dicom_name(path.name)
         if parsed is None:
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
@@ -1345,14 +1352,16 @@ class DICOMHandler(FileSystemEventHandler):
         if run_id != self.current_run:
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
+        if scan in self._processed_scans or scan in self._pending_scans:
+            return
+        if self.speed is not None:
+            self.speed.arrive(scan, backlog=backlog)
         if self._online_mode and not self._biopac_run_started:
             if not self._biopac_started:
                 self.start_biopac()
             elif self.biopac_receiver is not None:
                 self.biopac_receiver.send_run_start()
                 self._biopac_run_started = True
-        if scan in self._processed_scans or scan in self._pending_scans:
-            return
         self._pending.put((scan, path))
         self._pending_scans.add(scan)
 
@@ -1395,6 +1404,8 @@ class DICOMHandler(FileSystemEventHandler):
             return
         if exc is None:
             return
+        if self.speed is not None:
+            self.speed.finish(volume_idx, False)
 
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         log.error(
@@ -1469,7 +1480,7 @@ class DICOMHandler(FileSystemEventHandler):
         prepared_raw: Optional[Path] = None
         volume_timestamp: Optional[float] = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-            prepared_raw, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
+            prepared_raw, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx, self.speed)
             if prepared_raw is not None:
                 break
             log.warning(
@@ -1487,14 +1498,19 @@ class DICOMHandler(FileSystemEventHandler):
                     self._order_cv.wait(timeout=0.1)
             log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
             for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-                ok = process_volume(
-                    self.cfg,
-                    self,
-                    path,
-                    volume_idx,
-                    raw_nii=prepared_raw,
-                    volume_timestamp=volume_timestamp,
-                )
+                started = self.speed.process_start(volume_idx) if self.speed else None
+                try:
+                    ok = process_volume(
+                        self.cfg,
+                        self,
+                        path,
+                        volume_idx,
+                        raw_nii=prepared_raw,
+                        volume_timestamp=volume_timestamp,
+                    )
+                finally:
+                    if self.speed is not None:
+                        self.speed.process_end(volume_idx, started)
                 if ok:
                     break
                 log.warning(
@@ -1507,6 +1523,8 @@ class DICOMHandler(FileSystemEventHandler):
 
         if not ok:
             log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
+        if self.speed is not None:
+            self.speed.finish(volume_idx, ok)
         with self._lock:
             self._inflight_scans.discard(scan)
             self.mark_processed(scan)
@@ -1517,7 +1535,7 @@ class DICOMHandler(FileSystemEventHandler):
         tb_txt = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
             try:
-                env = compute_stage(self.cfg, path, scan=scan, volume_idx=volume_idx, attempt=attempt)
+                env = compute_stage(self.cfg, path, scan=scan, volume_idx=volume_idx, attempt=attempt, speed=self.speed)
                 env.attempts = attempt
                 return env
             except Exception as exc:
@@ -1537,11 +1555,17 @@ class DICOMHandler(FileSystemEventHandler):
         )
 
     def _commit_scan(self, env: ResultEnvelope) -> None:
+        speed = getattr(self, "speed", None)
+        started = speed.process_start(env.volume_idx) if speed else None
+        ok = False
         try:
-            commit_stage(self.cfg, self, env)
+            ok = commit_stage(self.cfg, self, env)
         except Exception as exc:
             log.error("[ENGINE] commit failure scan=%s vol=%05d err=%s", env.scan, env.volume_idx, exc)
         finally:
+            if speed is not None:
+                speed.process_end(env.volume_idx, started)
+                speed.finish(env.volume_idx, ok)
             with self._lock:
                 if env.scan <= self._last_committed_scan:
                     log.warning("[COMMIT] Ignoring already-committed/late scan=%s (last=%s)", env.scan, self._last_committed_scan)
@@ -1570,7 +1594,18 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC -> FMAP) ----------
 
-def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
+def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int, speed=None) -> tuple[Optional[Path], Optional[float]]:
+    if speed is None:
+        return _prepare_volume_input(cfg, dicom_path, volume_idx)
+    cached = (cfg.rt_raw_dir / f"vol_{volume_idx:05d}.nii").exists()
+    started = speed.conversion_start(volume_idx, cached=cached)
+    try:
+        return _prepare_volume_input(cfg, dicom_path, volume_idx)
+    finally:
+        speed.conversion_end(volume_idx, started)
+
+
+def _prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
     """
     Convert DICOM to raw NIfTI.
     This stage is safe to run ahead of ordered/stateful realtime steps.
@@ -1578,7 +1613,7 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
     volume_timestamp = time.time()
 
     # ---------- 1) DICOM -> raw NIfTI ----------
-    t0 = volume_timestamp
+    t0 = time.perf_counter()
     raw_dir = cfg.rt_raw_dir
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
@@ -1630,8 +1665,8 @@ def run_worker_local_volreg(ref_epi: Path, raw_nii: Path, mc_nii: Path, volume_i
     return mc_data, img.affine, motion_vec
 
 
-def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1) -> ResultEnvelope:
-    raw_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1, speed=None) -> ResultEnvelope:
+    raw_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx, speed)
     if raw_nii is None or volume_timestamp is None:
         raise RuntimeError("prepare_volume_input failed")
     return ResultEnvelope(
@@ -1677,7 +1712,7 @@ def process_volume(
       3) Motion correction of unwarped volume -> mc NIfTI
       4) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
     """
-
+    speed = getattr(handler, "speed", None)
     if raw_nii is None:
         raw_nii, prepared_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
         if raw_nii is None or prepared_timestamp is None:
@@ -1687,7 +1722,7 @@ def process_volume(
         volume_timestamp = time.time()
 
     # Unwarp raw BOLD in calibration geometry before estimating motion.
-    uw_t0 = time.time()
+    uw_t0 = time.perf_counter()
     raw_img = nib.load(str(raw_nii))
     validate_bold(raw_img, cfg.fmap_dir, str(REGRESSOR_SETTINGS.epi_phase_encoding).upper(), raw_nii)
     ref_img = nib.load(str(cfg.rt_motion_ref_epi))
@@ -1708,10 +1743,10 @@ def process_volume(
     img = nib.Nifti1Image(corrected, raw_img.affine)
     if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)):
         nib.save(img, str(local_unwarped))
-    log_step("FMAP", volume_idx, start_t=uw_t0)
+    log_step("FMAP", volume_idx, start_t=uw_t0, speed=speed)
 
     # ---------- 2) Motion correction (RtpVolreg) ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     mc_dir = cfg.rt_mc_dir
     mc_nii = mc_dir / f"vol_{volume_idx:05d}_mc.nii"
 
@@ -1769,9 +1804,11 @@ def process_volume(
         volume_idx,
         extra=f"FD={fd_to_save:.4f}" if np.isfinite(fd_to_save) else "FD=NaN (pre-trial)",
         start_t=t0,
+        speed=speed,
     )
 
     # ---------- 2b.5) CENSOR FLAGS (FD + DVARS) ----------
+    qc_t0 = time.perf_counter()
     fd_censor = 0
     dvars_censor = 0
 
@@ -1827,10 +1864,11 @@ def process_volume(
 
     # update prev for next DVARS
     handler.prev_mc_for_dvars = mc_data.copy()
-
+    if speed is not None:
+        speed.stage(volume_idx, "QC", time.perf_counter() - qc_t0)
 
     # ---------- 2d) Motion regression (RTPS_py) ----------
-    reg_t0 = time.time()
+    reg_t0 = time.perf_counter()
     mc_for_warp = mc_unwarped_nii
     if handler.motion_regressor is not None:
         handler.proc_src.proc_data = np.asanyarray(mc_unwarped_img.dataobj)
@@ -1844,7 +1882,7 @@ def process_volume(
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "motion", start_t=reg_t0)
+        log_step("REG", volume_idx, "cumulative GLM", start_t=reg_t0, speed=speed)
     else:
         cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
         reg_ready = True
@@ -1852,7 +1890,11 @@ def process_volume(
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0)
+        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0, speed=speed)
+
+    if speed is not None:
+        speed.readiness(volume_idx, reg_ready)
+    output_t0 = time.perf_counter()
 
     if handler.motion_regressor is not None:
         reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
@@ -1889,8 +1931,11 @@ def process_volume(
                 avg_timelag,
             )
 
+    if speed is not None:
+        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
+
     # ---------- 3) Space handling (EPI passthrough, EPI→T1, or EPI→T1→MNI) ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     score_input_nii = mc_for_warp
     score_input_orig_nii: Optional[Path] = None
@@ -1898,7 +1943,7 @@ def process_volume(
         score_input_orig_nii = mc_unwarped_nii
 
     if analysis_space == "epi":
-        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0)
+        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0, speed=speed)
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
@@ -1950,7 +1995,7 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = t1_orig_nii
-        log_step("TRANS", volume_idx, "warp→T1", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→T1", start_t=t0, speed=speed)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
         mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
@@ -2003,7 +2048,7 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = mni_orig_nii
-        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0, speed=speed)
     else:
         log.error(
             "Unsupported analysis_space=%r. Expected 'epi', 't1', or 'mni'.",
@@ -2014,7 +2059,7 @@ def process_volume(
     # Final image operation, after spatial transforms and before all scoring.
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
-        smooth_t0 = time.time()
+        smooth_t0 = time.perf_counter()
         kind = smoother.output_kind
         folder = cfg.rt_work_dir / kind
         score_input_nii = smooth_file(smoother, score_input_nii,
@@ -2022,8 +2067,9 @@ def process_volume(
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
                 folder / f"vol_{volume_idx:05d}_{kind}_orig.nii")
-        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0)
+        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
 
+    output_t0 = time.perf_counter()
     stream_kind = str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")).lower()
     stream_paths = {
         "raw": raw_nii,
@@ -2045,10 +2091,15 @@ def process_volume(
                 )
             except Exception as exc:
                 log.error(f"[SCORE] Failed to enqueue volume {volume_idx:05d}: {exc}")
+        if speed is not None:
+            speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
         return True
 
+    if speed is not None:
+        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
+
     # ---------- 4) Decoder scoring ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     try:
         # Load the warped volume (decoder/ROI space)
         score_img = nib.load(str(score_input_nii))
@@ -2114,7 +2165,7 @@ def process_volume(
         else:
             extra = f"raw={raw_score:.4f} z={z_score:.4f}"
 
-        log_step("SCORE", volume_idx, extra, start_t=t0)
+        log_step("SCORE", volume_idx, extra, start_t=t0, speed=speed)
 
     except Exception as e:
         log.error(f"[SCORE] Failed scoring vol {volume_idx:05d}: {e}")
@@ -2206,11 +2257,16 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
+    # Prime backlog provenance before created/closed notifications can arrive.
+    if event_handler.speed is not None:
+        for path in existing:
+            event_handler.speed.arrive(parse_dicom_name(path.name)[2], backlog=True)
+
     observer.start()
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
-            event_handler.enqueue_path(Path(f))
+            event_handler.enqueue_path(Path(f), backlog=True)
         while event_handler.submit_pending():
             continue
 

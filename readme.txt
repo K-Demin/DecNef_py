@@ -307,6 +307,39 @@ Contact / Notes
   but the pipeline just treats them as AP.nii.gz and PA.nii.gz, so future
   renaming will not break the logic.
 
+Measure realtime speed
+----------------------
+
+Append --test-speed to your usual rs_realtime_parallel.py command. It runs the
+same pipeline and records timings; stop normally with Ctrl+C after acquisition.
+The run folder (sub-<subject>/<day>/func/<run>/) receives:
+
+  speed_test.csv   per-volume measurements, flushed as volumes finish
+  speed_test.png   16:9 report generated after stopping, outside the TR loop
+
+The plot includes median/P90 stage times, processing and detection-to-completion
+latency across the run, and incoming-file intervals/idle waiting/queue delays.
+Stages include DICOM conversion, PyHySCO, MC+FD, QC, cumulative GLM (including any
+physiology wait), spatial resampling, masking/smoothing, decoder and output I/O.
+Warm-up volumes are marked; stage summaries use regression-ready volumes when
+available. Cumulative GLM is multiple linear regression refitted on all available
+run history, so inspect timings late in the run as well as near the start.
+
+Existing files are marked backlog, reused raw NIfTIs are marked cached, and
+failed volumes have their own status. Backlog detection intervals do not measure
+scanner cadence. Input timing begins when the watcher sees a file, not at the
+scanner trigger; file-transfer time before detection is therefore not measured.
+Processing includes file I/O and repeated conversion/processing attempts;
+end-to-end latency additionally includes queue delays and retry backoff. An
+interrupted volume may be absent, but completed rows remain in the CSV.
+Profiling is off by default. Matplotlib is only imported to make the report.
+Initialization/anatomy preparation and external display rendering are excluded.
+Each profiled invocation replaces this run's previous speed_test.csv/.png.
+
+To regenerate the report (set --tr to the run's configured TR, in seconds):
+
+    python rt_speed.py /path/to/run/speed_test.csv --tr 1.0
+
 Global runtime settings (new)
 -----------------------------
 
