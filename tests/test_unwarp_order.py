@@ -66,11 +66,12 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
         img._dataobj = np.roll(np.asarray(img.dataobj), 1, axis=0)
 
     handler.pyhysco_applier = SimpleNamespace(apply_volume=apply)
-    handler.volreg = SimpleNamespace(do_proc=mc, _motion=np.zeros((1, 6)))
+    handler.volreg = SimpleNamespace(do_proc=mc, _motion=np.zeros((1, 6)),
+                                    resample_support=lambda support, idx: support.copy())
     handler.biopac_receiver = None
     handler.motion_regressor.get_regressors = lambda idx: ([], None)
     streamed = []
-    handler.volume_streamer = SimpleNamespace(publish=lambda idx, path: streamed.append(path))
+    handler.volume_streamer = SimpleNamespace(publish=lambda idx, path, t1=None: streamed.append(path))
     if smoothing:
         from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
         kind = "masked" if smoothing == "masked" else "smooth"
@@ -190,7 +191,7 @@ def test_run_rejects_changed_pair_and_legacy_outputs(tmp_path, monkeypatch):
     work = tmp_path / "run"
     work.mkdir()
     cfg = SimpleNamespace(rt_work_dir=work, fmap_dir=pair, rt_motion_ref_epi=ref)
-    monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", SimpleNamespace(epi_phase_encoding="PA"))
+    monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", SimpleNamespace(epi_phase_encoding="PA", analysis_space="epi"))
     rt.validate_run_provenance(cfg)
     cfg.fmap_dir = make_pair(tmp_path / "other_pair")
     with pytest.raises(ValueError, match="changed"):

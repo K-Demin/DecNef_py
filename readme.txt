@@ -21,6 +21,29 @@ All heavy transforms for realtime are precomputed offline.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
+Partial-coverage EPI registration (explicit opt-in)
+--------------------------------------------------
+
+Preparation retains the existing full_brain registration by default. For a
+partial slab, select --registration-mode partial_epi in run_preproc.py, or set
+"registration_mode": "partial_epi" in the settings JSON passed to
+rs_realtime_parallel.py. The RS launcher forwards this choice to its automatic
+preparation step. Its equivalent CLI flags override only explicitly supplied
+values; omitted flags preserve the settings file.
+
+"registration_initialization": "auto" uses center_of_mass in full_brain mode
+and header-based identity in partial_epi mode. Explicit identity and
+center_of_mass choices are also supported. Partial mode uses Translation then
+Rigid registration; optional SyN refinement requires "partial_epi_syn": true
+or --partial-epi-syn. This option is false by default and is valid only in
+partial_epi mode.
+
+Preparation checks registration-cache compatibility before staging scans or
+rewriting config.json. An incompatible existing prepared session is rejected;
+use a fresh preparation/session directory and rebuild its reference and derived
+transforms together. This is not the truncate_t1_to_epi_fov output-grid option.
+Commands, settings and QC guidance: docs/partial_epi_registration.md
+
 Final analysis masking and spatial smoothing
 --------------------------------------------
 
@@ -47,8 +70,7 @@ Use absolute custom paths; relative paths are resolved from the process director
 
 Order: unwarp -> MC -> regression/normalization -> EPI/T1/MNI output ->
        final analysis masking / masked smoothing -> scoring.
-Motion estimation, DVARS, and WM/CSF nuisance extraction retain their existing
-inputs. The decoder ROI can be a smaller subset of the analysis/smoothing mask.
+The decoder ROI can be a smaller subset of the analysis/smoothing mask.
 
 whole_brain uses the corrected session EPI brain mask. cortical_gm selects the
 bilateral cortical DKT parcels from anat/fastsurfer/<subject>/mri/
@@ -64,10 +86,17 @@ MNI->EPI/T1 mask conversion is not supported; supply a mask in final coordinates
 Cortex/custom masks are intersected with transformed EPI brain coverage. Empty,
 nonfinite, nonbinary custom, or incompatible masks fail before volume processing.
 
-Positive-FWHM mathematics matches smooth_masked in the supplied volume_smooth.py:
-Gaussian(mask * volume) / Gaussian(mask) inside the SAME selected mask, zero outside;
+Each volume also carries geometric FOV support from its estimated MC transform
+through the same final spatial transform. This is independent of voxel intensity.
+The effective mask is the fixed analysis mask intersected with current support.
+Missing current samples are zeroed before spatial interpolation and final output.
+This does not add a missing-observation policy to cumulative nuisance regression.
+
+Positive-FWHM mathematics uses normalized convolution:
+Gaussian(effective_mask * volume) / Gaussian(effective_mask), zero outside;
 float64, per-axis mm-to-voxel conversion, zero padding, truncate=4, and original-value
-fallback where the denominator is below 1e-6. The denominator and buffers are cached.
+fallback where the denominator is below 1e-6. Buffers are reused; the denominator
+is recomputed when coverage removes analysis voxels and cached otherwise.
 At 0 mm, cortex/custom mode copies in-mask values unchanged and zeros everything
 else, with no Gaussian calls. This remains volumetric, not surface-geodesic smoothing.
 
@@ -75,10 +104,14 @@ Outputs under func/<run>/:
   smooth/vol_XXXXX_smooth.nii       positive FWHM, masked and smoothed
   masked/vol_XXXXX_masked.nii       cortex/custom masking with 0 mm
   corresponding *_orig.nii         optional original-score comparison stream
-Each active folder includes mask.nii (the actual final mask); source/coverage masks
-may also be saved for inspection. Earlier-step files remain unchanged. Final volumes
+Each active folder includes mask.nii (the fixed analysis mask). Per-volume support
+is saved separately in coverage/vol_XXXXX_epi.nii and, when applicable, *_t1.nii
+or *_mni.nii. New coverage handling requires fresh run outputs, but an unchanged
+prepared registration can be reused. Final volumes
 are published atomically for PCA readers. Stream "score_input" to see final output;
 "mc" and "unwarped" continue to show the earlier corrected volumes.
+The online viewer adds a second row for the same volume's T1 stage before
+smoothing. EPI/MNI runs without a T1 intermediate show that row as unavailable.
 
 PCA final reg/t1/mni readers follow the selected final stage from run metadata.
 Preparation accepts --pca-input smooth or masked; auto follows the final stage,

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
+import json
+import zipfile
 from pathlib import Path
 from typing import Sequence
 
@@ -25,6 +28,32 @@ def _torch_load_compat(path: Path):
     except TypeError:
         # Older PyTorch versions do not expose the weights_only argument.
         return torch.load(str(path), map_location="cpu")
+
+
+def sampling_grid_identity(moving_ref: Path, fixed_ref: Path, transforms: Sequence[Path]) -> dict:
+    """Identify the grids and ordered transform contents used for pull-resampling."""
+    def geometry(path):
+        img = nib.load(str(path))
+        return {
+            "shape": list(img.shape[:3]),
+            "affine": img.affine.tolist(),
+            "zooms": [float(v) for v in img.header.get_zooms()[:3]],
+            "qform": img.get_qform().tolist(),
+            "qform_code": int(img.header["qform_code"]),
+            "sform": img.get_sform().tolist(),
+            "sform_code": int(img.header["sform_code"]),
+        }
+
+    identities = []
+    for transform in transforms:
+        path = Path(transform)
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identities.append({"path": str(path.resolve()), "sha256": digest.hexdigest()})
+    return {"version": 2, "moving": geometry(moving_ref), "fixed": geometry(fixed_ref),
+            "transforms": identities}
 
 
 def make_voxel_coordinate_images(moving_ref: Path, out_dir: Path) -> dict[str, Path]:
@@ -64,26 +93,41 @@ def precompute_sampling_grid(
     Build a fixed-grid lookup for PyTorch grid_sample that approximates ANTs pull-resampling.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    identity = sampling_grid_identity(moving_ref, fixed_ref, transforms)
+    grid_path = out_dir / grid_name
+    if grid_path.exists():
+        try:
+            with np.load(str(grid_path)) as payload:
+                if json.loads(str(payload["provenance"].item())) == identity:
+                    return grid_path
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            pass  # Legacy, incomplete, or incompatible grids must be rebuilt.
+
+    # Regenerate every coordinate image together. Reusing an axis by filename
+    # would retain the old transform even after the grid itself is invalidated.
     coord_paths = make_voxel_coordinate_images(moving_ref, out_dir)
+    moving_img = nib.load(str(moving_ref))
+    coverage_path = out_dir / "coverage_epi.nii"
+    nib.save(nib.Nifti1Image(np.ones(moving_img.shape[:3], np.float32),
+                            moving_img.affine, moving_img.header), str(coverage_path))
+    coord_paths["coverage"] = coverage_path
 
     warped_paths: dict[str, Path] = {}
     for axis, coord_img in coord_paths.items():
         warped_img = out_dir / f"coord_{axis}_in_fixed.nii"
-        if not warped_img.exists():
-            cmd = [
-                "antsApplyTransforms",
-                "-d", "3",
-                "-i", str(coord_img),
-                "-r", str(fixed_ref),
-                "-o", str(warped_img),
-            ]
-            for transform in transforms:
-                cmd.extend(["-t", str(transform)])
-            cmd.extend(["-n", "Linear", "--float", "1"])
-            _run_cmd(cmd)
+        cmd = [
+            "antsApplyTransforms",
+            "-d", "3",
+            "-i", str(coord_img),
+            "-r", str(fixed_ref),
+            "-o", str(warped_img),
+        ]
+        for transform in transforms:
+            cmd.extend(["-t", str(transform)])
+        cmd.extend(["-n", "Linear", "--float", "1"])
+        _run_cmd(cmd)
         warped_paths[axis] = warped_img
 
-    moving_img = nib.load(str(moving_ref))
     fixed_img = nib.load(str(fixed_ref))
     moving_shape = np.array(moving_img.shape[:3], dtype=np.float32)
     cx = np.asanyarray(nib.load(str(warped_paths["x"])).dataobj).astype(np.float32)
@@ -96,16 +140,22 @@ def precompute_sampling_grid(
 
     # nibabel uses [X,Y,Z], grid_sample expects [Z,Y,X] layout and [x,y,z] components.
     grid_xyz = np.stack([gx, gy, gz], axis=-1)
+    coverage = np.asarray(nib.load(str(warped_paths["coverage"])).dataobj)
+    # ANTs fills out-of-field coordinate images with 0: that is otherwise
+    # indistinguishable from the legitimate source voxel (0, 0, 0).
+    # A separate ones image identifies these locations before normalization.
+    valid = np.isfinite(coverage) & (coverage >= 1.0 - 1e-5)
+    grid_xyz[~valid] = 3.0  # Fully outside grid_sample's source extent.
     grid_zyx = np.transpose(grid_xyz, (2, 1, 0, 3))
     grid = torch.from_numpy(grid_zyx[None, ...]).float()
 
-    grid_path = out_dir / grid_name
     np.savez_compressed(
         str(grid_path),
         grid=grid.numpy(),
         moving_shape=np.asarray(moving_img.shape[:3], dtype=np.int32),
         fixed_shape=np.asarray(fixed_img.shape[:3], dtype=np.int32),
         fixed_affine=fixed_img.affine.astype(np.float64),
+        provenance=json.dumps(identity, sort_keys=True),
     )
     return grid_path
 

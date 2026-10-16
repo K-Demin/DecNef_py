@@ -58,6 +58,8 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
+COVERAGE_POLICY = "mc_fov_v1"
+SUPPORT_THRESHOLD = 1.0 - 1e-5
 
 
 @dataclass
@@ -610,55 +612,14 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
         log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
         return None
 
-    grid_path_npz = out_dir / "sampling_grid.npz"
-    grid_path_pt = out_dir / "sampling_grid.pt"
-    grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
-    if grid_path.exists():
-        try:
-            fixed_img = nib.load(str(fixed_ref))
-            payload = GpuAntsLikeResampler._load_payload(grid_path)
-            cached_shape = tuple(int(v) for v in payload["fixed_shape"])
-            cached_affine = np.asarray(payload["fixed_affine"], dtype=np.float64)
-            if cached_shape != fixed_img.shape[:3] or not np.allclose(
-                cached_affine,
-                fixed_img.affine,
-                atol=1e-3,
-            ):
-                log.warning(
-                    "[GPU] Existing sampling grid does not match current fixed reference; "
-                    "recomputing %s",
-                    out_dir,
-                )
-                for stale in [
-                    grid_path_npz,
-                    grid_path_pt,
-                    out_dir / "coord_x_in_fixed.nii",
-                    out_dir / "coord_y_in_fixed.nii",
-                    out_dir / "coord_z_in_fixed.nii",
-                ]:
-                    if stale.exists():
-                        stale.unlink()
-                grid_path = grid_path_npz
-        except Exception as exc:
-            log.warning("[GPU] Could not validate existing sampling grid %s: %s", grid_path, exc)
-            for stale in [
-                grid_path_npz,
-                grid_path_pt,
-                out_dir / "coord_x_in_fixed.nii",
-                out_dir / "coord_y_in_fixed.nii",
-                out_dir / "coord_z_in_fixed.nii",
-            ]:
-                if stale.exists():
-                    stale.unlink()
-            grid_path = grid_path_npz
-    if not grid_path.exists():
-        log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
-        grid_path = precompute_sampling_grid(
-            moving_ref=moving_ref,
-            fixed_ref=fixed_ref,
-            transforms=transforms,
-            out_dir=out_dir,
-        )
+    # The builder validates both geometries and the ordered transform contents;
+    # grids from older versions without that provenance are rebuilt once.
+    grid_path = precompute_sampling_grid(
+        moving_ref=moving_ref,
+        fixed_ref=fixed_ref,
+        transforms=transforms,
+        out_dir=out_dir,
+    )
 
     device = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_device", "cuda"))
     resampler = GpuAntsLikeResampler(grid_path=grid_path, device=device, mode="bilinear")
@@ -937,6 +898,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "reference_score_stats": cfg.reference_score_stats,
             "enable_original_score": cfg.enable_original_score,
             "preprocessing_order": PIPELINE_ORDER,
+            "coverage_policy": COVERAGE_POLICY,
             "smoothing_fwhm_mm": float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0)),
             "analysis_mask": getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
             "analysis_mask_file": getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
@@ -1596,6 +1558,53 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC -> FMAP) ----------
 
+def final_volume_support(cfg, handler, support, epi_affine, volume_idx, space):
+    """Carry this volume's MC field of view through the same final transform.
+
+    Linear support must be essentially one: a retained output voxel must not
+    interpolate unavailable EPI samples. This is independent of BOLD intensity.
+    """
+    folder = cfg.rt_work_dir / "coverage"
+    folder.mkdir(parents=True, exist_ok=True)
+    epi_path = folder / f"vol_{volume_idx:05d}_epi.nii"
+    nib.save(nib.Nifti1Image(support.astype(np.uint8), epi_affine), epi_path)
+    if space == "epi":
+        return support
+    final_path = folder / f"vol_{volume_idx:05d}_{space}.nii"
+    reference = resolve_decoder_template(cfg)
+    ref = nib.load(str(reference))
+    if handler.gpu_resampler is not None:
+        mapped = handler.gpu_resampler.resample_array(support.astype(np.float32))
+    else:
+        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        if space == "mni":
+            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        cmd = ["antsApplyTransforms", "-d", "3", "-i", str(epi_path),
+               "-r", str(reference), "-o", str(final_path), "-n", "Linear", "--float", "1"]
+        for transform in transforms:
+            cmd.extend(["-t", str(transform)])
+        run(cmd)
+        mapped_img = nib.load(str(final_path), mmap=False)
+        require_same_grid(mapped_img, ref)
+        mapped = np.asarray(mapped_img.dataobj).copy()
+    if mapped.shape != ref.shape[:3] or not np.isfinite(mapped).all():
+        raise ValueError("Invalid per-volume coverage on the final image grid.")
+    valid = mapped >= SUPPORT_THRESHOLD
+    nib.save(nib.Nifti1Image(valid.astype(np.uint8), ref.affine), final_path)
+    return valid
+
+
+def zero_outside_support(path, support):
+    """Remove unsupported resampled values; do not infer validity from signal."""
+    if support.all():
+        return
+    img = nib.load(str(path), mmap=False)
+    data = np.asarray(img.dataobj).copy()
+    if data.shape != support.shape:
+        raise ValueError("BOLD and per-volume coverage shapes differ.")
+    data[~support] = 0
+    nib.save(nib.Nifti1Image(data, img.affine), str(path))
+
 def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int, speed=None) -> tuple[Optional[Path], Optional[float]]:
     if speed is None:
         return _prepare_volume_input(cfg, dicom_path, volume_idx)
@@ -1764,6 +1773,17 @@ def process_volume(
 
     # Extract corrected data and save with a FRESH header
     mc_data = np.asanyarray(tmp_img.dataobj).astype(np.float32)
+    # Apply the estimated motion to geometric support, never re-register a mask
+    # or threshold denoised intensities (valid residuals may be zero/negative).
+    acquisition_support = getattr(handler, "acquisition_support", None)
+    if acquisition_support is None or acquisition_support.shape != data.shape:
+        acquisition_support = np.ones(data.shape, dtype=np.float32)
+        handler.acquisition_support = acquisition_support
+    mc_support_values = handler.volreg.resample_support(acquisition_support, volume_idx - 1)
+    if mc_support_values.shape != mc_data.shape or not np.isfinite(mc_support_values).all():
+        raise ValueError("Invalid motion-corrected field-of-view support.")
+    mc_support = mc_support_values >= SUPPORT_THRESHOLD
+    mc_data[~mc_support] = 0
     mc_img = nib.Nifti1Image(mc_data, ref_img.affine)  # fixed corrected reference grid
     nib.save(mc_img, str(mc_nii))
 
@@ -1880,6 +1900,8 @@ def process_volume(
             fd_censor=fd_censor,
             dvars_censor=dvars_censor,
         )
+        cleaned = np.array(cleaned, copy=True)
+        cleaned[~mc_support] = 0
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
@@ -1887,6 +1909,8 @@ def process_volume(
         log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
     else:
         cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
+        cleaned = np.array(cleaned, copy=True)
+        cleaned[~mc_support] = 0
         reg_ready = True
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
@@ -1939,6 +1963,8 @@ def process_volume(
     # ---------- 3) Space handling (EPI passthrough, EPI→T1, or EPI→T1→MNI) ----------
     t0 = time.perf_counter()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    t1_stage_nii = None
+    pending_spatial_outputs = []
     score_input_nii = mc_for_warp
     score_input_orig_nii: Optional[Path] = None
     if cfg.enable_original_score and mc_unwarped_nii.exists():
@@ -1949,7 +1975,9 @@ def process_volume(
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
-        t1_nii = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+        t1_final = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+        t1_nii = t1_final.with_name("." + t1_final.name)
+        pending_spatial_outputs.append((t1_nii, t1_final))
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
@@ -1978,10 +2006,13 @@ def process_volume(
             ]
             run(cmd)
         score_input_nii = t1_nii
+        t1_stage_nii = t1_final
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
-            t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+            t1_orig_final = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+            t1_orig_nii = t1_orig_final.with_name("." + t1_orig_final.name)
+            pending_spatial_outputs.append((t1_orig_nii, t1_orig_final))
             if handler.gpu_resampler is not None:
                 handler.gpu_resampler.resample_nifti_to_nifti(mc_unwarped_nii, t1_orig_nii)
             else:
@@ -2000,7 +2031,9 @@ def process_volume(
         log_step("TRANS", volume_idx, "warp→T1", start_t=t0, speed=speed)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
-        mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+        mni_final = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+        mni_nii = mni_final.with_name("." + mni_final.name)
+        pending_spatial_outputs.append((mni_nii, mni_final))
 
         warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
@@ -2033,7 +2066,9 @@ def process_volume(
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
-            mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            mni_orig_final = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            mni_orig_nii = mni_orig_final.with_name("." + mni_orig_final.name)
+            pending_spatial_outputs.append((mni_orig_nii, mni_orig_final))
             if handler.gpu_resampler is not None:
                 handler.gpu_resampler.resample_nifti_to_nifti(mc_unwarped_nii, mni_orig_nii)
             else:
@@ -2058,6 +2093,24 @@ def process_volume(
         )
         return False
 
+    # Coverage is transformed separately from the signal, before smoothing.
+    coverage_t0 = time.perf_counter()
+    final_support = final_volume_support(cfg, handler, mc_support, ref_img.affine,
+                                        volume_idx, analysis_space)
+    zero_outside_support(score_input_nii, final_support)
+    if score_input_orig_nii is not None and score_input_orig_nii != mc_nii:
+        zero_outside_support(score_input_orig_nii, final_support)
+    # PCA polls public stage filenames. Publish only the completed, supported
+    # image so an unsmoothed consumer cannot read an intermediate interpolation.
+    for temporary, destination in pending_spatial_outputs:
+        temporary.replace(destination)
+        if score_input_nii == temporary:
+            score_input_nii = destination
+        if score_input_orig_nii == temporary:
+            score_input_orig_nii = destination
+    if speed is not None:
+        speed.stage(volume_idx, "TRANS", time.perf_counter() - coverage_t0)
+
     # Final image operation, after spatial transforms and before all scoring.
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
@@ -2065,10 +2118,11 @@ def process_volume(
         kind = smoother.output_kind
         folder = cfg.rt_work_dir / kind
         score_input_nii = smooth_file(smoother, score_input_nii,
-                                      folder / f"vol_{volume_idx:05d}_{kind}.nii")
+                                      folder / f"vol_{volume_idx:05d}_{kind}.nii",
+                                      support_mask=final_support)
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
-                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii")
+                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_support)
         log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
 
     output_t0 = time.perf_counter()
@@ -2080,7 +2134,7 @@ def process_volume(
         "reg": reg_nii,
         "score_input": score_input_nii,
     }
-    handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind))
+    handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind), t1_stage_nii)
 
     if not cfg.enable_scoring:
         if handler.score_queue is not None:
@@ -2197,24 +2251,57 @@ def validate_run_provenance(cfg):
     """Do not mix old MC-first outputs or a different field/reference in a run."""
     folder = cfg.rt_work_dir
     marker = folder / "preprocessing_order.json"
-    payload = {"order": PIPELINE_ORDER, "calibration": load_calibration(cfg.fmap_dir),
+    saved = json.loads(marker.read_text()) if marker.exists() else None
+    if saved is not None and saved.get("coverage_policy") != COVERAGE_POLICY:
+        raise ValueError("Run coverage handling changed. Use a fresh run output directory.")
+    trans_dir = getattr(cfg, "trans_dir", None)
+    if trans_dir is not None and (trans_dir / "registration_pending.json").exists():
+        raise ValueError("Registration preparation is incomplete. Finish preparation before starting a run.")
+    legacy_schema = saved is not None and not any(
+        key in saved for key in ("analysis_space", "spatial_transform", "nuisance_masks"))
+    if legacy_schema and trans_dir is not None and (trans_dir / "registration.json").exists():
+        raise ValueError("Legacy run provenance cannot certify the new registration. Use a fresh run output directory.")
+    payload = {"order": PIPELINE_ORDER, "coverage_policy": COVERAGE_POLICY,
+               "calibration": load_calibration(cfg.fmap_dir),
                "field": source_identity(_preferred_pyhysco_fieldmap(cfg.fmap_dir)),
                "reference": source_identity(cfg.rt_motion_ref_epi),
                "epi_phase_encoding": str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()}
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if not legacy_schema:
+        payload["analysis_space"] = space
+    if not legacy_schema and space in {"t1", "mni"}:
+        from gpu_ants_like_resampler import sampling_grid_identity
+        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        if space == "mni":
+            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        payload["spatial_transform"] = sampling_grid_identity(
+            cfg.rt_unwarped_analysis_ref_epi, resolve_decoder_template(cfg), transforms)
+    if not legacy_schema and bool(getattr(REGRESSOR_SETTINGS, "enable_motion_regression", False)):
+        # These EPI-space masks can change when a registration is rebuilt even
+        # when the final analysis stays in EPI space.
+        payload["nuisance_masks"] = {}
+        for setting, attribute in (("use_gs", "rt_unwarped_analysis_ref_mask"),
+                                   ("use_wm", "rt_wm_mask"), ("use_vent", "rt_vent_mask")):
+            if bool(getattr(REGRESSOR_SETTINGS, setting, False)):
+                path = getattr(cfg, attribute)
+                payload["nuisance_masks"][setting] = source_identity(path) if path.exists() else None
     fwhm = float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0))
     if not np.isfinite(fwhm) or fwhm < 0:
         raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
     mask_type = getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain")
     if final_output_kind(fwhm, mask_type) is not None:
-        space = str(REGRESSOR_SETTINGS.analysis_space).lower()
         reference = cfg.rt_unwarped_analysis_ref_epi if space == "epi" else resolve_decoder_template(cfg)
         payload["final_masking"] = {"fwhm_mm": fwhm, "space": space,
             **mask_provenance(cfg, mask_type, space, reference,
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"))}
-    if marker.exists():
-        if json.loads(marker.read_text()) != payload:
-            raise ValueError("Run preprocessing/calibration/reference changed. Use a fresh run output directory.")
+    if saved is not None:
+        if saved != payload:
+            raise ValueError("Run preprocessing/calibration/reference or spatial transform changed. Use a fresh run output directory.")
+        if legacy_schema:
+            log.info("[REGISTRATION] Reusing legacy run provenance with its original checks; "
+                     "registration fingerprints remain unrecorded.")
+        return  # Preserve legacy markers; never certify new fields retroactively.
     elif any((folder / name).exists() and any((folder / name).glob("*.nii*"))
              for name in ("mc", "unwarped", "reg", "t1", "mni", "smooth", "masked")):
         raise ValueError("Legacy processed run detected. Use a fresh output directory for unwarp -> MC replay.")

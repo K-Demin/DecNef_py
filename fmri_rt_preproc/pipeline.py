@@ -2,7 +2,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc_pipeline")
 
-from fmri_rt_preproc.config import SubjectDayConfig
+from fmri_rt_preproc.config import SubjectDayConfig, validate_registration_settings
 from fmri_rt_preproc.utils import run, ensure_dir, run_in_conda
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from pathlib import Path
@@ -13,6 +13,7 @@ import gzip
 import shutil
 import os
 import json
+import shlex
 from fmri_rt_preproc.native_fieldmap import (
     PIPELINE_ORDER, native_paths, calibration_spec, load_calibration,
     save_native_mean, require_same_grid, validate_bold, source_identity,
@@ -69,6 +70,7 @@ class FMRIRealtimePreprocessor:
     # ---------- Top-level entry points ----------
 
     def run_all(self):
+        self.validate_registration_request()
         ensure_dir(self.anat_dir)
         ensure_dir(self.func_dir)
         ensure_dir(self.trans_dir)
@@ -108,7 +110,11 @@ class FMRIRealtimePreprocessor:
         # ---------- 3. BRAIN MASKS ----------
         t1_combined = self.anat_dir / "T1_combined_mask.nii"
 
-        if t1_combined.exists():
+        needs_partial_brain = (
+            self._registration_settings()["mode"] == "partial_epi"
+            and not (self.anat_dir / "T1_brain.nii").exists()
+        )
+        if t1_combined.exists() and not needs_partial_brain:
             print("✓ Brain masks: already exist — skipping")
         else:
             print("→ Creating brain masks")
@@ -563,59 +569,143 @@ class FMRIRealtimePreprocessor:
             if source.resolve() != target.resolve() and not target.exists():
                 nib.save(nib.load(str(source)), str(target))
 
+    def _registration_settings(self):
+        cfg = getattr(self, "cfg", None)
+        mode, initialization, syn = validate_registration_settings(
+            getattr(cfg, "registration_mode", "full_brain"),
+            getattr(cfg, "registration_initialization", "auto"),
+            getattr(cfg, "partial_epi_syn", False),
+        )
+        if initialization == "auto":
+            initialization = "identity" if mode == "partial_epi" else "center_of_mass"
+        return {"mode": mode, "initialization": initialization, "partial_epi_syn": syn}
+
+    def _registration_outputs(self):
+        # Semantic directions never depend on the ANTs fixed/moving choice.
+        return [self.trans_dir / ("epi2t1_" + suffix) for suffix in (
+            "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii"
+        )]
+
+    def validate_registration_request(self):
+        """Reject incompatible cached assets before preparation changes anything."""
+        settings = self._registration_settings()
+        marker = self.trans_dir / "registration.json"
+        outputs = self._registration_outputs()
+        error = (
+            "Registration settings, inputs or outputs differ from this prepared session. "
+            "Use a fresh day/preparation directory so transforms, masks and reference "
+            "images are rebuilt together; existing assets have not been overwritten."
+        )
+        if (self.trans_dir / "registration_pending.json").exists():
+            raise ValueError("Registration was interrupted before validation completed. " + error)
+        if marker.exists():
+            saved = json.loads(marker.read_text())
+            if saved.get("version") != 1 or saved.get("settings") != settings:
+                raise ValueError(error)
+            records = saved.get("inputs", []) + saved.get("outputs", [])
+            if not saved.get("inputs") or len(saved.get("outputs", [])) != len(outputs):
+                raise ValueError(error)
+            for record in records:
+                path = Path(record["path"])
+                if not path.is_file() or source_identity(path) != record:
+                    raise ValueError(error)
+            if [str(p.resolve()) for p in outputs] != [r["path"] for r in saved["outputs"]]:
+                raise ValueError(error)
+        elif any(p.exists() for p in outputs):
+            # Existing full-brain studies used these same semantic directions.
+            # Do not silently reinterpret their unversioned transforms as slab fits.
+            legacy = {"mode": "full_brain", "initialization": "center_of_mass", "partial_epi_syn": False}
+            if settings != legacy or not all(p.is_file() and p.stat().st_size for p in outputs):
+                raise ValueError(error)
+        elif any((self.trans_dir / name).exists() for name in (
+            "rt_WM_mask.nii", "rt_Vent_mask.nii", "epi_in_MNI.nii", "gpu_grids"
+        )):
+            raise ValueError(error)
+
     def _register_epi_to_t1(self, run_dir: Path, epi_mean: Path, epi_mask_mean: Path):
+        self.validate_registration_request()
+        settings = self._registration_settings()
+        partial = settings["mode"] == "partial_epi"
         t1_n4 = self.anat_dir / "T1_N4.nii"
-        t1_combined = self.anat_dir / "T1_combined_mask.nii"
-
-        out_prefix = self.trans_dir / "epi2t1_"
-        warped = self.trans_dir / "epi2t1_Warped.nii"
-        inv_warped = self.trans_dir / "epi2t1_InverseWarped.nii"
-        composite = self.trans_dir / "epi2t1_Composite.h5"
-
-        # If transforms already exist → reuse, do nothing
-        if warped.exists() and inv_warped.exists() and composite.exists():
-            print("✓ epi→T1 transform already exists — skipping antsRegistration")
+        t1 = self.anat_dir / ("T1_brain.nii" if partial else "T1_N4.nii")
+        t1_mask = self.anat_dir / "T1_combined_mask.nii"
+        fixed, moving = (epi_mean, t1) if partial else (t1, epi_mean)
+        masks = f"[{epi_mask_mean},NULL]" if partial else f"[{t1_mask},{epi_mask_mean}]"
+        inputs = [epi_mean, epi_mask_mean, t1, t1_n4] if partial else [epi_mean, epi_mask_mean, t1, t1_mask]
+        input_records = [source_identity(p) for p in dict.fromkeys(inputs)]
+        outputs = self._registration_outputs()
+        marker = self.trans_dir / "registration.json"
+        if marker.exists() and json.loads(marker.read_text())["inputs"] != input_records:
+            raise ValueError("Registration input selection changed. Use a fresh day/preparation directory.")
+        if all(p.exists() for p in outputs):
+            print("✓ EPI↔T1 transforms already exist — skipping antsRegistration")
             return
 
-        # Otherwise, run registration ONCE using this run’s epi_mean/mask
         ensure_dir(self.trans_dir)
-        print("→ Running epi→T1 antsRegistration (global)")
+        require_same_grid(nib.load(str(epi_mask_mean)), nib.load(str(epi_mean)))
+        require_same_grid(nib.load(str(t1)), nib.load(str(t1_n4)))
+        if not partial:
+            require_same_grid(nib.load(str(t1_mask)), nib.load(str(t1)))
+        if not np.any(nib.load(str(epi_mask_mean)).get_fdata() > 0):
+            raise ValueError("EPI registration mask is empty; check skull stripping of the partial acquisition.")
 
-        cmd = [
-            "bash", "-lc",
-            f"""
-            export ANTS_USE_GPU=1
-            export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
-            export OMP_NUM_THREADS=$(nproc)
-            antsRegistration \
-              --dimensionality 3 \
-              --float 1 \
-              --verbose 1 \
-              --output [{out_prefix}, {warped}, {inv_warped}] \
-              --interpolation Linear \
-              --winsorize-image-intensities [0.005,0.995] \
-              --use-histogram-matching 0 \
-              --write-composite-transform 1 \
-              --initial-moving-transform [{epi_mean}, {t1_n4}, 1] \
-              --masks [{epi_mask_mean}, {t1_combined}] \
-              \
-              --transform Affine[0.1] \
-              --metric MI[{t1_n4}, {epi_mean}, 1, 32, Regular, 0.2] \
-              --convergence [1000x500x250x100,1e-7,15] \
-              --shrink-factors 8x4x2x1 \
-              --smoothing-sigmas 3x2x1x0vox \
-              \
-              --transform SyN[0.1,1,0] \
-              --metric MI[{t1_n4}, {epi_mean}, 1, 32, Regular, 0.2] \
-              --convergence [100x70x50x20,1e-7,15] \
-              --shrink-factors 6x4x2x1 \
-              --smoothing-sigmas 3x2x1x0vox
-            """
+        prefix = self.trans_dir / ("t1_to_partial_epi_" if partial else "epi2t1_")
+        native = [Path(str(prefix) + suffix) for suffix in (
+            "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii"
+        )]
+        initialization = "Identity" if settings["initialization"] == "identity" else f"[{fixed},{moving},1]"
+        args = [
+            "antsRegistration", "--dimensionality", "3", "--float", "1", "--verbose", "1",
+            "--output", f"[{prefix},{native[2]},{native[3]}]", "--interpolation", "Linear",
+            "--winsorize-image-intensities", "[0.005,0.995]", "--use-histogram-matching", "0",
+            "--write-composite-transform", "1", "--initial-moving-transform", initialization,
         ]
-        run(cmd)
-        # Copy geometry from T1 (helps keep everything aligned)
-        run(["fslcpgeom", str(t1_n4), str(warped)])
-        run(["fslcpgeom", str(t1_n4), str(inv_warped)])
+        if partial:
+            # ANTs' partial-slab example: small pyramid, no affine stretching.
+            # Identity keeps the physical-coordinate placement rather than
+            # equating a cropped slab's centroid with a whole T1's centroid.
+            stages = [
+                ("Translation[0.1]", "[50,1e-6,10]", "1", "0vox", ",Random,0.25"),
+                ("Rigid[0.1]", "[500x250x50,1e-6,10]", "2x2x1", "2x1x0vox", ",Random,0.25"),
+            ]
+            if settings["partial_epi_syn"]:
+                stages.append(("SyN[0.1,3,0]", "[50x10,1e-6,10]", "2x1", "1x0vox", ""))
+        else:
+            stages = [
+                ("Rigid[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
+                ("Affine[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
+                ("SyN[0.1,1,0]", "[100x70x50x20,1e-7,15]", "6x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
+            ]
+        for transform, convergence, shrink, sigma, sampling in stages:
+            args += ["--transform", transform, "--metric", f"MI[{fixed},{moving},1,32{sampling}]",
+                     "--convergence", convergence, "--shrink-factors", shrink,
+                     "--smoothing-sigmas", sigma, "--masks", masks]
+        print(f"→ Running {settings['mode']} EPI↔T1 registration ({settings['initialization']})")
+        # A failed/interrupted new fit must not be mistaken for a legacy cache,
+        # even if ANTs or publication happened to write all four output files.
+        pending = self.trans_dir / "registration_pending.json"
+        pending.write_text(json.dumps(settings, indent=2) + "\n")
+        run(["bash", "-lc", "export ANTS_USE_GPU=1\n"
+             "export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)\n"
+             "export OMP_NUM_THREADS=$(nproc)\n" + shlex.join(args)])
+        if not all(p.is_file() and p.stat().st_size for p in native):
+            raise RuntimeError("ANTs registration did not produce both transforms and both diagnostic images.")
+        require_same_grid(nib.load(str(native[2])), nib.load(str(fixed)))
+        require_same_grid(nib.load(str(native[3])), nib.load(str(moving)))
+        # Publish inverse slab fit as EPI→T1; keep native files for transparent QC.
+        # No header changes: each diagnostic retains its ANTs reference grid.
+        if partial:
+            for source, target in zip((native[1], native[0], native[3], native[2]), outputs):
+                shutil.copy2(source, target)
+        saved = {"version": 1, "settings": settings, "inputs": input_records,
+                 "outputs": [source_identity(p) for p in outputs],
+                 "native_fixed": str(fixed.resolve()), "native_moving": str(moving.resolve()),
+                 "epi_to_t1_native": str(native[1 if partial else 0].resolve()),
+                 "t1_to_epi_native": str(native[0 if partial else 1].resolve())}
+        temporary = marker.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(saved, indent=2) + "\n")
+        temporary.replace(marker)
+        pending.unlink()
 
     def _make_rtp_nuisance_masks(self):
         """
@@ -712,11 +802,11 @@ class FMRIRealtimePreprocessor:
                 export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)
                 export OMP_NUM_THREADS=$(nproc)
                 antsApplyTransforms -d 3 \
-                  -i {in_mask_t1} \
-                  -r {epi_ref} \
-                  -o {out_mask_epi} \
+                  -i {shlex.quote(str(in_mask_t1))} \
+                  -r {shlex.quote(str(epi_ref))} \
+                  -o {shlex.quote(str(out_mask_epi))} \
                   -n NearestNeighbor \
-                  -t {inv_comp} \
+                  -t {shlex.quote(str(inv_comp))} \
                   --float 1
                 """
             ]
@@ -774,11 +864,11 @@ class FMRIRealtimePreprocessor:
             export OMP_NUM_THREADS=$(nproc)
             antsApplyTransforms \
               -d 3 \
-              -i {epi_mean} \
-              -r {self.decoder_template} \
-              -o {out_epi_mni} \
-              -t {warp_t1_mni} \
-              -t {composite} \
+              -i {shlex.quote(str(epi_mean))} \
+              -r {shlex.quote(str(self.decoder_template))} \
+              -o {shlex.quote(str(out_epi_mni))} \
+              -t {shlex.quote(str(warp_t1_mni))} \
+              -t {shlex.quote(str(composite))} \
               -n Linear --float 1
             """
         ]

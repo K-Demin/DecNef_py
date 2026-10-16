@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from fmri_rt_preproc.config import validate_registration_settings
+
 
 @dataclass
 class RegressorSettings:
@@ -57,6 +59,9 @@ class RegressorSettings:
     skip_first_trs: int = 0
     truncate_t1_to_epi_fov: bool = True
     truncate_t1_padding_vox: int = 2
+    registration_mode: str = "full_brain"
+    registration_initialization: str = "auto"
+    partial_epi_syn: bool = False
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
@@ -71,10 +76,20 @@ class RegressorSettings:
     pyhysco_device: str = "cuda"
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 
+    def __post_init__(self) -> None:
+        (self.registration_mode, self.registration_initialization,
+         self.partial_epi_syn) = validate_registration_settings(
+            self.registration_mode, self.registration_initialization, self.partial_epi_syn
+        )
+
     def update(self, overrides: dict[str, Any]) -> None:
+        registration_keys = ("registration_mode", "registration_initialization", "partial_epi_syn")
+        registration_values = validate_registration_settings(
+            *(overrides.get(key, getattr(self, key)) for key in registration_keys)
+        )
         known = {f.name: f for f in fields(self)}
         for key, value in overrides.items():
-            if key not in known:
+            if key not in known or key in registration_keys:
                 continue
             if key == "biopac_file" and value is not None:
                 setattr(self, key, Path(value))
@@ -113,6 +128,8 @@ class RegressorSettings:
                 setattr(self, key, max(1, int(value)))
             else:
                 setattr(self, key, value)
+        for key, value in zip(registration_keys, registration_values):
+            setattr(self, key, value)
 
     def to_json_dict(self) -> dict[str, Any]:
         payload = asdict(self)

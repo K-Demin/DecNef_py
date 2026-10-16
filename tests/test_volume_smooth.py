@@ -30,6 +30,125 @@ def test_matches_supplied_normalized_convolution():
     np.testing.assert_allclose(smoother.apply(constant)[mask], 7.)
 
 
+def test_dynamic_support_keeps_constant_signal_at_missing_boundary():
+    mask = np.ones((11, 12, 13), dtype=bool)
+    mask[0] = False
+    support = np.ones_like(mask)
+    support[:, :, 8:] = False
+    support[4:7, 4:8, 3:6] = False
+    active = mask & support
+    data = np.full(mask.shape, 7.)
+    data[~active] = np.nan
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), 4.)
+
+    result = smoother.apply(data, support_mask=support)
+
+    np.testing.assert_allclose(result[active], 7., rtol=1e-14, atol=1e-14)
+    assert np.all(result[~active] == 0.)
+
+
+def test_dynamic_support_counts_acquired_zero_and_negative_residuals():
+    mask = np.ones((7, 8, 9), dtype=bool)
+    support = np.ones_like(mask)
+    support[:, :, -2:] = False
+    data = np.full(mask.shape, -3.)
+    data[2:5, 2:6, 2:5] = 0.  # Acquired zeros still contribute kernel density.
+    data[~support] = 1000.  # Missing values must not contribute, whatever their value.
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), 3.)
+    numerator = gaussian_filter(np.where(support, data, 0.), smoother.sigma,
+                                mode="constant", cval=0., truncate=4.)
+    density = gaussian_filter(support.astype(float), smoother.sigma,
+                              mode="constant", cval=0., truncate=4.)
+
+    result = smoother.apply(data, support)
+
+    np.testing.assert_allclose(result[support], numerator[support] / density[support],
+                               rtol=1e-14, atol=1e-14)
+    assert -3. < result[3, 4, 3] < 0.
+    assert np.all(result[~support] == 0.)
+
+
+@pytest.mark.parametrize("fwhm", [0., 4.])
+def test_changing_support_and_return_to_static_mask_do_not_leak_frames(fwhm):
+    mask = np.ones((7, 8, 9), dtype=bool)
+    mask[0] = False
+    first = np.ones_like(mask)
+    first[:, :, 5:] = False
+    second = np.ones_like(mask)
+    second[:, :, :4] = False
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), fwhm)
+
+    for value, support in ((19., first), (-3., second),
+                           (0., np.zeros_like(mask)), (7., None)):
+        active = mask if support is None else mask & support
+        data = np.full(mask.shape, value)
+        data[~active] = np.nan
+        result = smoother.apply(data, support)
+        np.testing.assert_allclose(result[active], value, rtol=1e-14, atol=1e-14)
+        assert np.all(result[~active] == 0.)
+
+    # Switching back to the cached static denominator preserves the old result.
+    data = np.random.default_rng(25).normal(size=mask.shape)
+    expected = MaskedGaussianSmoother(mask, np.eye(4), fwhm).apply(data)
+    np.testing.assert_array_equal(smoother.apply(data), expected)
+
+
+def test_mask_only_support_preserves_acquired_values_exactly():
+    mask = np.ones((3, 4, 5), dtype=bool)
+    support = np.ones_like(mask)
+    support[:, :, -1] = False
+    data = np.arange(mask.size, dtype=float).reshape(mask.shape) - 15.
+    data[~support] = np.nan
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), 0.)
+
+    result = smoother.apply(data, support)
+
+    np.testing.assert_array_equal(result[support], data[support])
+    assert np.all(result[~support] == 0.)
+
+
+@pytest.mark.parametrize("invalid", [np.nan, np.inf, .5, -1., 2.])
+def test_dynamic_support_rejects_nonfinite_or_nonbinary_masks(invalid):
+    mask = np.ones((3, 4, 5), dtype=bool)
+    support = mask.astype(float)
+    support[0, 0, 0] = invalid
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), 4.)
+    with pytest.raises(ValueError, match="finite and binary"):
+        smoother.apply(np.zeros(mask.shape), support)
+
+
+def test_nonfinite_acquired_value_is_still_rejected():
+    mask = np.ones((3, 4, 5), dtype=bool)
+    data = np.ones(mask.shape)
+    data[1, 1, 1] = np.nan
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), 4.)
+    with pytest.raises(ValueError, match="Nonfinite values"):
+        smoother.apply(data, mask)
+
+
+def test_smooth_file_uses_support_and_rejects_its_wrong_shape(tmp_path):
+    mask = np.ones((5, 6, 7), dtype=bool)
+    support = np.ones_like(mask)
+    support[:, :, -2:] = False
+    data = np.full(mask.shape, 5.)
+    data[~support] = np.nan
+    affine = np.diag([2., 2., 2., 1.])
+    source, destination = tmp_path / "source.nii", tmp_path / "out.nii"
+    nib.save(nib.Nifti1Image(data, affine), source)
+    smoother = MaskedGaussianSmoother(mask, affine, 4.)
+
+    smooth_file(smoother, source, destination, support_mask=support.astype(np.uint8))
+
+    saved = nib.load(destination)
+    np.testing.assert_array_equal(saved.affine, affine)
+    np.testing.assert_allclose(saved.get_fdata()[support], 5.)
+    assert np.all(saved.get_fdata()[~support] == 0.)
+    assert not (tmp_path / ".out.nii").exists()
+    with pytest.raises(ValueError, match="support and mask shapes differ"):
+        smooth_file(smoother, source, tmp_path / "bad.nii", np.ones((5, 6, 6), bool))
+    assert not (tmp_path / "bad.nii").exists()
+
+
 def test_disabled_is_a_complete_bypass():
     assert prepare_smoother(None, 0, None, None, None) is None
 

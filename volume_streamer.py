@@ -13,7 +13,6 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 import queue
-import time
 from typing import Literal, Optional
 
 import numpy as np
@@ -203,20 +202,27 @@ class VolumeStreamerHandle:
             self.config.window_y,
         )
 
-    def publish(self, volume_idx: int, path: Path | None) -> None:
-        if not self.config.enabled or self._queue is None or path is None:
-            return
-        if volume_idx % self.config.every_n != 0:
+    def publish(
+        self,
+        volume_idx: int,
+        primary_path: Path | None,
+        t1_path: Path | None = None,
+    ) -> None:
+        """Send same-volume paths atomically; all image IO stays in the viewer."""
+        if not self.config.enabled or self._queue is None:
             return
 
         try:
+            message = _decode_message((volume_idx, primary_path, t1_path))
+            if message[0] % self.config.every_n != 0:
+                return
             # Keep only the newest pending frame.
             while True:
                 try:
                     self._queue.get_nowait()
                 except queue.Empty:
                     break
-            self._queue.put_nowait((int(volume_idx), str(path)))
+            self._queue.put_nowait(message)
         except queue.Full:
             self.log.debug(
                 "[VOLQC] dropping volume %05d because viewer queue is full",
@@ -224,7 +230,7 @@ class VolumeStreamerHandle:
             )
         except Exception as exc:
             self.log.warning(
-                "[VOLQC] could not publish volume %05d: %s",
+                "[VOLQC] could not publish volume %s: %s",
                 volume_idx,
                 exc,
             )
@@ -245,6 +251,46 @@ class VolumeStreamerHandle:
         self._stop_event = None
 
 
+def _decode_message(message) -> tuple[int, str | None, str | None]:
+    """Validate the small path payload, including legacy single-row messages."""
+    if not isinstance(message, (tuple, list)) or len(message) not in (2, 3):
+        raise ValueError("Expected (volume_index, primary_path[, t1_path]).")
+    volume_idx, primary_path = message[:2]
+    t1_path = message[2] if len(message) == 3 else None
+    if (isinstance(volume_idx, bool)
+            or not isinstance(volume_idx, (int, np.integer))
+            or volume_idx < 0):
+        raise ValueError("Volume index must be a nonnegative integer.")
+
+    def checked_path(value):
+        if value is None:
+            return None
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise ValueError("Volume paths must be nonempty strings or Path objects.")
+        return str(value)
+
+    return int(volume_idx), checked_path(primary_path), checked_path(t1_path)
+
+
+def _load_display_volume(path_text: str | None):
+    """Reorient to canonical RAS without resampling; preserve each row's grid."""
+    if path_text is None:
+        return None, None, None
+    try:
+        import nibabel as nib
+
+        img = nib.as_closest_canonical(nib.load(path_text))
+        data = np.asanyarray(img.dataobj, dtype=np.float32)
+        if data.ndim > 3 and all(size == 1 for size in data.shape[3:]):
+            data = data.reshape(data.shape[:3])
+        if data.ndim != 3 or any(size == 0 for size in data.shape):
+            raise ValueError(f"expected a 3D volume, got {data.shape}")
+        return data, img.header.get_zooms()[:3], None
+    except Exception as exc:
+        logging.getLogger("volume_streamer").warning("[VOLQC] could not load %s: %s", path_text, exc)
+        return None, None, "File unavailable or unreadable"
+
+
 def _viewer_main(
     config: VolumeStreamerConfig,
     q: mp.Queue,
@@ -257,7 +303,6 @@ def _viewer_main(
     log = logging.getLogger("volume_streamer")
 
     try:
-        import nibabel as nib
         import matplotlib
 
         _disable_matplotlib_keymaps(matplotlib)
@@ -276,9 +321,9 @@ def _viewer_main(
 
         plt.ion()
         fig, axes = plt.subplots(
-            1,
+            2,
             3,
-            figsize=(9, 3),
+            figsize=(10, 6.5),
             num=config.window_title,
         )
 
@@ -306,9 +351,6 @@ def _viewer_main(
             non_focusable,
         )
 
-        fig.tight_layout()
-
-        last_path: Optional[Path] = None
         while not stop_event.is_set():
             # Closing the window manually should end only the viewer process.
             if not plt.fignum_exists(fig.number):
@@ -316,41 +358,25 @@ def _viewer_main(
                 return
 
             try:
-                volume_idx, path_text = q.get(timeout=config.poll_interval_s)
+                message = q.get(timeout=config.poll_interval_s)
             except queue.Empty:
                 plt.pause(config.poll_interval_s)
                 continue
 
-            path = Path(path_text)
-            if path == last_path or not path.exists():
-                continue
-            last_path = path
-
             try:
-                data = np.asanyarray(
-                    nib.load(str(path)).dataobj,
-                    dtype=np.float32,
-                )
-                if data.ndim > 3:
-                    data = np.squeeze(data)
-                if data.ndim != 3:
-                    raise ValueError(
-                        f"expected 3D volume, got shape {data.shape}"
-                    )
+                volume_idx, primary_path, t1_path = _decode_message(message)
+                data, voxel_sizes, primary_error = _load_display_volume(primary_path)
+                t1_data, t1_voxel_sizes, t1_error = _load_display_volume(t1_path)
                 _draw_volume(
-                    fig,
-                    axes,
-                    data,
-                    volume_idx,
-                    path.name,
-                    config,
+                    fig, axes, data, volume_idx,
+                    Path(primary_path).name if primary_path else "Unavailable",
+                    config, voxel_sizes=voxel_sizes, primary_error=primary_error,
+                    t1_data=t1_data, t1_voxel_sizes=t1_voxel_sizes,
+                    t1_label=Path(t1_path).name if t1_path else None,
+                    t1_error=t1_error,
                 )
             except Exception as exc:
-                log.warning(
-                    "[VOLQC] could not render %s: %s",
-                    path,
-                    exc,
-                )
+                log.warning("[VOLQC] could not render viewer message: %s", exc)
     except Exception:
         # Make child-process failures visible in the parent terminal.
         log.exception("[VOLQC] viewer process crashed")
@@ -364,45 +390,96 @@ def _viewer_main(
 def _draw_volume(
     fig,
     axes,
-    data: np.ndarray,
+    data: np.ndarray | None,
     volume_idx: int,
     label: str,
     config: VolumeStreamerConfig,
+    *,
+    voxel_sizes=None,
+    primary_error: str | None = None,
+    t1_data: np.ndarray | None = None,
+    t1_voxel_sizes=None,
+    t1_label: str | None = None,
+    t1_error: str | None = None,
 ) -> None:
+    """Draw both rows anew so an unavailable stage cannot retain an older image."""
+    axes = np.asarray(axes).reshape(2, 3)
+    row_labels = getattr(fig, "_volqc_row_labels", None)
+    if row_labels is None:
+        row_labels = [fig.text(.04, .91, "", fontsize=11, weight="bold"),
+                      fig.text(.04, .455, "", fontsize=11, weight="bold")]
+        fig._volqc_row_labels = row_labels
+    row_labels[0].set_text(f"{config.kind} — {label}")
+    row_labels[1].set_text("T1 — before smoothing" + (f"  |  {t1_label}" if t1_label else ""))
+    _draw_row(axes[0], data, voxel_sizes, config, volume_idx,
+              primary_error or "Selected stream unavailable")
+    _draw_row(axes[1], t1_data, t1_voxel_sizes, config, volume_idx,
+              t1_error or "No T1 stage in this processing path")
+    fig.suptitle(f"{config.window_title}  |  Volume {volume_idx:05d}", fontsize=12)
+    fig.subplots_adjust(left=.04, right=.98, top=.85, bottom=.04, hspace=.53, wspace=.08)
+    fig.canvas.draw_idle()
+    fig.canvas.flush_events()
+
+
+def _draw_row(axes, data, voxel_sizes, config, volume_idx, unavailable_reason):
+    for ax in axes:
+        ax.clear()
+        ax.axis("off")
+    if data is None:
+        axes[1].text(.5, .5, f"Unavailable for volume {volume_idx:05d}\n{unavailable_reason}",
+                     ha="center", va="center", transform=axes[1].transAxes,
+                     fontsize=10, color="0.35", linespacing=1.6)
+        return
+
     finite = data[np.isfinite(data)]
-    if finite.size:
+    # Sparse T1 grids can contain mostly background. Do not let those zeros
+    # collapse the contrast range of the acquired slab.
+    contrast_values = finite[finite != 0]
+    if not contrast_values.size:
+        contrast_values = finite
+    if contrast_values.size:
         vmin, vmax = np.percentile(
-            finite,
+            contrast_values,
             [config.percentile_low, config.percentile_high],
         )
         if vmin == vmax:
             vmin, vmax = float(finite.min()), float(finite.max())
+        if vmin == vmax:
+            vmin, vmax = float(vmin) - .5, float(vmax) + .5
     else:
         vmin, vmax = 0.0, 1.0
 
     mids = [size // 2 for size in data.shape]
+    # In a full T1 grid the geometric midpoint can miss a partial EPI slab.
+    # Select orthogonal centers of the displayed signal's bounding box.
+    support = np.isfinite(data) & (data != 0)
+    if support.any():
+        for axis in range(3):
+            occupied = np.flatnonzero(support.any(axis=tuple(i for i in range(3) if i != axis)))
+            mids[axis] = int((occupied[0] + occupied[-1]) // 2)
+    sizes = voxel_sizes if voxel_sizes is not None else (1., 1., 1.)
     slices = [
         np.rot90(data[mids[0], :, :]),
         np.rot90(data[:, mids[1], :]),
         np.rot90(data[:, :, mids[2]]),
     ]
 
-    for ax, slc, title in zip(axes, slices, ["sag", "cor", "axi"]):
-        ax.clear()
+    planes = [("Sagittal", "x", "P", "A", "S", "I", 1, 2),
+              ("Coronal", "y", "L", "R", "S", "I", 0, 2),
+              ("Axial", "z", "L", "R", "A", "P", 0, 1)]
+    for ax, slc, index, plane in zip(axes, slices, mids, planes):
+        title, coordinate, left, right, top, bottom, horizontal, vertical = plane
         ax.imshow(
             slc,
             cmap=config.cmap,
             vmin=vmin,
             vmax=vmax,
             interpolation="nearest",
+            extent=(0, data.shape[horizontal] * sizes[horizontal],
+                    0, data.shape[vertical] * sizes[vertical]),
+            aspect="equal",
         )
-        ax.set_title(title, fontsize=8)
-        ax.axis("off")
-
-    fig.suptitle(
-        f"{config.kind} vol {volume_idx:05d}: {label}",
-        fontsize=9,
-    )
-    fig.canvas.draw_idle()
-    fig.canvas.flush_events()
-    time.sleep(0.001)
+        ax.set_title(f"{title}  |  {coordinate} = {index}", fontsize=9)
+        for text, x, y in ((left, .025, .5), (right, .975, .5), (top, .5, .97), (bottom, .5, .03)):
+            ax.text(x, y, text, ha="center", va="center", transform=ax.transAxes,
+                    fontsize=8, color="white", bbox=dict(facecolor="black", edgecolor="none", alpha=.45, pad=1))
