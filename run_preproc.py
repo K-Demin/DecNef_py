@@ -9,6 +9,9 @@ from fmri_rt_preproc.config import SubjectDayConfig
 from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
 from fmri_rt_preproc.native_fieldmap import find_source
 from fmri_rt_preproc.utils import ensure_dir, run  # <- to call fslmerge
+from rt_global_settings import (
+    add_registration_arguments, apply_registration_arguments, load_regressor_settings,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc")
@@ -277,9 +280,8 @@ def preflight_registration(
     day: str,
     ap_block: int | None = None,
     pa_block: int | None = None,
-    registration_mode: str = "full_brain",
-    registration_initialization: str = "auto",
-    partial_epi_syn: bool = False,
+    registration_initialization: str = "identity",
+    registration_syn: bool = False,
 ) -> None:
     """Reject an incompatible prepared session before staging or waiting for scans."""
     root = Path(base_data) / f"sub-{subject}" / day
@@ -288,9 +290,9 @@ def preflight_registration(
         subject_id=subject, day_id=day, root=root, run_id="trans",
         epi_file=root / "func" / "trans" / "epi_4d.nii.gz",
         ap_file=fmap_dir / "AP.nii", pa_file=fmap_dir / "PA.nii",
-        fieldmap_dir=fmap_dir, registration_mode=registration_mode,
+        fieldmap_dir=fmap_dir,
         registration_initialization=registration_initialization,
-        partial_epi_syn=partial_epi_syn,
+        registration_syn=registration_syn,
     )
     FMRIRealtimePreprocessor(cfg).validate_registration_request()
 
@@ -373,24 +375,17 @@ def main():
         help="Do not write config.json (use only in-memory config).",
     )
     parser.add_argument(
-        "--registration-mode", choices=["full_brain", "partial_epi"],
-        default="full_brain",
-        help="EPI-to-T1 preparation recipe. partial_epi explicitly opts in to partial-coverage registration.",
+        "--settings-file", default=None,
+        help="Optional realtime JSON profile supplying registration settings.",
     )
-    parser.add_argument(
-        "--registration-initialization", choices=["auto", "identity", "center_of_mass"],
-        default="auto",
-        help="Initial alignment: auto uses center_of_mass for full_brain and header-based identity for partial_epi.",
-    )
-    parser.add_argument(
-        "--partial-epi-syn", action=argparse.BooleanOptionalAction, default=False,
-        help="Add optional SyN refinement in partial_epi mode (default: disabled).",
-    )
+    add_registration_arguments(parser)
     args = parser.parse_args()
+    settings = load_regressor_settings(args.settings_file)
+    apply_registration_arguments(settings, args)
 
     preflight_registration(
         args.base_data, args.sub, args.day, args.ap_block, args.pa_block,
-        args.registration_mode, args.registration_initialization, args.partial_epi_syn,
+        settings.registration_initialization, settings.registration_syn,
     )
 
     # data/sub-0001/3
@@ -487,9 +482,8 @@ def main():
         ap_file=ap_path,
         pa_file=pa_path,
         fieldmap_dir=fmap_dir,
-        registration_mode=args.registration_mode,
-        registration_initialization=args.registration_initialization,
-        partial_epi_syn=args.partial_epi_syn,
+        registration_initialization=settings.registration_initialization,
+        registration_syn=settings.registration_syn,
     )
 
     pipe = FMRIRealtimePreprocessor(cfg)

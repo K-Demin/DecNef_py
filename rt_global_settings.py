@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
+import argparse
 import json
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
-from fmri_rt_preproc.config import validate_registration_settings
+from fmri_rt_preproc.config import normalize_registration_config, validate_registration_settings
 
 
 @dataclass
@@ -59,9 +60,8 @@ class RegressorSettings:
     skip_first_trs: int = 0
     truncate_t1_to_epi_fov: bool = True
     truncate_t1_padding_vox: int = 2
-    registration_mode: str = "full_brain"
-    registration_initialization: str = "auto"
-    partial_epi_syn: bool = False
+    registration_initialization: str = "identity"
+    registration_syn: bool = False
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
@@ -77,13 +77,13 @@ class RegressorSettings:
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 
     def __post_init__(self) -> None:
-        (self.registration_mode, self.registration_initialization,
-         self.partial_epi_syn) = validate_registration_settings(
-            self.registration_mode, self.registration_initialization, self.partial_epi_syn
+        (self.registration_initialization, self.registration_syn) = validate_registration_settings(
+            self.registration_initialization, self.registration_syn
         )
 
     def update(self, overrides: dict[str, Any]) -> None:
-        registration_keys = ("registration_mode", "registration_initialization", "partial_epi_syn")
+        overrides = normalize_registration_config(overrides)
+        registration_keys = ("registration_initialization", "registration_syn")
         registration_values = validate_registration_settings(
             *(overrides.get(key, getattr(self, key)) for key in registration_keys)
         )
@@ -161,3 +161,27 @@ def load_regressor_settings(path: str | Path | None = None) -> RegressorSettings
 def save_regressor_settings(path: str | Path, settings: RegressorSettings | None = None) -> None:
     payload = (settings or RegressorSettings()).to_json_dict()
     Path(path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def add_registration_arguments(parser: argparse.ArgumentParser) -> None:
+    """Use identical, opt-in CLI overrides in every preparation launcher."""
+    parser.add_argument(
+        "--registration-initialization", choices=["identity", "center_of_mass", "auto"],
+        default=None,
+        help="T1-to-EPI initialization: identity uses headers (default); "
+             "center_of_mass is an explicit alternative; auto aliases identity.",
+    )
+    parser.add_argument(
+        "--registration-syn", action=argparse.BooleanOptionalAction, default=None,
+        help="Enable optional SyN refinement after Translation + Rigid "
+             "(default: disabled; overrides the settings file only when supplied).",
+    )
+
+
+def apply_registration_arguments(settings: RegressorSettings, args: argparse.Namespace) -> None:
+    """Apply explicit CLI choices after loading a profile, preserving omitted values."""
+    settings.update({
+        key: getattr(args, key)
+        for key in ("registration_initialization", "registration_syn")
+        if getattr(args, key, None) is not None
+    })

@@ -238,11 +238,15 @@ def test_run_without_current_coverage_policy_is_rejected(tmp_path, monkeypatch):
         rt.validate_run_provenance(cfg)
 
 
-@pytest.mark.parametrize("mode", ["full_brain", "partial_epi"])
-def test_legacy_run_rejected_after_versioned_registration(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("registration", [
+    {"version": 1, "settings": {"mode": "full_brain"}},
+    {"version": 1, "settings": {"mode": "partial_epi"}},
+    {"version": 2, "settings": {"recipe": "t1_to_epi"}},
+])
+def test_legacy_run_rejected_after_versioned_registration(tmp_path, monkeypatch, registration):
     cfg, marker = _legacy_run(tmp_path, monkeypatch)
     saved = marker.read_bytes()
-    (cfg.trans_dir / "registration.json").write_text(json.dumps({"mode": mode}))
+    (cfg.trans_dir / "registration.json").write_text(json.dumps(registration))
     with pytest.raises(ValueError, match="cannot certify the new registration"):
         rt.validate_run_provenance(cfg)
     assert marker.read_bytes() == saved

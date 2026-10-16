@@ -16,7 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import (
+    add_registration_arguments, apply_registration_arguments, load_regressor_settings,
+)
 import rs_pca_runtime as pca_rt
 from fmri_rt_preproc.native_fieldmap import load_calibration, native_paths
 
@@ -137,9 +139,8 @@ def _run_preproc(
     ap_block: Optional[int],
     pa_block: Optional[int],
     epi_block: int,
-    registration_mode: str = "full_brain",
-    registration_initialization: str = "auto",
-    partial_epi_syn: bool = False,
+    registration_initialization: str = "identity",
+    registration_syn: bool = False,
 ) -> None:
     cmd = [
         sys.executable,
@@ -154,11 +155,9 @@ def _run_preproc(
         str(incoming_root),
         "--epi-block",
         str(epi_block),
-        "--registration-mode",
-        registration_mode,
         "--registration-initialization",
         registration_initialization,
-        "--partial-epi-syn" if partial_epi_syn else "--no-partial-epi-syn",
+        "--registration-syn" if registration_syn else "--no-registration-syn",
     ]
     if struct_block is not None:
         cmd += ["--struct-block", str(struct_block)]
@@ -536,18 +535,7 @@ def main() -> None:
         default=20,
         help="Minimum EPI DICOMs to wait for before running offline preproc.",
     )
-    parser.add_argument(
-        "--registration-mode", choices=["full_brain", "partial_epi"], default=None,
-        help="Override the settings-file EPI-to-T1 preparation recipe.",
-    )
-    parser.add_argument(
-        "--registration-initialization", choices=["auto", "identity", "center_of_mass"],
-        default=None, help="Override preparation initialization (auto is mode-dependent).",
-    )
-    parser.add_argument(
-        "--partial-epi-syn", action=argparse.BooleanOptionalAction, default=None,
-        help="Override optional SyN refinement for partial_epi preparation.",
-    )
+    add_registration_arguments(parser)
     parser.add_argument(
         "--prep-surface-rois",
         action="store_true",
@@ -728,11 +716,7 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
-    REGRESSOR_SETTINGS.update({
-        key: getattr(args, key)
-        for key in ("registration_mode", "registration_initialization", "partial_epi_syn")
-        if getattr(args, key) is not None
-    })
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
     if args.skip_first_trs < 0:
         raise ValueError("--skip-first-trs must be >= 0")
     baseline_trs = (
@@ -760,9 +744,8 @@ def main() -> None:
     from run_preproc import preflight_registration
     preflight_registration(
         base_data, args.sub, args.day, args.ap_block, args.pa_block,
-        REGRESSOR_SETTINGS.registration_mode,
         REGRESSOR_SETTINGS.registration_initialization,
-        REGRESSOR_SETTINGS.partial_epi_syn,
+        REGRESSOR_SETTINGS.registration_syn,
     )
 
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
@@ -838,9 +821,8 @@ def main() -> None:
             ap_block=args.ap_block,
             pa_block=args.pa_block,
             epi_block=epi_block,
-            registration_mode=REGRESSOR_SETTINGS.registration_mode,
             registration_initialization=REGRESSOR_SETTINGS.registration_initialization,
-            partial_epi_syn=REGRESSOR_SETTINGS.partial_epi_syn,
+            registration_syn=REGRESSOR_SETTINGS.registration_syn,
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, args.sub, args.day)

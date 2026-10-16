@@ -14,34 +14,49 @@ It runs:
 - T1 -> MNI registration via SynthMorph
 - PyHySCO distortion correction from native AP/PA means (no AP/PA motion correction)
 - Raw BOLD unwarping, then motion correction to the fixed corrected session reference
-- EPI(mean) -> T1 -> MNI registration via ANTs
+- T1 -> corrected EPI registration via ANTs; use its inverse for EPI -> T1
+- EPI -> MNI resampling through EPI -> T1 and the SynthMorph T1 -> MNI transform
 - Optional composed transforms for online use
 
 All heavy transforms for realtime are precomputed offline.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
-Partial-coverage EPI registration (explicit opt-in)
---------------------------------------------------
+EPI-to-anatomy registration (full-brain and partial coverage)
+----------------------------------------------------------
 
-Preparation retains the existing full_brain registration by default. For a
-partial slab, select --registration-mode partial_epi in run_preproc.py, or set
-"registration_mode": "partial_epi" in the settings JSON passed to
-rs_realtime_parallel.py. The RS launcher forwards this choice to its automatic
-preparation step. Its equivalent CLI flags override only explicitly supplied
-values; omitted flags preserve the settings file.
+Preparation uses one recipe: fixed corrected EPI, moving T1, header-based
+identity initialization, then Translation and Rigid optimization. The default
+settings are "registration_initialization": "identity" and
+"registration_syn": false. center_of_mass is an explicit initialization option;
+auto is a compatibility alias for identity. Optional SyN adds nonlinear
+refinement. New full-brain preparation therefore changes the old recipe: there
+is no Affine stage, and SyN is disabled by default.
 
-"registration_initialization": "auto" uses center_of_mass in full_brain mode
-and header-based identity in partial_epi mode. Explicit identity and
-center_of_mass choices are also supported. Partial mode uses Translation then
-Rigid registration; optional SyN refinement requires "partial_epi_syn": true
-or --partial-epi-syn. This option is false by default and is valid only in
-partial_epi mode.
+run_preproc.py, rs_realtime_parallel.py and rs_pca_score_all_rois.py all accept
+--settings-file /path/to/participant_settings.json. Without it they use built-in
+defaults; rt_settings.json is not loaded automatically. Explicit
+--registration-initialization, --registration-syn or --no-registration-syn
+options override the profile; omitted options preserve it. Effective choices
+are recorded in the prepared session's config.json. Neurofeedback, PsychoPy,
+robot and BrainPong reuse these prepared maps without separate partial flags.
 
-Preparation checks registration-cache compatibility before staging scans or
-rewriting config.json. An incompatible existing prepared session is rejected;
-use a fresh preparation/session directory and rebuild its reference and derived
-transforms together. This is not the truncate_t1_to_epi_fov output-grid option.
+The canonical epi2t1_Composite.h5 still maps EPI -> T1, and
+epi2t1_InverseComposite.h5 still maps T1 -> EPI. Native ANTs outputs from new
+fits are retained as t1_to_epi_*. There is no active registration_mode flag.
+Old JSON registration_mode values full_brain/partial_epi warn and are ignored;
+partial_epi_syn warns and aliases registration_syn. Conflicting aliases fail.
+
+All three preparation commands check cache compatibility before staging scans
+or rewriting config.json. New fits record registration.json version 2.
+Equivalent version 1 partial-EPI caches can be reused after input/output and
+settings checks. Old full-brain or unversioned caches require a fresh preparation
+directory for the new recipe; unchanged prepared maps remain usable by existing
+realtime consumers. Rebuild the reference and derived transforms together when
+changing preparation. This is separate from truncate_t1_to_epi_fov, which only
+changes a PCA output grid. Inspect alignment and mask/decoder coverage for both
+full-brain and partial acquisitions; native anatomical registration has not been
+validated in the Windows development environment.
 Commands, settings and QC guidance: docs/partial_epi_registration.md
 
 Final analysis masking and spatial smoothing
@@ -145,7 +160,7 @@ We assume two conda environments:
 Typical usage:
 
     conda activate rt_pipe
-    python run_preproc.py --sub 00085 --day 4
+    python run_preproc.py --sub 00085 --day 4 --settings-file ./rt_settings.json
     python rt_pipeline.py --sub 00085 --day 2 --run 11 --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya  --base-data /SSD2/DecNef_py/data
     python -m fmri_rt_preproc.prep_surface_rois --root /SSD2/DecNef_py/data --subj 00085 --day 2_copy
 
@@ -153,7 +168,8 @@ To stage raw DICOMs for the structural scan and AP/PA fieldmaps before preproces
 
     python run_preproc.py --sub 00085 --day 4 \
       --incoming-root /path/to/incoming/dicoms \
-      --ap-block 7 --pa-block 8 --struct-block 3 --epi-block 11
+      --ap-block 7 --pa-block 8 --struct-block 3 --epi-block 11 \
+      --settings-file ./rt_settings.json
 
 For full fastsurfer preproc + ROI masks (you can run it before run_preproc):
     python -m fmri_rt_preproc.prep_surface_rois \
@@ -246,7 +262,7 @@ Running the pipeline
 3) Run the preprocessing:
 
        conda activate rt_pipe
-       python run_preproc.py /path/to/sub-0001/day-01/config.json
+       python run_preproc.py --sub 0001 --day 01 --base-data /project_root --settings-file /path/to/participant_settings.json
 
 4) The script will:
 

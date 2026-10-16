@@ -32,7 +32,7 @@ def registration(tmp_path, monkeypatch):
     pipe.trans_dir = tmp_path / "session transforms"
     pipe.anat_dir.mkdir()
     pipe.trans_dir.mkdir()
-    pipe.cfg = SimpleNamespace(registration_mode="full_brain", registration_initialization="auto", partial_epi_syn=False)
+    pipe.cfg = SimpleNamespace(registration_initialization="identity", registration_syn=False)
     epi = pipe.trans_dir / "epi_unwarped_mean.nii"
     mask = pipe.trans_dir / "epi_mask_mean.nii"
     epi_affine = np.diag([2., 2., 3., 1.])
@@ -61,26 +61,27 @@ def registration(tmp_path, monkeypatch):
     return pipe, epi, mask, calls
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_semantic_directions_and_image_grids(registration, partial):
+@pytest.mark.parametrize("epi_shape", [(4, 5, 3), (4, 5, 6)], ids=["partial", "whole_brain"])
+def test_semantic_directions_and_image_grids(registration, epi_shape):
     pipe, epi, mask, calls = registration
-    pipe.cfg.registration_mode = "partial_epi" if partial else "full_brain"
+    for path in (epi, mask):
+        img = nib.load(path)
+        nib.save(nib.Nifti1Image(np.ones(epi_shape, np.float32), img.affine), path)
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     args = calls[0]
-    t1 = pipe.anat_dir / ("T1_brain.nii" if partial else "T1_N4.nii")
-    fixed, moving = (epi, t1) if partial else (t1, epi)
+    t1 = pipe.anat_dir / "T1_brain.nii"
+    fixed, moving = epi, t1
     stages = [value.split("[")[0] for value in values(args, "--transform")]
-    assert stages == (["Translation", "Rigid"] if partial else ["Rigid", "Affine", "SyN"])
-    expected_mask = f"[{mask},NULL]" if partial else f"[{pipe.anat_dir / 'T1_combined_mask.nii'},{mask}]"
+    assert stages == ["Translation", "Rigid"]
+    expected_mask = f"[{mask},NULL]"
     assert values(args, "--masks") == [expected_mask] * len(stages)
     assert all(metric.startswith(f"MI[{fixed},{moving},") for metric in values(args, "--metric"))
-    assert values(args, "--initial-moving-transform") == (["Identity"] if partial else [f"[{fixed},{moving},1]"])
-    assert values(args, "--shrink-factors") == (["1", "2x2x1"] if partial else ["8x4x2x1", "8x4x2x1", "6x4x2x1"])
+    assert values(args, "--initial-moving-transform") == ["Identity"]
+    assert values(args, "--shrink-factors") == ["1", "2x2x1"]
     forward, inverse, warped, inv_warped = pipe._registration_outputs()
-    assert forward.read_bytes() == (b"native-inverse" if partial else b"native-forward")
-    assert inverse.read_bytes() == (b"native-forward" if partial else b"native-inverse")
-    for path, reference, signal in ((warped, t1, 22 if partial else 11),
-                                    (inv_warped, epi, 11 if partial else 22)):
+    assert forward.read_bytes() == b"native-inverse"
+    assert inverse.read_bytes() == b"native-forward"
+    for path, reference, signal in ((warped, t1, 22), (inv_warped, epi, 11)):
         output, target = nib.load(path), nib.load(reference)
         assert output.shape == target.shape
         np.testing.assert_allclose(output.affine, target.affine)
@@ -93,13 +94,17 @@ def test_semantic_directions_and_image_grids(registration, partial):
     assert len(calls) == 1  # no fslcpgeom or extra resampling
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     assert len(calls) == 1  # valid repeat reuses the pair together
+    saved = json.loads((pipe.trans_dir / "registration.json").read_text())
+    assert saved["version"] == 2
+    assert saved["native_fixed"] == str(epi.resolve())
+    assert saved["native_moving"] == str(t1.resolve())
+    assert saved["epi_to_t1_native"] == str((pipe.trans_dir / "t1_to_epi_InverseComposite.h5").resolve())
 
 
-def test_partial_syn_and_explicit_com(registration):
+def test_optional_syn_and_explicit_com(registration):
     pipe, epi, mask, calls = registration
-    pipe.cfg.registration_mode = "partial_epi"
     pipe.cfg.registration_initialization = "center_of_mass"
-    pipe.cfg.partial_epi_syn = True
+    pipe.cfg.registration_syn = True
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     args = calls[0]
     assert values(args, "--transform") == ["Translation[0.1]", "Rigid[0.1]", "SyN[0.1,3,0]"]
@@ -108,10 +113,10 @@ def test_partial_syn_and_explicit_com(registration):
     assert values(args, "--masks") == [f"[{mask},NULL]"] * 3
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_published_transforms_feed_actual_wm_vent_and_mni_preparation(registration, monkeypatch, partial):
+@pytest.mark.parametrize("syn", [False, True])
+def test_published_transforms_feed_actual_wm_vent_and_mni_preparation(registration, monkeypatch, syn):
     pipe, epi, mask, _ = registration
-    pipe.cfg.registration_mode = "partial_epi" if partial else "full_brain"
+    pipe.cfg.registration_syn = syn
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     pipe.rt_unwarped_analysis_ref_epi = epi
     pipe.rt_unwarped_analysis_ref_mask = mask
@@ -151,8 +156,8 @@ def test_published_transforms_feed_actual_wm_vent_and_mni_preparation(registrati
     monkeypatch.setattr("fmri_rt_preproc.pipeline.run", fake_apply)
     _, wm, vent = pipe._make_rtp_nuisance_masks()
     pipe._warp_epi_mean_to_mni(pipe.trans_dir, epi)
-    t1_to_epi = b"native-forward" if partial else b"native-inverse"
-    epi_to_t1 = b"native-inverse" if partial else b"native-forward"
+    t1_to_epi = b"native-forward"
+    epi_to_t1 = b"native-inverse"
     assert transforms == [
         ([t1_to_epi], ["NearestNeighbor"], [str(epi)]),
         ([t1_to_epi], ["NearestNeighbor"], [str(epi)]),
@@ -164,15 +169,15 @@ def test_published_transforms_feed_actual_wm_vent_and_mni_preparation(registrati
         np.testing.assert_array_equal(img.affine, brain.affine)
 
 
-@pytest.mark.parametrize("change", ["mode", "initialization", "input", "output", "missing_inverse"])
+@pytest.mark.parametrize("change", ["syn", "initialization", "input", "output", "missing_inverse"])
 def test_changed_cache_rejected_before_any_overwrite(registration, change):
     pipe, epi, mask, calls = registration
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     forward, inverse, _, _ = pipe._registration_outputs()
-    if change == "mode":
-        pipe.cfg.registration_mode = "partial_epi"
+    if change == "syn":
+        pipe.cfg.registration_syn = True
     elif change == "initialization":
-        pipe.cfg.registration_initialization = "identity"
+        pipe.cfg.registration_initialization = "center_of_mass"
     elif change == "input":
         mask.write_bytes(mask.read_bytes() + b"changed")
     elif change == "output":
@@ -186,21 +191,53 @@ def test_changed_cache_rejected_before_any_overwrite(registration, change):
     assert len(calls) == 1
 
 
-def test_legacy_full_brain_cache_is_supported_but_not_reinterpreted(registration):
+@pytest.mark.parametrize("cache_kind", ["unversioned", "full_brain", "unknown_version"])
+def test_incompatible_cache_is_not_reinterpreted_or_overwritten(registration, cache_kind):
     pipe, epi, mask, calls = registration
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
-    (pipe.trans_dir / "registration.json").unlink()
+    marker = pipe.trans_dir / "registration.json"
+    if cache_kind == "unversioned":
+        marker.unlink()
+    else:
+        saved = json.loads(marker.read_text())
+        saved["version"] = 1 if cache_kind == "full_brain" else 99
+        saved["settings"] = {"mode": "full_brain", "initialization": "center_of_mass", "partial_epi_syn": False}
+        marker.write_text(json.dumps(saved))
+    original = {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()}
+    with pytest.raises(ValueError, match="fresh day/preparation directory"):
+        pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    assert {p: p.read_bytes() for p in original} == original
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("initialization,syn", [("identity", False), ("center_of_mass", True)])
+def test_equivalent_version_one_partial_cache_reused_without_rewriting(registration, initialization, syn):
+    pipe, epi, mask, calls = registration
+    pipe.cfg.registration_initialization = initialization
+    pipe.cfg.registration_syn = syn
+    pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    marker = pipe.trans_dir / "registration.json"
+    saved = json.loads(marker.read_text())
+    saved["version"] = 1
+    saved["settings"] = {"mode": "partial_epi", "initialization": initialization, "partial_epi_syn": syn}
+    # Prior releases retain native outputs under their original prefix.
+    for key in ("epi_to_t1_native", "t1_to_epi_native"):
+        path = Path(saved[key])
+        old_path = path.with_name(path.name.replace("t1_to_epi_", "t1_to_partial_epi_"))
+        path.rename(old_path)
+        saved[key] = str(old_path)
+    marker.write_text(json.dumps(saved))
+    original = {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()}
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     assert len(calls) == 1
-    pipe.cfg.registration_mode = "partial_epi"
+    assert {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()} == original
+    pipe.cfg.registration_syn = not syn
     with pytest.raises(ValueError, match="fresh day/preparation directory"):
         pipe.validate_registration_request()
-    assert len(calls) == 1
 
 
-def test_fresh_partial_preflight_does_not_require_images(registration):
+def test_fresh_preflight_does_not_require_images(registration):
     pipe, _, _, calls = registration
-    pipe.cfg.registration_mode = "partial_epi"
     pipe.trans_dir = pipe.trans_dir / "fresh"
     pipe.anat_dir = pipe.anat_dir / "not_yet_created"
     pipe.validate_registration_request()
@@ -217,28 +254,30 @@ def test_different_selected_reference_is_not_silently_reused(registration):
     assert len(calls) == 1
 
 
-def test_failed_full_brain_publication_cannot_be_accepted_as_legacy(registration, monkeypatch):
+def test_interrupted_publication_cannot_be_reused(registration, monkeypatch):
     pipe, epi, mask, calls = registration
     from fmri_rt_preproc import pipeline
-    fake_ants = pipeline.run
+    copy = pipeline.shutil.copy2
+    copies = []
 
-    def wrong_grid(cmd):
-        fake_ants(cmd)
-        nib.save(nib.load(epi), pipe.trans_dir / "epi2t1_Warped.nii")
+    def interrupted_copy(source, target):
+        copy(source, target)
+        copies.append(target)
+        if len(copies) == 2:
+            raise OSError("interrupted publication")
 
-    monkeypatch.setattr(pipeline, "run", wrong_grid)
-    with pytest.raises(ValueError, match="grids differ"):
+    monkeypatch.setattr(pipeline.shutil, "copy2", interrupted_copy)
+    with pytest.raises(OSError, match="interrupted publication"):
         pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
-    assert all(p.exists() for p in pipe._registration_outputs())
+    assert [p.exists() for p in pipe._registration_outputs()] == [True, True, False, False]
     assert not (pipe.trans_dir / "registration.json").exists()
     with pytest.raises(ValueError, match="interrupted"):
         pipe.validate_registration_request()
 
 
 @pytest.mark.parametrize("failure", ["missing_inverse", "wrong_grid", "empty_mask"])
-def test_invalid_outputs_never_publish_partial_transforms(registration, monkeypatch, failure):
+def test_invalid_outputs_never_publish_transforms(registration, monkeypatch, failure):
     pipe, epi, mask, calls = registration
-    pipe.cfg.registration_mode = "partial_epi"
     from fmri_rt_preproc import pipeline
     fake_ants = pipeline.run
     if failure == "empty_mask":
@@ -248,9 +287,9 @@ def test_invalid_outputs_never_publish_partial_transforms(registration, monkeypa
         def broken(cmd):
             fake_ants(cmd)
             if failure == "missing_inverse":
-                (pipe.trans_dir / "t1_to_partial_epi_InverseComposite.h5").unlink()
+                (pipe.trans_dir / "t1_to_epi_InverseComposite.h5").unlink()
             else:
-                nib.save(nib.load(epi), pipe.trans_dir / "t1_to_partial_epi_InverseWarped.nii")
+                nib.save(nib.load(epi), pipe.trans_dir / "t1_to_epi_InverseWarped.nii")
         monkeypatch.setattr(pipeline, "run", broken)
     with pytest.raises((RuntimeError, ValueError)):
         pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)

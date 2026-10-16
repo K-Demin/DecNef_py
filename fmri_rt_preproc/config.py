@@ -2,23 +2,45 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
 import os
+import warnings
 
 
-def validate_registration_settings(mode, initialization, partial_epi_syn):
+def validate_registration_settings(initialization, syn):
     """Validate preparation settings shared by config files and launchers."""
-    mode = str(mode).lower()
     initialization = str(initialization).lower()
-    if mode not in {"full_brain", "partial_epi"}:
-        raise ValueError("registration_mode must be 'full_brain' or 'partial_epi'.")
     if initialization not in {"auto", "identity", "center_of_mass"}:
         raise ValueError(
             "registration_initialization must be 'auto', 'identity', or 'center_of_mass'."
         )
-    if not isinstance(partial_epi_syn, bool):
-        raise ValueError("partial_epi_syn must be a boolean.")
-    if partial_epi_syn and mode != "partial_epi":
-        raise ValueError("partial_epi_syn requires registration_mode='partial_epi'.")
-    return mode, initialization, partial_epi_syn
+    if not isinstance(syn, bool):
+        raise ValueError("registration_syn must be a boolean.")
+    return "identity" if initialization == "auto" else initialization, syn
+
+
+def normalize_registration_config(payload):
+    """Translate deprecated JSON keys without selecting a different recipe."""
+    payload = dict(payload)
+    if "registration_mode" in payload:
+        mode = str(payload.pop("registration_mode")).lower()
+        if mode not in {"full_brain", "partial_epi"}:
+            raise ValueError("Legacy registration_mode must be 'full_brain' or 'partial_epi'.")
+        warnings.warn(
+            "registration_mode is deprecated and ignored; preparation now uses one "
+            "T1-to-EPI Translation + Rigid recipe for all EPI coverage.",
+            FutureWarning, stacklevel=2,
+        )
+    if "partial_epi_syn" in payload:
+        old_syn = payload.pop("partial_epi_syn")
+        if not isinstance(old_syn, bool):
+            raise ValueError("Legacy partial_epi_syn must be a boolean.")
+        if "registration_syn" in payload and payload["registration_syn"] != old_syn:
+            raise ValueError("Conflicting partial_epi_syn and registration_syn values.")
+        warnings.warn(
+            "partial_epi_syn is deprecated; use registration_syn instead.",
+            FutureWarning, stacklevel=2,
+        )
+        payload.setdefault("registration_syn", old_syn)
+    return payload
 
 
 @dataclass
@@ -40,21 +62,19 @@ class SubjectDayConfig:
     fieldmap_dir: Path | None = None
     fieldmap_method: str = "pyhysco"
     epi_phase_encoding: str = "PA"
-    registration_mode: str = "full_brain"
-    registration_initialization: str = "auto"
-    partial_epi_syn: bool = False
+    registration_initialization: str = "identity"
+    registration_syn: bool = False
     project_root = Path(__file__).resolve().parents[1]
     decoder_template = project_root / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
     def __post_init__(self):
-        (self.registration_mode, self.registration_initialization,
-         self.partial_epi_syn) = validate_registration_settings(
-            self.registration_mode, self.registration_initialization, self.partial_epi_syn
+        (self.registration_initialization, self.registration_syn) = validate_registration_settings(
+            self.registration_initialization, self.registration_syn
         )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "SubjectDayConfig":
-        cfg = json.loads(Path(path).read_text())
+        cfg = normalize_registration_config(json.loads(Path(path).read_text()))
         root = Path(cfg["root"])
         subject_root = Path(cfg.get("subject_root", root.parent))
         runs = [
@@ -74,9 +94,8 @@ class SubjectDayConfig:
             runs=runs,
             fieldmap_method=cfg.get("fieldmap_method", "pyhysco"),
             epi_phase_encoding=cfg.get("epi_phase_encoding", "PA"),
-            registration_mode=cfg.get("registration_mode", "full_brain"),
-            registration_initialization=cfg.get("registration_initialization", "auto"),
-            partial_epi_syn=cfg.get("partial_epi_syn", False),
+            registration_initialization=cfg.get("registration_initialization", "identity"),
+            registration_syn=cfg.get("registration_syn", False),
         )
 
     @classmethod
@@ -86,9 +105,8 @@ class SubjectDayConfig:
         day_id: str,
         root: Path,
         epi_basename: str = "epi.nii",
-        registration_mode: str = "full_brain",
-        registration_initialization: str = "auto",
-        partial_epi_syn: bool = False,
+        registration_initialization: str = "identity",
+        registration_syn: bool = False,
     ) -> "SubjectDayConfig":
         """
         Build config from a standard layout:
@@ -139,9 +157,8 @@ class SubjectDayConfig:
             runs=runs,
             fieldmap_method="pyhysco",
             epi_phase_encoding="PA",
-            registration_mode=registration_mode,
             registration_initialization=registration_initialization,
-            partial_epi_syn=partial_epi_syn,
+            registration_syn=registration_syn,
         )
 
     @classmethod
@@ -156,9 +173,8 @@ class SubjectDayConfig:
         ap_file: Path | None = None,
         pa_file: Path | None = None,
         fieldmap_dir: Path | None = None,
-        registration_mode: str = "full_brain",
-        registration_initialization: str = "auto",
-        partial_epi_syn: bool = False,
+        registration_initialization: str = "identity",
+        registration_syn: bool = False,
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -215,9 +231,8 @@ class SubjectDayConfig:
             runs=runs,
             fieldmap_method="pyhysco",
             epi_phase_encoding="PA",
-            registration_mode=registration_mode,
             registration_initialization=registration_initialization,
-            partial_epi_syn=partial_epi_syn,
+            registration_syn=registration_syn,
         )
 
 
@@ -238,9 +253,8 @@ class SubjectDayConfig:
             },
             "fieldmap_method": self.fieldmap_method,
             "epi_phase_encoding": self.epi_phase_encoding,
-            "registration_mode": self.registration_mode,
             "registration_initialization": self.registration_initialization,
-            "partial_epi_syn": self.partial_epi_syn,
+            "registration_syn": self.registration_syn,
             "ap_file": str(self.ap_file.relative_to(root)),
             "pa_file": str(self.pa_file.relative_to(root)),
             "fieldmap_dir": str((self.fieldmap_dir or self.ap_file.parent).relative_to(root)),

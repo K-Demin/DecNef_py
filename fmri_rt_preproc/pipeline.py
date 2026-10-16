@@ -110,11 +110,7 @@ class FMRIRealtimePreprocessor:
         # ---------- 3. BRAIN MASKS ----------
         t1_combined = self.anat_dir / "T1_combined_mask.nii"
 
-        needs_partial_brain = (
-            self._registration_settings()["mode"] == "partial_epi"
-            and not (self.anat_dir / "T1_brain.nii").exists()
-        )
-        if t1_combined.exists() and not needs_partial_brain:
+        if t1_combined.exists() and (self.anat_dir / "T1_brain.nii").exists():
             print("✓ Brain masks: already exist — skipping")
         else:
             print("→ Creating brain masks")
@@ -571,14 +567,11 @@ class FMRIRealtimePreprocessor:
 
     def _registration_settings(self):
         cfg = getattr(self, "cfg", None)
-        mode, initialization, syn = validate_registration_settings(
-            getattr(cfg, "registration_mode", "full_brain"),
-            getattr(cfg, "registration_initialization", "auto"),
-            getattr(cfg, "partial_epi_syn", False),
+        initialization, syn = validate_registration_settings(
+            getattr(cfg, "registration_initialization", "identity"),
+            getattr(cfg, "registration_syn", False),
         )
-        if initialization == "auto":
-            initialization = "identity" if mode == "partial_epi" else "center_of_mass"
-        return {"mode": mode, "initialization": initialization, "partial_epi_syn": syn}
+        return {"recipe": "t1_to_epi", "initialization": initialization, "syn": syn}
 
     def _registration_outputs(self):
         # Semantic directions never depend on the ANTs fixed/moving choice.
@@ -600,7 +593,23 @@ class FMRIRealtimePreprocessor:
             raise ValueError("Registration was interrupted before validation completed. " + error)
         if marker.exists():
             saved = json.loads(marker.read_text())
-            if saved.get("version") != 1 or saved.get("settings") != settings:
+            saved_settings = saved.get("settings")
+            if saved.get("version") == 1:
+                # The old partial recipe is identical to the common recipe.
+                # Preserve its provenance and assets without renaming/refitting.
+                old = saved_settings or {}
+                if old.get("mode") != "partial_epi":
+                    raise ValueError(error)
+                try:
+                    initialization, syn = validate_registration_settings(
+                        old["initialization"], old["partial_epi_syn"],
+                    )
+                except (KeyError, ValueError):
+                    raise ValueError(error) from None
+                saved_settings = {"recipe": "t1_to_epi", "initialization": initialization, "syn": syn}
+            elif saved.get("version") != 2:
+                raise ValueError(error)
+            if saved_settings != settings:
                 raise ValueError(error)
             records = saved.get("inputs", []) + saved.get("outputs", [])
             if not saved.get("inputs") or len(saved.get("outputs", [])) != len(outputs):
@@ -612,11 +621,9 @@ class FMRIRealtimePreprocessor:
             if [str(p.resolve()) for p in outputs] != [r["path"] for r in saved["outputs"]]:
                 raise ValueError(error)
         elif any(p.exists() for p in outputs):
-            # Existing full-brain studies used these same semantic directions.
-            # Do not silently reinterpret their unversioned transforms as slab fits.
-            legacy = {"mode": "full_brain", "initialization": "center_of_mass", "partial_epi_syn": False}
-            if settings != legacy or not all(p.is_file() and p.stat().st_size for p in outputs):
-                raise ValueError(error)
+            # Unversioned assets cannot certify the common registration recipe.
+            # Existing realtime consumers can still use their semantic directions.
+            raise ValueError(error)
         elif any((self.trans_dir / name).exists() for name in (
             "rt_WM_mask.nii", "rt_Vent_mask.nii", "epi_in_MNI.nii", "gpu_grids"
         )):
@@ -625,13 +632,11 @@ class FMRIRealtimePreprocessor:
     def _register_epi_to_t1(self, run_dir: Path, epi_mean: Path, epi_mask_mean: Path):
         self.validate_registration_request()
         settings = self._registration_settings()
-        partial = settings["mode"] == "partial_epi"
         t1_n4 = self.anat_dir / "T1_N4.nii"
-        t1 = self.anat_dir / ("T1_brain.nii" if partial else "T1_N4.nii")
-        t1_mask = self.anat_dir / "T1_combined_mask.nii"
-        fixed, moving = (epi_mean, t1) if partial else (t1, epi_mean)
-        masks = f"[{epi_mask_mean},NULL]" if partial else f"[{t1_mask},{epi_mask_mean}]"
-        inputs = [epi_mean, epi_mask_mean, t1, t1_n4] if partial else [epi_mean, epi_mask_mean, t1, t1_mask]
+        t1 = self.anat_dir / "T1_brain.nii"
+        fixed, moving = epi_mean, t1
+        masks = f"[{epi_mask_mean},NULL]"
+        inputs = [epi_mean, epi_mask_mean, t1, t1_n4]
         input_records = [source_identity(p) for p in dict.fromkeys(inputs)]
         outputs = self._registration_outputs()
         marker = self.trans_dir / "registration.json"
@@ -644,12 +649,10 @@ class FMRIRealtimePreprocessor:
         ensure_dir(self.trans_dir)
         require_same_grid(nib.load(str(epi_mask_mean)), nib.load(str(epi_mean)))
         require_same_grid(nib.load(str(t1)), nib.load(str(t1_n4)))
-        if not partial:
-            require_same_grid(nib.load(str(t1_mask)), nib.load(str(t1)))
         if not np.any(nib.load(str(epi_mask_mean)).get_fdata() > 0):
-            raise ValueError("EPI registration mask is empty; check skull stripping of the partial acquisition.")
+            raise ValueError("EPI registration mask is empty; check skull stripping of the EPI reference.")
 
-        prefix = self.trans_dir / ("t1_to_partial_epi_" if partial else "epi2t1_")
+        prefix = self.trans_dir / "t1_to_epi_"
         native = [Path(str(prefix) + suffix) for suffix in (
             "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii"
         )]
@@ -660,27 +663,20 @@ class FMRIRealtimePreprocessor:
             "--winsorize-image-intensities", "[0.005,0.995]", "--use-histogram-matching", "0",
             "--write-composite-transform", "1", "--initial-moving-transform", initialization,
         ]
-        if partial:
-            # ANTs' partial-slab example: small pyramid, no affine stretching.
-            # Identity keeps the physical-coordinate placement rather than
-            # equating a cropped slab's centroid with a whole T1's centroid.
-            stages = [
-                ("Translation[0.1]", "[50,1e-6,10]", "1", "0vox", ",Random,0.25"),
-                ("Rigid[0.1]", "[500x250x50,1e-6,10]", "2x2x1", "2x1x0vox", ",Random,0.25"),
-            ]
-            if settings["partial_epi_syn"]:
-                stages.append(("SyN[0.1,3,0]", "[50x10,1e-6,10]", "2x1", "1x0vox", ""))
-        else:
-            stages = [
-                ("Rigid[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
-                ("Affine[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
-                ("SyN[0.1,1,0]", "[100x70x50x20,1e-7,15]", "6x4x2x1", "3x2x1x0vox", ",Regular,0.2"),
-            ]
+        # One recipe for any EPI coverage, based on ANTs' partial-slab example.
+        # Header initialization avoids equating a cropped EPI's centroid with
+        # the whole T1's centroid. Translation and rotation are still optimized.
+        stages = [
+            ("Translation[0.1]", "[50,1e-6,10]", "1", "0vox", ",Random,0.25"),
+            ("Rigid[0.1]", "[500x250x50,1e-6,10]", "2x2x1", "2x1x0vox", ",Random,0.25"),
+        ]
+        if settings["syn"]:
+            stages.append(("SyN[0.1,3,0]", "[50x10,1e-6,10]", "2x1", "1x0vox", ""))
         for transform, convergence, shrink, sigma, sampling in stages:
             args += ["--transform", transform, "--metric", f"MI[{fixed},{moving},1,32{sampling}]",
                      "--convergence", convergence, "--shrink-factors", shrink,
                      "--smoothing-sigmas", sigma, "--masks", masks]
-        print(f"→ Running {settings['mode']} EPI↔T1 registration ({settings['initialization']})")
+        print(f"→ Running T1→EPI registration ({settings['initialization']}, SyN={settings['syn']})")
         # A failed/interrupted new fit must not be mistaken for a legacy cache,
         # even if ANTs or publication happened to write all four output files.
         pending = self.trans_dir / "registration_pending.json"
@@ -692,16 +688,15 @@ class FMRIRealtimePreprocessor:
             raise RuntimeError("ANTs registration did not produce both transforms and both diagnostic images.")
         require_same_grid(nib.load(str(native[2])), nib.load(str(fixed)))
         require_same_grid(nib.load(str(native[3])), nib.load(str(moving)))
-        # Publish inverse slab fit as EPI→T1; keep native files for transparent QC.
+        # Publish the inverse fit as EPI→T1; keep native files for transparent QC.
         # No header changes: each diagnostic retains its ANTs reference grid.
-        if partial:
-            for source, target in zip((native[1], native[0], native[3], native[2]), outputs):
-                shutil.copy2(source, target)
-        saved = {"version": 1, "settings": settings, "inputs": input_records,
+        for source, target in zip((native[1], native[0], native[3], native[2]), outputs):
+            shutil.copy2(source, target)
+        saved = {"version": 2, "settings": settings, "inputs": input_records,
                  "outputs": [source_identity(p) for p in outputs],
                  "native_fixed": str(fixed.resolve()), "native_moving": str(moving.resolve()),
-                 "epi_to_t1_native": str(native[1 if partial else 0].resolve()),
-                 "t1_to_epi_native": str(native[0 if partial else 1].resolve())}
+                 "epi_to_t1_native": str(native[1].resolve()),
+                 "t1_to_epi_native": str(native[0].resolve())}
         temporary = marker.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(saved, indent=2) + "\n")
         temporary.replace(marker)
