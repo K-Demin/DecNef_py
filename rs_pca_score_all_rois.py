@@ -33,7 +33,9 @@ from rs_realtime_parallel import (
     _wait_for_epi_dicoms,
     run_fixation_presentation,
 )
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import (
+    add_registration_arguments, apply_registration_arguments, load_regressor_settings,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -429,6 +431,7 @@ def main() -> None:
         help="TRs for voxel-wise normalization baseline.",
     )
     parser.add_argument("--settings-file", default=None)
+    add_registration_arguments(parser)
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--rt-max-scan-length", type=int, default=None)
     parser.add_argument("--biopac-enable", action="store_true")
@@ -454,6 +457,7 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
 
     sub = _coalesce_sub(args)
     max_trs = args.max_trs
@@ -480,6 +484,13 @@ def main() -> None:
         raise FileNotFoundError(f"Incoming directory does not exist: {incoming_root}")
     if (args.ap_block is None) != (args.pa_block is None):
         raise ValueError("Set both --ap-block and --pa-block, or neither.")
+
+    from run_preproc import preflight_registration
+    preflight_registration(
+        base_data, sub, args.day, args.ap_block, args.pa_block,
+        REGRESSOR_SETTINGS.registration_initialization,
+        REGRESSOR_SETTINGS.registration_syn,
+    )
 
     subject_root = base_data / f"sub-{sub}"
     run_dir = subject_root / args.day / "func" / args.run
@@ -549,6 +560,8 @@ def main() -> None:
             ap_block=args.ap_block,
             pa_block=args.pa_block,
             epi_block=epi_block,
+            registration_initialization=REGRESSOR_SETTINGS.registration_initialization,
+            registration_syn=REGRESSOR_SETTINGS.registration_syn,
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, sub, args.day)

@@ -14,12 +14,50 @@ It runs:
 - T1 -> MNI registration via SynthMorph
 - PyHySCO distortion correction from native AP/PA means (no AP/PA motion correction)
 - Raw BOLD unwarping, then motion correction to the fixed corrected session reference
-- EPI(mean) -> T1 -> MNI registration via ANTs
+- T1 -> corrected EPI registration via ANTs; use its inverse for EPI -> T1
+- EPI -> MNI resampling through EPI -> T1 and the SynthMorph T1 -> MNI transform
 - Optional composed transforms for online use
 
 All heavy transforms for realtime are precomputed offline.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
+
+EPI-to-anatomy registration (full-brain and partial coverage)
+----------------------------------------------------------
+
+Preparation uses one recipe: fixed corrected EPI, moving T1, header-based
+identity initialization, then Translation and Rigid optimization. The default
+settings are "registration_initialization": "identity" and
+"registration_syn": false. center_of_mass is an explicit initialization option;
+auto is a compatibility alias for identity. Optional SyN adds nonlinear
+refinement. New full-brain preparation therefore changes the old recipe: there
+is no Affine stage, and SyN is disabled by default.
+
+run_preproc.py, rs_realtime_parallel.py and rs_pca_score_all_rois.py all accept
+--settings-file /path/to/participant_settings.json. Without it they use built-in
+defaults; rt_settings.json is not loaded automatically. Explicit
+--registration-initialization, --registration-syn or --no-registration-syn
+options override the profile; omitted options preserve it. Effective choices
+are recorded in the prepared session's config.json. Neurofeedback, PsychoPy,
+robot and BrainPong reuse these prepared maps without separate partial flags.
+
+The canonical epi2t1_Composite.h5 still maps EPI -> T1, and
+epi2t1_InverseComposite.h5 still maps T1 -> EPI. Native ANTs outputs from new
+fits are retained as t1_to_epi_*. There is no active registration_mode flag.
+Old JSON registration_mode values full_brain/partial_epi warn and are ignored;
+partial_epi_syn warns and aliases registration_syn. Conflicting aliases fail.
+
+All three preparation commands check cache compatibility before staging scans
+or rewriting config.json. New fits record registration.json version 2.
+Equivalent version 1 partial-EPI caches can be reused after input/output and
+settings checks. Old full-brain or unversioned caches require a fresh preparation
+directory for the new recipe; unchanged prepared maps remain usable by existing
+realtime consumers. Rebuild the reference and derived transforms together when
+changing preparation. This is separate from truncate_t1_to_epi_fov, which only
+changes a PCA output grid. Inspect alignment and mask/decoder coverage for both
+full-brain and partial acquisitions; native anatomical registration has not been
+validated in the Windows development environment.
+Commands, settings and QC guidance: docs/partial_epi_registration.md
 
 Final analysis masking and spatial smoothing
 --------------------------------------------
@@ -47,8 +85,7 @@ Use absolute custom paths; relative paths are resolved from the process director
 
 Order: unwarp -> MC -> regression/normalization -> EPI/T1/MNI output ->
        final analysis masking / masked smoothing -> scoring.
-Motion estimation, DVARS, and WM/CSF nuisance extraction retain their existing
-inputs. The decoder ROI can be a smaller subset of the analysis/smoothing mask.
+The decoder ROI can be a smaller subset of the analysis/smoothing mask.
 
 whole_brain uses the corrected session EPI brain mask. cortical_gm selects the
 bilateral cortical DKT parcels from anat/fastsurfer/<subject>/mri/
@@ -64,10 +101,17 @@ MNI->EPI/T1 mask conversion is not supported; supply a mask in final coordinates
 Cortex/custom masks are intersected with transformed EPI brain coverage. Empty,
 nonfinite, nonbinary custom, or incompatible masks fail before volume processing.
 
-Positive-FWHM mathematics matches smooth_masked in the supplied volume_smooth.py:
-Gaussian(mask * volume) / Gaussian(mask) inside the SAME selected mask, zero outside;
+Each volume also carries geometric FOV support from its estimated MC transform
+through the same final spatial transform. This is independent of voxel intensity.
+The effective mask is the fixed analysis mask intersected with current support.
+Missing current samples are zeroed before spatial interpolation and final output.
+This does not add a missing-observation policy to cumulative nuisance regression.
+
+Positive-FWHM mathematics uses normalized convolution:
+Gaussian(effective_mask * volume) / Gaussian(effective_mask), zero outside;
 float64, per-axis mm-to-voxel conversion, zero padding, truncate=4, and original-value
-fallback where the denominator is below 1e-6. The denominator and buffers are cached.
+fallback where the denominator is below 1e-6. Buffers are reused; the denominator
+is recomputed when coverage removes analysis voxels and cached otherwise.
 At 0 mm, cortex/custom mode copies in-mask values unchanged and zeros everything
 else, with no Gaussian calls. This remains volumetric, not surface-geodesic smoothing.
 
@@ -75,10 +119,14 @@ Outputs under func/<run>/:
   smooth/vol_XXXXX_smooth.nii       positive FWHM, masked and smoothed
   masked/vol_XXXXX_masked.nii       cortex/custom masking with 0 mm
   corresponding *_orig.nii         optional original-score comparison stream
-Each active folder includes mask.nii (the actual final mask); source/coverage masks
-may also be saved for inspection. Earlier-step files remain unchanged. Final volumes
+Each active folder includes mask.nii (the fixed analysis mask). Per-volume support
+is saved separately in coverage/vol_XXXXX_epi.nii and, when applicable, *_t1.nii
+or *_mni.nii. New coverage handling requires fresh run outputs, but an unchanged
+prepared registration can be reused. Final volumes
 are published atomically for PCA readers. Stream "score_input" to see final output;
 "mc" and "unwarped" continue to show the earlier corrected volumes.
+The online viewer adds a second row for the same volume's T1 stage before
+smoothing. EPI/MNI runs without a T1 intermediate show that row as unavailable.
 
 PCA final reg/t1/mni readers follow the selected final stage from run metadata.
 Preparation accepts --pca-input smooth or masked; auto follows the final stage,
@@ -112,7 +160,7 @@ We assume two conda environments:
 Typical usage:
 
     conda activate rt_pipe
-    python run_preproc.py --sub 00085 --day 4
+    python run_preproc.py --sub 00085 --day 4 --settings-file ./rt_settings.json
     python rt_pipeline.py --sub 00085 --day 2 --run 11 --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20251105.20251105_00085.Kostya  --base-data /SSD2/DecNef_py/data
     python -m fmri_rt_preproc.prep_surface_rois --root /SSD2/DecNef_py/data --subj 00085 --day 2_copy
 
@@ -120,7 +168,8 @@ To stage raw DICOMs for the structural scan and AP/PA fieldmaps before preproces
 
     python run_preproc.py --sub 00085 --day 4 \
       --incoming-root /path/to/incoming/dicoms \
-      --ap-block 7 --pa-block 8 --struct-block 3 --epi-block 11
+      --ap-block 7 --pa-block 8 --struct-block 3 --epi-block 11 \
+      --settings-file ./rt_settings.json
 
 For full fastsurfer preproc + ROI masks (you can run it before run_preproc):
     python -m fmri_rt_preproc.prep_surface_rois \
@@ -213,7 +262,7 @@ Running the pipeline
 3) Run the preprocessing:
 
        conda activate rt_pipe
-       python run_preproc.py /path/to/sub-0001/day-01/config.json
+       python run_preproc.py --sub 0001 --day 01 --base-data /project_root --settings-file /path/to/participant_settings.json
 
 4) The script will:
 
@@ -306,6 +355,60 @@ Contact / Notes
 - The AP/PA naming in your current folders is flipped ("AP" == down, "PA" == up),
   but the pipeline just treats them as AP.nii.gz and PA.nii.gz, so future
   renaming will not break the logic.
+
+Measure realtime speed
+----------------------
+
+Append --test-speed to your usual rs_realtime_parallel.py command. It runs the
+same pipeline and records timings; stop normally with Ctrl+C after acquisition.
+The run folder (sub-<subject>/<day>/func/<run>/) receives:
+
+  speed_test.csv   per-volume measurements, flushed as volumes finish
+  speed_test.png   16:9 report generated after stopping, outside the TR loop
+
+The plot is one per-stage duration chart. Labels follow the script: DICOM
+conversion, FMAP unwarping, MC plus FD, REG denoising (including any physiology
+wait), TRANS spatial resampling, SMOOTH/MASK, SCORE and output I/O. The internal
+QC timing is labeled DVARS: signal-change and censor checks (FD and DVARS flags).
+Disabled stages with no measured work are omitted.
+
+The same chart includes incoming-volume overhead:
+  WAIT       idle time until the next incoming volume is detected
+  FILE       creation-to-close callback interval, when both events are observed
+  WATCHDOG   detection to conversion-worker start, including worker queueing
+  ORDER      conversion completion to ordered processing start
+These input intervals can overlap and should not be added together. FILE includes
+event-delivery delay and is not a pure transfer-time measurement. It is
+blank/not observed if the filesystem supplies no close event, the creation event
+was missed, or the close arrives after the completed CSV row was flushed.
+
+Summaries use ready volumes when available, preferring fresh live conversions.
+Backlog and reused-NIfTI measurements are separate cohorts, never pooled into
+the selected summary. The subtitle identifies the cohort and each row gives n.
+Whiskers are approximate 95% moving-block-bootstrap confidence intervals
+of each stage's median, using 2,000 resamples and blocks of ceil(n^(1/3)) adjacent
+measurements. A fixed seed makes regeneration repeatable; fewer than 8 observations
+or nonconsecutive volume indices are labeled CI unavailable. Missing observations
+are not treated as adjacent TRs. These are uncertainty intervals for the within-run
+median, not a range containing 95% of individual TR times. The bootstrap assumes
+approximate stationarity and short-range dependence. Per-volume timings in the
+CSV allow inspection of drift; the intervals do not predict a future run.
+Method: https://arch.readthedocs.io/en/stable/bootstrap/timeseries-bootstraps.html
+
+Existing files are marked backlog, reused raw NIfTIs are marked cached, and
+failed volumes have their own status. Backlog detection intervals do not measure
+scanner cadence. Input timing begins when the watcher sees a file, not at the
+scanner trigger; file-transfer time before detection is therefore not measured.
+Processing includes file I/O and repeated conversion/processing attempts;
+end-to-end latency additionally includes queue delays and retry backoff. An
+interrupted volume may be absent, but completed rows remain in the CSV.
+Profiling is off by default. Matplotlib is only imported to make the report.
+Initialization/anatomy preparation and external display rendering are excluded.
+Each profiled invocation replaces this run's previous speed_test.csv/.png.
+
+To regenerate the report (set --tr to the run's configured TR, in seconds):
+
+    python rt_speed.py /path/to/run/speed_test.csv --tr 1.0
 
 Global runtime settings (new)
 -----------------------------

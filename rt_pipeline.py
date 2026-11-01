@@ -58,6 +58,8 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
+COVERAGE_POLICY = "mc_fov_v1"
+SUPPORT_THRESHOLD = 1.0 - 1e-5
 
 
 @dataclass
@@ -79,11 +81,13 @@ class ResultEnvelope:
     motion_vec: Optional[np.ndarray] = None
     meta: dict[str, Any] = field(default_factory=dict)
 
-def log_step(step: str, vol: int, extra: str = "", start_t=None):
+def log_step(step: str, vol: int, extra: str = "", start_t=None, speed=None):
     """Compact colored/clean log."""
     v = f"{vol:05d}"
     if start_t is not None:
-        dt = time.time() - start_t
+        dt = time.perf_counter() - start_t
+        if speed is not None:
+            speed.stage(vol, step, dt)
         log.info(f"[{step:<5}] vol {v}  {extra}  ({dt*1000:.1f} ms)")
     else:
         log.info(f"[{step:<5}] vol {v}  {extra}")
@@ -433,6 +437,7 @@ class RTSessionConfig:
     reference_score_stats: Optional[dict] = None
     enable_scoring: bool = True
     enable_original_score: bool = False
+    test_speed: bool = False
 
     # NEW
     ap_block: Optional[int] = None
@@ -607,55 +612,14 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
         log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
         return None
 
-    grid_path_npz = out_dir / "sampling_grid.npz"
-    grid_path_pt = out_dir / "sampling_grid.pt"
-    grid_path = grid_path_npz if grid_path_npz.exists() else grid_path_pt
-    if grid_path.exists():
-        try:
-            fixed_img = nib.load(str(fixed_ref))
-            payload = GpuAntsLikeResampler._load_payload(grid_path)
-            cached_shape = tuple(int(v) for v in payload["fixed_shape"])
-            cached_affine = np.asarray(payload["fixed_affine"], dtype=np.float64)
-            if cached_shape != fixed_img.shape[:3] or not np.allclose(
-                cached_affine,
-                fixed_img.affine,
-                atol=1e-3,
-            ):
-                log.warning(
-                    "[GPU] Existing sampling grid does not match current fixed reference; "
-                    "recomputing %s",
-                    out_dir,
-                )
-                for stale in [
-                    grid_path_npz,
-                    grid_path_pt,
-                    out_dir / "coord_x_in_fixed.nii",
-                    out_dir / "coord_y_in_fixed.nii",
-                    out_dir / "coord_z_in_fixed.nii",
-                ]:
-                    if stale.exists():
-                        stale.unlink()
-                grid_path = grid_path_npz
-        except Exception as exc:
-            log.warning("[GPU] Could not validate existing sampling grid %s: %s", grid_path, exc)
-            for stale in [
-                grid_path_npz,
-                grid_path_pt,
-                out_dir / "coord_x_in_fixed.nii",
-                out_dir / "coord_y_in_fixed.nii",
-                out_dir / "coord_z_in_fixed.nii",
-            ]:
-                if stale.exists():
-                    stale.unlink()
-            grid_path = grid_path_npz
-    if not grid_path.exists():
-        log.info("[GPU] Precomputing fixed sampling grid at %s", out_dir)
-        grid_path = precompute_sampling_grid(
-            moving_ref=moving_ref,
-            fixed_ref=fixed_ref,
-            transforms=transforms,
-            out_dir=out_dir,
-        )
+    # The builder validates both geometries and the ordered transform contents;
+    # grids from older versions without that provenance are rebuilt once.
+    grid_path = precompute_sampling_grid(
+        moving_ref=moving_ref,
+        fixed_ref=fixed_ref,
+        transforms=transforms,
+        out_dir=out_dir,
+    )
 
     device = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_device", "cuda"))
     resampler = GpuAntsLikeResampler(grid_path=grid_path, device=device, mode="bilinear")
@@ -934,6 +898,7 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "reference_score_stats": cfg.reference_score_stats,
             "enable_original_score": cfg.enable_original_score,
             "preprocessing_order": PIPELINE_ORDER,
+            "coverage_policy": COVERAGE_POLICY,
             "smoothing_fwhm_mm": float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0)),
             "analysis_mask": getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
             "analysis_mask_file": getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
@@ -1019,6 +984,10 @@ class DICOMHandler(FileSystemEventHandler):
     ):
         super().__init__()
         self.cfg = cfg
+        self.speed = None
+        if getattr(cfg, "test_speed", False):
+            from rt_speed import SpeedRecorder
+            self.speed = SpeedRecorder(cfg.rt_work_dir / "speed_test.csv")
         self.current_run = int(cfg.run)
         self.next_volume_idx = 1
         self.score_queue = score_queue
@@ -1090,7 +1059,15 @@ class DICOMHandler(FileSystemEventHandler):
                 kind=str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")),
                 every_n=int(getattr(REGRESSOR_SETTINGS, "volume_stream_every_n", 1)),
                 max_queue=int(getattr(REGRESSOR_SETTINGS, "volume_stream_max_queue", 2)),
-                window_title=str(getattr(REGRESSOR_SETTINGS, "volume_stream_window_title", "RT volume QC")),
+                window_title=str(
+                    getattr(
+                        REGRESSOR_SETTINGS,
+                        "volume_stream_window_title",
+                        "RT volume QC",
+                    )
+                ),
+                window_x=int(getattr(REGRESSOR_SETTINGS, "volume_stream_window_x", 50)),
+                window_y=int(getattr(REGRESSOR_SETTINGS, "volume_stream_window_y", 50)),
             ),
             logger=log,
         )
@@ -1318,16 +1295,16 @@ class DICOMHandler(FileSystemEventHandler):
         # We still enqueue as a fallback for filesystems that don't emit
         # close events, but the preferred path is `on_closed` below.
         log.info(f"[WATCHDOG] File created: {path}")
-        self.enqueue_path(path)
+        self.enqueue_path(path, file_event="created")
 
     def on_closed(self, event):
         if event.is_directory:
             return
         path = Path(event.src_path)
         log.info(f"[WATCHDOG] File closed: {path}")
-        self.enqueue_path(path)
+        self.enqueue_path(path, file_event="closed")
 
-    def enqueue_path(self, path: Path) -> None:
+    def enqueue_path(self, path: Path, backlog: bool = False, file_event: Optional[str] = None) -> None:
         parsed = parse_dicom_name(path.name)
         if parsed is None:
             log.debug(f"[WATCHDOG] Ignoring non-matching file: {path.name}")
@@ -1337,14 +1314,18 @@ class DICOMHandler(FileSystemEventHandler):
         if run_id != self.current_run:
             log.debug(f"[WATCHDOG] Ignoring run {run_id}, expecting {self.current_run}")
             return
+        if self.speed is not None:
+            self.speed.arrive(scan, backlog=backlog)
+            if file_event is not None:
+                self.speed.file_event(scan, file_event)
+        if scan in self._processed_scans or scan in self._pending_scans:
+            return
         if self._online_mode and not self._biopac_run_started:
             if not self._biopac_started:
                 self.start_biopac()
             elif self.biopac_receiver is not None:
                 self.biopac_receiver.send_run_start()
                 self._biopac_run_started = True
-        if scan in self._processed_scans or scan in self._pending_scans:
-            return
         self._pending.put((scan, path))
         self._pending_scans.add(scan)
 
@@ -1387,6 +1368,8 @@ class DICOMHandler(FileSystemEventHandler):
             return
         if exc is None:
             return
+        if self.speed is not None:
+            self.speed.finish(volume_idx, False)
 
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         log.error(
@@ -1461,7 +1444,7 @@ class DICOMHandler(FileSystemEventHandler):
         prepared_raw: Optional[Path] = None
         volume_timestamp: Optional[float] = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-            prepared_raw, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx)
+            prepared_raw, volume_timestamp = prepare_volume_input(self.cfg, path, volume_idx, self.speed)
             if prepared_raw is not None:
                 break
             log.warning(
@@ -1479,14 +1462,19 @@ class DICOMHandler(FileSystemEventHandler):
                     self._order_cv.wait(timeout=0.1)
             log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
             for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-                ok = process_volume(
-                    self.cfg,
-                    self,
-                    path,
-                    volume_idx,
-                    raw_nii=prepared_raw,
-                    volume_timestamp=volume_timestamp,
-                )
+                started = self.speed.process_start(volume_idx) if self.speed else None
+                try:
+                    ok = process_volume(
+                        self.cfg,
+                        self,
+                        path,
+                        volume_idx,
+                        raw_nii=prepared_raw,
+                        volume_timestamp=volume_timestamp,
+                    )
+                finally:
+                    if self.speed is not None:
+                        self.speed.process_end(volume_idx, started)
                 if ok:
                     break
                 log.warning(
@@ -1499,6 +1487,8 @@ class DICOMHandler(FileSystemEventHandler):
 
         if not ok:
             log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
+        if self.speed is not None:
+            self.speed.finish(volume_idx, ok)
         with self._lock:
             self._inflight_scans.discard(scan)
             self.mark_processed(scan)
@@ -1509,7 +1499,7 @@ class DICOMHandler(FileSystemEventHandler):
         tb_txt = None
         for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
             try:
-                env = compute_stage(self.cfg, path, scan=scan, volume_idx=volume_idx, attempt=attempt)
+                env = compute_stage(self.cfg, path, scan=scan, volume_idx=volume_idx, attempt=attempt, speed=self.speed)
                 env.attempts = attempt
                 return env
             except Exception as exc:
@@ -1529,11 +1519,17 @@ class DICOMHandler(FileSystemEventHandler):
         )
 
     def _commit_scan(self, env: ResultEnvelope) -> None:
+        speed = getattr(self, "speed", None)
+        started = speed.process_start(env.volume_idx) if speed else None
+        ok = False
         try:
-            commit_stage(self.cfg, self, env)
+            ok = commit_stage(self.cfg, self, env)
         except Exception as exc:
             log.error("[ENGINE] commit failure scan=%s vol=%05d err=%s", env.scan, env.volume_idx, exc)
         finally:
+            if speed is not None:
+                speed.process_end(env.volume_idx, started)
+                speed.finish(env.volume_idx, ok)
             with self._lock:
                 if env.scan <= self._last_committed_scan:
                     log.warning("[COMMIT] Ignoring already-committed/late scan=%s (last=%s)", env.scan, self._last_committed_scan)
@@ -1562,7 +1558,65 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC -> FMAP) ----------
 
-def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
+def final_volume_support(cfg, handler, support, epi_affine, volume_idx, space):
+    """Carry this volume's MC field of view through the same final transform.
+
+    Linear support must be essentially one: a retained output voxel must not
+    interpolate unavailable EPI samples. This is independent of BOLD intensity.
+    """
+    folder = cfg.rt_work_dir / "coverage"
+    folder.mkdir(parents=True, exist_ok=True)
+    epi_path = folder / f"vol_{volume_idx:05d}_epi.nii"
+    nib.save(nib.Nifti1Image(support.astype(np.uint8), epi_affine), epi_path)
+    if space == "epi":
+        return support
+    final_path = folder / f"vol_{volume_idx:05d}_{space}.nii"
+    reference = resolve_decoder_template(cfg)
+    ref = nib.load(str(reference))
+    if handler.gpu_resampler is not None:
+        mapped = handler.gpu_resampler.resample_array(support.astype(np.float32))
+    else:
+        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        if space == "mni":
+            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        cmd = ["antsApplyTransforms", "-d", "3", "-i", str(epi_path),
+               "-r", str(reference), "-o", str(final_path), "-n", "Linear", "--float", "1"]
+        for transform in transforms:
+            cmd.extend(["-t", str(transform)])
+        run(cmd)
+        mapped_img = nib.load(str(final_path), mmap=False)
+        require_same_grid(mapped_img, ref)
+        mapped = np.asarray(mapped_img.dataobj).copy()
+    if mapped.shape != ref.shape[:3] or not np.isfinite(mapped).all():
+        raise ValueError("Invalid per-volume coverage on the final image grid.")
+    valid = mapped >= SUPPORT_THRESHOLD
+    nib.save(nib.Nifti1Image(valid.astype(np.uint8), ref.affine), final_path)
+    return valid
+
+
+def zero_outside_support(path, support):
+    """Remove unsupported resampled values; do not infer validity from signal."""
+    if support.all():
+        return
+    img = nib.load(str(path), mmap=False)
+    data = np.asarray(img.dataobj).copy()
+    if data.shape != support.shape:
+        raise ValueError("BOLD and per-volume coverage shapes differ.")
+    data[~support] = 0
+    nib.save(nib.Nifti1Image(data, img.affine), str(path))
+
+def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int, speed=None) -> tuple[Optional[Path], Optional[float]]:
+    if speed is None:
+        return _prepare_volume_input(cfg, dicom_path, volume_idx)
+    cached = (cfg.rt_raw_dir / f"vol_{volume_idx:05d}.nii").exists()
+    started = speed.conversion_start(volume_idx, cached=cached)
+    try:
+        return _prepare_volume_input(cfg, dicom_path, volume_idx)
+    finally:
+        speed.conversion_end(volume_idx, started)
+
+
+def _prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int) -> tuple[Optional[Path], Optional[float]]:
     """
     Convert DICOM to raw NIfTI.
     This stage is safe to run ahead of ordered/stateful realtime steps.
@@ -1570,7 +1624,7 @@ def prepare_volume_input(cfg: RTSessionConfig, dicom_path: Path, volume_idx: int
     volume_timestamp = time.time()
 
     # ---------- 1) DICOM -> raw NIfTI ----------
-    t0 = volume_timestamp
+    t0 = time.perf_counter()
     raw_dir = cfg.rt_raw_dir
     raw_nii = raw_dir / f"vol_{volume_idx:05d}.nii"
 
@@ -1622,8 +1676,8 @@ def run_worker_local_volreg(ref_epi: Path, raw_nii: Path, mc_nii: Path, volume_i
     return mc_data, img.affine, motion_vec
 
 
-def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1) -> ResultEnvelope:
-    raw_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
+def compute_stage(cfg: RTSessionConfig, dicom_path: Path, scan: int, volume_idx: int, attempt: int = 1, speed=None) -> ResultEnvelope:
+    raw_nii, volume_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx, speed)
     if raw_nii is None or volume_timestamp is None:
         raise RuntimeError("prepare_volume_input failed")
     return ResultEnvelope(
@@ -1669,7 +1723,7 @@ def process_volume(
       3) Motion correction of unwarped volume -> mc NIfTI
       4) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
     """
-
+    speed = getattr(handler, "speed", None)
     if raw_nii is None:
         raw_nii, prepared_timestamp = prepare_volume_input(cfg, dicom_path, volume_idx)
         if raw_nii is None or prepared_timestamp is None:
@@ -1679,7 +1733,7 @@ def process_volume(
         volume_timestamp = time.time()
 
     # Unwarp raw BOLD in calibration geometry before estimating motion.
-    uw_t0 = time.time()
+    uw_t0 = time.perf_counter()
     raw_img = nib.load(str(raw_nii))
     validate_bold(raw_img, cfg.fmap_dir, str(REGRESSOR_SETTINGS.epi_phase_encoding).upper(), raw_nii)
     ref_img = nib.load(str(cfg.rt_motion_ref_epi))
@@ -1700,10 +1754,10 @@ def process_volume(
     img = nib.Nifti1Image(corrected, raw_img.affine)
     if bool(getattr(REGRESSOR_SETTINGS, "save_intermediate_unwarped", True)):
         nib.save(img, str(local_unwarped))
-    log_step("FMAP", volume_idx, start_t=uw_t0)
+    log_step("FMAP", volume_idx, start_t=uw_t0, speed=speed)
 
     # ---------- 2) Motion correction (RtpVolreg) ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     mc_dir = cfg.rt_mc_dir
     mc_nii = mc_dir / f"vol_{volume_idx:05d}_mc.nii"
 
@@ -1719,6 +1773,17 @@ def process_volume(
 
     # Extract corrected data and save with a FRESH header
     mc_data = np.asanyarray(tmp_img.dataobj).astype(np.float32)
+    # Apply the estimated motion to geometric support, never re-register a mask
+    # or threshold denoised intensities (valid residuals may be zero/negative).
+    acquisition_support = getattr(handler, "acquisition_support", None)
+    if acquisition_support is None or acquisition_support.shape != data.shape:
+        acquisition_support = np.ones(data.shape, dtype=np.float32)
+        handler.acquisition_support = acquisition_support
+    mc_support_values = handler.volreg.resample_support(acquisition_support, volume_idx - 1)
+    if mc_support_values.shape != mc_data.shape or not np.isfinite(mc_support_values).all():
+        raise ValueError("Invalid motion-corrected field-of-view support.")
+    mc_support = mc_support_values >= SUPPORT_THRESHOLD
+    mc_data[~mc_support] = 0
     mc_img = nib.Nifti1Image(mc_data, ref_img.affine)  # fixed corrected reference grid
     nib.save(mc_img, str(mc_nii))
 
@@ -1761,9 +1826,11 @@ def process_volume(
         volume_idx,
         extra=f"FD={fd_to_save:.4f}" if np.isfinite(fd_to_save) else "FD=NaN (pre-trial)",
         start_t=t0,
+        speed=speed,
     )
 
     # ---------- 2b.5) CENSOR FLAGS (FD + DVARS) ----------
+    qc_t0 = time.perf_counter()
     fd_censor = 0
     dvars_censor = 0
 
@@ -1819,10 +1886,11 @@ def process_volume(
 
     # update prev for next DVARS
     handler.prev_mc_for_dvars = mc_data.copy()
-
+    if speed is not None:
+        speed.stage(volume_idx, "QC", time.perf_counter() - qc_t0)
 
     # ---------- 2d) Motion regression (RTPS_py) ----------
-    reg_t0 = time.time()
+    reg_t0 = time.perf_counter()
     mc_for_warp = mc_unwarped_nii
     if handler.motion_regressor is not None:
         handler.proc_src.proc_data = np.asanyarray(mc_unwarped_img.dataobj)
@@ -1832,19 +1900,27 @@ def process_volume(
             fd_censor=fd_censor,
             dvars_censor=dvars_censor,
         )
+        cleaned = np.array(cleaned, copy=True)
+        cleaned[~mc_support] = 0
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "motion", start_t=reg_t0)
+        log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
     else:
         cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
+        cleaned = np.array(cleaned, copy=True)
+        cleaned[~mc_support] = 0
         reg_ready = True
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0)
+        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0, speed=speed)
+
+    if speed is not None:
+        speed.readiness(volume_idx, reg_ready)
+    output_t0 = time.perf_counter()
 
     if handler.motion_regressor is not None:
         reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
@@ -1881,20 +1957,27 @@ def process_volume(
                 avg_timelag,
             )
 
+    if speed is not None:
+        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
+
     # ---------- 3) Space handling (EPI passthrough, EPI→T1, or EPI→T1→MNI) ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    t1_stage_nii = None
+    pending_spatial_outputs = []
     score_input_nii = mc_for_warp
     score_input_orig_nii: Optional[Path] = None
     if cfg.enable_original_score and mc_unwarped_nii.exists():
         score_input_orig_nii = mc_unwarped_nii
 
     if analysis_space == "epi":
-        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0)
+        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0, speed=speed)
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
-        t1_nii = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+        t1_final = t1_dir / f"vol_{volume_idx:05d}_t1.nii"
+        t1_nii = t1_final.with_name("." + t1_final.name)
+        pending_spatial_outputs.append((t1_nii, t1_final))
 
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
@@ -1923,10 +2006,13 @@ def process_volume(
             ]
             run(cmd)
         score_input_nii = t1_nii
+        t1_stage_nii = t1_final
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
-            t1_orig_nii = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+            t1_orig_final = t1_dir / f"vol_{volume_idx:05d}_t1_orig.nii"
+            t1_orig_nii = t1_orig_final.with_name("." + t1_orig_final.name)
+            pending_spatial_outputs.append((t1_orig_nii, t1_orig_final))
             if handler.gpu_resampler is not None:
                 handler.gpu_resampler.resample_nifti_to_nifti(mc_unwarped_nii, t1_orig_nii)
             else:
@@ -1942,10 +2028,12 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = t1_orig_nii
-        log_step("TRANS", volume_idx, "warp→T1", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→T1", start_t=t0, speed=speed)
     elif analysis_space == "mni":
         mni_dir = cfg.rt_mni_dir
-        mni_nii = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+        mni_final = mni_dir / f"vol_{volume_idx:05d}_mni.nii"
+        mni_nii = mni_final.with_name("." + mni_final.name)
+        pending_spatial_outputs.append((mni_nii, mni_final))
 
         warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
@@ -1978,7 +2066,9 @@ def process_volume(
 
         # Optional: also save pre-denoise / pre-normalization score source.
         if cfg.enable_original_score:
-            mni_orig_nii = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            mni_orig_final = mni_dir / f"vol_{volume_idx:05d}_mni_orig.nii"
+            mni_orig_nii = mni_orig_final.with_name("." + mni_orig_final.name)
+            pending_spatial_outputs.append((mni_orig_nii, mni_orig_final))
             if handler.gpu_resampler is not None:
                 handler.gpu_resampler.resample_nifti_to_nifti(mc_unwarped_nii, mni_orig_nii)
             else:
@@ -1995,7 +2085,7 @@ def process_volume(
                 ]
                 run(cmd_orig)
             score_input_orig_nii = mni_orig_nii
-        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0)
+        log_step("TRANS", volume_idx, "warp→MNI", start_t=t0, speed=speed)
     else:
         log.error(
             "Unsupported analysis_space=%r. Expected 'epi', 't1', or 'mni'.",
@@ -2003,19 +2093,39 @@ def process_volume(
         )
         return False
 
+    # Coverage is transformed separately from the signal, before smoothing.
+    coverage_t0 = time.perf_counter()
+    final_support = final_volume_support(cfg, handler, mc_support, ref_img.affine,
+                                        volume_idx, analysis_space)
+    zero_outside_support(score_input_nii, final_support)
+    if score_input_orig_nii is not None and score_input_orig_nii != mc_nii:
+        zero_outside_support(score_input_orig_nii, final_support)
+    # PCA polls public stage filenames. Publish only the completed, supported
+    # image so an unsmoothed consumer cannot read an intermediate interpolation.
+    for temporary, destination in pending_spatial_outputs:
+        temporary.replace(destination)
+        if score_input_nii == temporary:
+            score_input_nii = destination
+        if score_input_orig_nii == temporary:
+            score_input_orig_nii = destination
+    if speed is not None:
+        speed.stage(volume_idx, "TRANS", time.perf_counter() - coverage_t0)
+
     # Final image operation, after spatial transforms and before all scoring.
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
-        smooth_t0 = time.time()
+        smooth_t0 = time.perf_counter()
         kind = smoother.output_kind
         folder = cfg.rt_work_dir / kind
         score_input_nii = smooth_file(smoother, score_input_nii,
-                                      folder / f"vol_{volume_idx:05d}_{kind}.nii")
+                                      folder / f"vol_{volume_idx:05d}_{kind}.nii",
+                                      support_mask=final_support)
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
-                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii")
-        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0)
+                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_support)
+        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
 
+    output_t0 = time.perf_counter()
     stream_kind = str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")).lower()
     stream_paths = {
         "raw": raw_nii,
@@ -2024,7 +2134,7 @@ def process_volume(
         "reg": reg_nii,
         "score_input": score_input_nii,
     }
-    handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind))
+    handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind), t1_stage_nii)
 
     if not cfg.enable_scoring:
         if handler.score_queue is not None:
@@ -2037,10 +2147,15 @@ def process_volume(
                 )
             except Exception as exc:
                 log.error(f"[SCORE] Failed to enqueue volume {volume_idx:05d}: {exc}")
+        if speed is not None:
+            speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
         return True
 
+    if speed is not None:
+        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
+
     # ---------- 4) Decoder scoring ----------
-    t0 = time.time()
+    t0 = time.perf_counter()
     try:
         # Load the warped volume (decoder/ROI space)
         score_img = nib.load(str(score_input_nii))
@@ -2106,7 +2221,7 @@ def process_volume(
         else:
             extra = f"raw={raw_score:.4f} z={z_score:.4f}"
 
-        log_step("SCORE", volume_idx, extra, start_t=t0)
+        log_step("SCORE", volume_idx, extra, start_t=t0, speed=speed)
 
     except Exception as e:
         log.error(f"[SCORE] Failed scoring vol {volume_idx:05d}: {e}")
@@ -2136,24 +2251,57 @@ def validate_run_provenance(cfg):
     """Do not mix old MC-first outputs or a different field/reference in a run."""
     folder = cfg.rt_work_dir
     marker = folder / "preprocessing_order.json"
-    payload = {"order": PIPELINE_ORDER, "calibration": load_calibration(cfg.fmap_dir),
+    saved = json.loads(marker.read_text()) if marker.exists() else None
+    if saved is not None and saved.get("coverage_policy") != COVERAGE_POLICY:
+        raise ValueError("Run coverage handling changed. Use a fresh run output directory.")
+    trans_dir = getattr(cfg, "trans_dir", None)
+    if trans_dir is not None and (trans_dir / "registration_pending.json").exists():
+        raise ValueError("Registration preparation is incomplete. Finish preparation before starting a run.")
+    legacy_schema = saved is not None and not any(
+        key in saved for key in ("analysis_space", "spatial_transform", "nuisance_masks"))
+    if legacy_schema and trans_dir is not None and (trans_dir / "registration.json").exists():
+        raise ValueError("Legacy run provenance cannot certify the new registration. Use a fresh run output directory.")
+    payload = {"order": PIPELINE_ORDER, "coverage_policy": COVERAGE_POLICY,
+               "calibration": load_calibration(cfg.fmap_dir),
                "field": source_identity(_preferred_pyhysco_fieldmap(cfg.fmap_dir)),
                "reference": source_identity(cfg.rt_motion_ref_epi),
                "epi_phase_encoding": str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()}
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    if not legacy_schema:
+        payload["analysis_space"] = space
+    if not legacy_schema and space in {"t1", "mni"}:
+        from gpu_ants_like_resampler import sampling_grid_identity
+        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        if space == "mni":
+            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        payload["spatial_transform"] = sampling_grid_identity(
+            cfg.rt_unwarped_analysis_ref_epi, resolve_decoder_template(cfg), transforms)
+    if not legacy_schema and bool(getattr(REGRESSOR_SETTINGS, "enable_motion_regression", False)):
+        # These EPI-space masks can change when a registration is rebuilt even
+        # when the final analysis stays in EPI space.
+        payload["nuisance_masks"] = {}
+        for setting, attribute in (("use_gs", "rt_unwarped_analysis_ref_mask"),
+                                   ("use_wm", "rt_wm_mask"), ("use_vent", "rt_vent_mask")):
+            if bool(getattr(REGRESSOR_SETTINGS, setting, False)):
+                path = getattr(cfg, attribute)
+                payload["nuisance_masks"][setting] = source_identity(path) if path.exists() else None
     fwhm = float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0))
     if not np.isfinite(fwhm) or fwhm < 0:
         raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
     mask_type = getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain")
     if final_output_kind(fwhm, mask_type) is not None:
-        space = str(REGRESSOR_SETTINGS.analysis_space).lower()
         reference = cfg.rt_unwarped_analysis_ref_epi if space == "epi" else resolve_decoder_template(cfg)
         payload["final_masking"] = {"fwhm_mm": fwhm, "space": space,
             **mask_provenance(cfg, mask_type, space, reference,
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"))}
-    if marker.exists():
-        if json.loads(marker.read_text()) != payload:
-            raise ValueError("Run preprocessing/calibration/reference changed. Use a fresh run output directory.")
+    if saved is not None:
+        if saved != payload:
+            raise ValueError("Run preprocessing/calibration/reference or spatial transform changed. Use a fresh run output directory.")
+        if legacy_schema:
+            log.info("[REGISTRATION] Reusing legacy run provenance with its original checks; "
+                     "registration fingerprints remain unrecorded.")
+        return  # Preserve legacy markers; never certify new fields retroactively.
     elif any((folder / name).exists() and any((folder / name).glob("*.nii*"))
              for name in ("mc", "unwarped", "reg", "t1", "mni", "smooth", "masked")):
         raise ValueError("Legacy processed run detected. Use a fresh output directory for unwarp -> MC replay.")
@@ -2198,11 +2346,16 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
+    # Prime backlog provenance before created/closed notifications can arrive.
+    if event_handler.speed is not None:
+        for path in existing:
+            event_handler.speed.arrive(parse_dicom_name(path.name)[2], backlog=True)
+
     observer.start()
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
-            event_handler.enqueue_path(Path(f))
+            event_handler.enqueue_path(Path(f), backlog=True)
         while event_handler.submit_pending():
             continue
 

@@ -16,7 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import (
+    add_registration_arguments, apply_registration_arguments, load_regressor_settings,
+)
 import rs_pca_runtime as pca_rt
 from fmri_rt_preproc.native_fieldmap import load_calibration, native_paths
 
@@ -136,6 +138,8 @@ def _run_preproc(
     ap_block: Optional[int],
     pa_block: Optional[int],
     epi_block: int,
+    registration_initialization: str = "identity",
+    registration_syn: bool = False,
 ) -> None:
     cmd = [
         sys.executable,
@@ -150,6 +154,9 @@ def _run_preproc(
         str(incoming_root),
         "--epi-block",
         str(epi_block),
+        "--registration-initialization",
+        registration_initialization,
+        "--registration-syn" if registration_syn else "--no-registration-syn",
     ]
     if struct_block is not None:
         cmd += ["--struct-block", str(struct_block)]
@@ -420,15 +427,34 @@ def run_fixation_presentation(
     score_queue: Queue,
     max_trs: Optional[int],
     stop_event: mp.Event,
+    fix_size: float = 0.3,
 ) -> None:
     from psychopy import core, event, visual
 
     win = _build_presentation_window(visual, color=[-0.004, -0.004, -0.004])
+
+    try:
+        w, h = win.size
+        aspect_ratio = float(h) / float(w)
+    except Exception:
+        aspect_ratio = 1.0
+
+    fixation = visual.ShapeStim(
+        win,
+        units="norm",
+        vertices="cross",
+        pos=(0, 0),
+        size=(aspect_ratio * fix_size, fix_size),
+        fillColor="white",
+        lineColor="white",
+    )
+
     seen_vols: set[int] = set()
 
     while True:
         win.fullscr = True
         _release_mouse_cursor(win)
+        fixation.draw()
         win.flip()
         try:
             while True:
@@ -508,6 +534,7 @@ def main() -> None:
         default=20,
         help="Minimum EPI DICOMs to wait for before running offline preproc.",
     )
+    add_registration_arguments(parser)
     parser.add_argument(
         "--prep-surface-rois",
         action="store_true",
@@ -673,6 +700,10 @@ def main() -> None:
         help="Maximum TR count preallocated by RTPSpy regression.",
     )
 
+    parser.add_argument(
+        "--test-speed", action="store_true",
+        help="Record per-volume stage/input timings and save speed_test.csv + speed_test.png when stopped.",
+    )
     args = parser.parse_args()
     if args.pca_score:
         raise ValueError(
@@ -684,6 +715,7 @@ def main() -> None:
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
     if args.skip_first_trs < 0:
         raise ValueError("--skip-first-trs must be >= 0")
     baseline_trs = (
@@ -707,6 +739,13 @@ def main() -> None:
 
     if not incoming_root.exists():
         raise FileNotFoundError(f"Incoming directory does not exist: {incoming_root}")
+
+    from run_preproc import preflight_registration
+    preflight_registration(
+        base_data, args.sub, args.day, args.ap_block, args.pa_block,
+        REGRESSOR_SETTINGS.registration_initialization,
+        REGRESSOR_SETTINGS.registration_syn,
+    )
 
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -781,6 +820,8 @@ def main() -> None:
             ap_block=args.ap_block,
             pa_block=args.pa_block,
             epi_block=epi_block,
+            registration_initialization=REGRESSOR_SETTINGS.registration_initialization,
+            registration_syn=REGRESSOR_SETTINGS.registration_syn,
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, args.sub, args.day)
@@ -827,6 +868,7 @@ def main() -> None:
                 else pca_reference_image
             ),
             enable_scoring=enable_scoring,
+            test_speed=args.test_speed,
             ap_block=args.ap_block,
             pa_block=args.pa_block,
         )
@@ -872,6 +914,13 @@ def main() -> None:
             if pipeline_process.is_alive():
                 pipeline_process.terminate()
             pipeline_process.join(timeout=5)
+            if args.test_speed:
+                try:
+                    from rt_speed import plot_speed
+                    speed_plot = plot_speed(cfg.rt_work_dir / "speed_test.csv", REGRESSOR_SETTINGS.TR)
+                    log.info("[SPEED] %s", speed_plot or "No completed volume timings to plot.")
+                except Exception:
+                    log.exception("[SPEED] Plot failed; recorded CSV remains available.")
             _plot_qc(cfg.rt_work_dir)
 
         if args.pca_prep:

@@ -6,9 +6,7 @@ from pathlib import Path
 import argparse
 
 import pandas as pd
-from psychopy import visual, core
 
-from .block import TrialBlock
 from .utils import load_defaults_params, get_game_params, load_defaults_levels
 
 WIN_SIZE = [1200, 800]
@@ -39,28 +37,22 @@ def handle_levels(levels: str | Path | None):
 
 def get_next_level(
     current_level: int,
-    performance: float,
-    performance_criteria: float,
+    player_won,
     max_level: int,
-    use_aggressive_leveling: bool,
 ) -> int:
-    """Return the level that should be used for the next trial/block."""
-    if performance > performance_criteria:
+    """1-up/1-down. player_won: True=up, False=down, None=hold."""
+    if player_won is True:
         return min(current_level + 1, max_level)
-
-    if use_aggressive_leveling:
+    if player_won is False:
         return max(current_level - 1, 0)
-
     return current_level
 
 
 def load_resume_state(
     resume_from: str | Path,
-    performance_criteria: float,
     max_level: int,
-    use_aggressive_leveling: bool,
-) -> tuple[int, int]:
-    """Load starting level and points from the last row of a block summary."""
+) -> int:
+    """Load starting level from the last row of a block summary."""
     resume_path = Path(resume_from)
     if not resume_path.exists():
         raise FileNotFoundError(f"Resume file not found: {resume_path}")
@@ -70,18 +62,11 @@ def load_resume_state(
         raise ValueError(f"Resume file has no trial rows: {resume_path}")
 
     last_trial = summary.iloc[-1]
-    total_points = int(last_trial["end_points"])
     current_level = int(last_trial["diff_level"])
-    performance = float(last_trial["performance"])
-    next_level = get_next_level(
-        current_level,
-        performance,
-        performance_criteria,
-        max_level,
-        use_aggressive_leveling,
-    )
+    if current_level > max_level:
+        current_level = max_level
 
-    return next_level, total_points
+    return current_level
 
 
 def run_experiment(
@@ -95,6 +80,8 @@ def run_experiment(
     start_block: int = 1,
     resume_from: str | Path | None = None,
     overwrite: bool = False,
+    keyboard_delay_sec: float | None = None,
+    window_backend: str | None = None,
 ):
     """Top-level function that runs the pong task in its entirety
 
@@ -107,7 +94,7 @@ def run_experiment(
         levels: Path to YAML file with level configurations.
         config: Path to YAML file with runtime parameter overrides.
         start_block: First block number to run. Block numbering is 1-based.
-        resume_from: Previous block summary TSV to continue level and points from.
+        resume_from: Previous block summary TSV to continue level from.
         overwrite: Allow overwriting existing block output files.
     """
     if start_block < 1:
@@ -115,6 +102,7 @@ def run_experiment(
 
     blocks = range(start_block, start_block + n_blocks)
 
+    print("[BrainPong] Loading configuration...", flush=True)
     params = handle_game_config(config)
     levels = handle_levels(levels)
 
@@ -123,11 +111,9 @@ def run_experiment(
     current_level = params["init_level"]
     total_points = params["init_points"]
     if resume_from is not None:
-        current_level, total_points = load_resume_state(
+        current_level = load_resume_state(
             resume_from,
-            params["performance_criteria"],
             max(levels.keys()),
-            params["use_aggressive_leveling"],
         )
 
     if not overwrite:
@@ -140,43 +126,79 @@ def run_experiment(
 
     game_params = get_game_params(params)
     game_params["input_method"] = input_method
+    if keyboard_delay_sec is not None:
+        game_params["keyboard_delay_sec"] = keyboard_delay_sec
     if paddle_response_mode is not None:
         game_params["paddle_response_mode"] = paddle_response_mode
 
-    win = visual.Window(
-        size=params["win_size"],
-        fullscr=bool(params.get("fullscr", True)),
-        winType="pyglet",
-        color="black",
-        units="pix",
+    backend = window_backend or params.get("win_type", "pyglet")
+    refresh_rate = params.get("refresh_rate")
+
+    # Import the GUI modules here so the terminal can identify an import-time
+    # stall separately from a window-creation stall on macOS.
+    print("[BrainPong] Importing PsychoPy visual modules...", flush=True)
+    from psychopy import visual, core
+    from .block import TrialBlock
+
+    print(
+        f"[BrainPong] Creating window "
+        f"(backend={backend}, fullscr={bool(params.get('fullscr', True))})...",
+        flush=True,
     )
-
-    for b in blocks:
-        trial_block = TrialBlock(
-            b,
-            n_trials,
-            save_dir,
-            levels,
-            current_level,
-            total_points,
-            params["block_pre_delay"],
-            params["performance_criteria"],
-            win=win,
-            game_params=game_params,
-            use_aggressive_leveling=params["use_aggressive_leveling"],
+    try:
+        win = visual.Window(
+            size=params["win_size"],
+            fullscr=bool(params.get("fullscr", True)),
+            winType=backend,
+            color="black",
+            units="pix",
+            allowGUI=True,
+            checkTiming=False,
         )
-        completed = trial_block.run()
+    except Exception as exc:
+        print(
+            f"[BrainPong] Window creation failed with {backend}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
 
-        if not completed:
-            print("Experiment ended early by user")
-            break
+    print("[BrainPong] Window created.", flush=True)
+    handle = getattr(win, "winHandle", None)
+    activate = getattr(handle, "activate", None)
+    if callable(activate):
+        activate()
 
-        total_points = trial_block.total_points
-        current_level = trial_block.current_level
+    try:
+        for b in blocks:
+            print(f"[BrainPong] Preparing block {b}...", flush=True)
+            trial_block = TrialBlock(
+                b,
+                n_trials,
+                save_dir,
+                levels,
+                current_level,
+                total_points,
+                params["block_pre_delay"],
+                params["performance_criteria"],
+                win=win,
+                game_params=game_params,
+                use_aggressive_leveling=params["use_aggressive_leveling"],
+                refresh_rate=refresh_rate,
+            )
+            completed = trial_block.run()
 
-    win.close()
+            if not completed:
+                print("[BrainPong] Experiment ended early by user.", flush=True)
+                break
+
+            total_points = trial_block.total_points
+            current_level = trial_block.current_level
+    finally:
+        win.close()
+
+    print("[BrainPong] DONE!", flush=True)
     core.quit()
-    print("DONE!")
 
 
 def handler(args: argparse.Namespace) -> int:
@@ -197,6 +219,8 @@ def handler(args: argparse.Namespace) -> int:
         start_block=args.start_block,
         resume_from=args.resume_from,
         overwrite=args.overwrite,
+        keyboard_delay_sec=args.keyboard_delay_sec,
+        window_backend=args.window_backend,
     )
     return 0
 
@@ -220,7 +244,16 @@ def create_parser(
     )
 
     parser.add_argument(
-        "--input_method", type=str, required = True, help = "mouse or press or wheel or brain"
+        "--input_method", choices=["keyboard", "mouse", "press", "wheel", "brain"],
+        default="keyboard", help="Default: keyboard (1=TOP, 2=BOTTOM, delayed by 6 seconds)"
+    )
+    parser.add_argument("--keyboard-delay-sec", type=float, default=None,
+                        help="Fixed behavioral key delay in seconds (default: 6); NF is unaffected")
+    parser.add_argument(
+        "--window-backend",
+        choices=["pyglet", "glfw"],
+        default=None,
+        help="PsychoPy window backend (overrides win_type in the YAML config)",
     )
 
     parser.add_argument(
@@ -229,8 +262,8 @@ def create_parser(
         choices=["hrf", "hold"],
         default=None,
         help=(
-            "Paddle response for press/wheel input. 'hrf' uses the full HRF "
-            "waveform; 'hold' rises to the HRF peak and keeps that position."
+            "Legacy compatibility option. Keyboard uses --keyboard-delay-sec; "
+            "NF receives no additional delay or HRF convolution."
         ),
     )
 
@@ -259,7 +292,7 @@ def create_parser(
         default=None,
         help=(
             "Path to a previous block summary TSV. The next run starts with "
-            "that block's carried-over points and adjusted next level."
+            "that block's last saved level; points reset to init_points."
         ),
     )
 
@@ -268,8 +301,8 @@ def create_parser(
         "-l",
         type=str,
         help="Path to a YAML file containing level configurations. If not "
-        "provided, then the experiments a single constant level across trials. "
-        "Will overwrite paddle_size and points_increment if used.",
+        "provided, uses the default binary-pilot level table. "
+        "Only opponent miss probability changes with level.",
     )
     parser.add_argument(
         "--config",

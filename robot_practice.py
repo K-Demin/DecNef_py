@@ -33,29 +33,42 @@ DELAY            = 8.0    # feedback delay, seconds (fixed, matches real task)
 SESSION_DURATION = 180    # 3 minutes
 
 # --- signal ---
-SCROLL_GAIN      = 6.0    # points added per wheel notch
-EFFORT_HALFLIFE  = 6.0    # s for the scrolled-up boost to halve (must keep working)
-NOISE_SD         = 7.0    # size of the ongoing jitter
-NOISE_TAU        = 2.0    # s, how slow the jitter is (bigger = smoother)
-DIP_MIN, DIP_MAX = 1.5, 4.0     # random seconds between downward dips
-P_RETURN         = 0.8    # chance a dip pulls back to centre (else a small drop)
-RETURN_FRAC      = (0.5, 1.0)   # how far to centre a "return" dip pulls
-DROP_AMOUNT      = (6.0, 12.0)  # size of a "small drop" dip
+# With NO scrolling the line rests at 0 (the bottom). Scrolling UP raises it.
+# The downward NOISE is harsh, so even scrolling up constantly the line is dragged
+# back and hovers around 50 most of the time - it can't be pushed to the top.
+# With NO scrolling the line rests near 0 (the bottom); scrolling raises it.
+# EFFORT_CAP is what the line can reach under sustained scrolling, and it has to
+# clear METER_THRESHOLD by a useful margin or the meter can never fill: at the
+# old cap of 50 even constant scrolling only reached ~50 and earned nothing.
+SIGNAL_CENTER    = 0.0    # value with no scrolling (line rests at the bottom)
+SCROLL_GAIN      = 6.0    # points added per wheel notch (real upward control)
+EFFORT_HALFLIFE  = 3.0    # s for the scrolled-up push to halve (leaks back to 0)
+EFFORT_CAP       = 80.0   # max sustained upward push from scrolling
+NOISE_SD         = 16.0   # jitter fighting the scroll
+NOISE_TAU        = 1.5    # s, correlation time of the noise
+# Over the 180 s practice: idle -> level 0, light scrolling -> 0, steady -> 1,
+# constant hard scrolling -> ~3. Effort has to be sustained to earn anything.
 
 # --- OUR level (from the meter) ---
-OUR_LEVEL_COST   = 3500.0   # meter units for the first level-up
+# Constants below match rt_robot_parallel.py so the practice feels like the
+# real task. The session is half as long (180 s vs 360 s), so expect roughly
+# half the levels: not scrolling ~level 1, steady scrolling ~level 3.
+METER_THRESHOLD  = 50.0     # meter fills only with the line ABOVE this
+OUR_LEVEL_COST   = 1030.0   # meter units for the first level-up
 COST_GROWTH      = 0.20     # each level costs this much more (0 = constant)
 
 # --- ENEMY level (from win streak) ---
 WIN_STREAK       = 3        # consecutive wins that level the enemy up
+ENEMY_CAP_AT_OUR_LEVEL = True   # enemy may catch up but never overtake
 
 # --- fight strength (both sides) ---
 STR_BASE         = 50.0     # strength at level 1
-STR_STEP         = 12.0     # strength gained per level
-GAME_HP          = 100.0
+STR_STEP         = 4.0      # strength gained per level
+GAME_HP          = 88.0
 DMG_K            = 0.22     # damage per hit = DMG_K * strength
-ATTACK_INTERVAL  = 0.5      # seconds between hits
-DMG_JITTER       = 0.30     # +/- randomness per hit (keeps equal levels ~chance)
+ATTACK_INTERVAL  = 1.2      # seconds between hits
+DMG_JITTER       = 0.55     # +/- randomness per hit
+# equal levels ~50% win, +1 level ~67%, -1 level ~33%; fights last ~9.6 s
 
 MAX_LEVEL        = 12       # safety cap for both sides
 
@@ -227,21 +240,26 @@ def show_message(text):
 show_message(
     "SCROLL the mouse wheel UP to raise the line.\n\n"
     "Your control is DELAYED by 8 seconds - what you see now is what you did 8 s ago.\n\n"
-    "Keep the line HIGH to fill your POWER meter and LEVEL UP your robot (bigger, stronger).\n"
-    "The enemy is even at first; each time you win 3 fights in a row, it levels up too.\n\n"
+    "The middle of the screen is your NEUTRAL level. The POWER meter charges only\n"
+    "while the line is ABOVE the middle. Charge it to LEVEL UP your robot.\n\n"
+    "The line is jumpy and will sometimes touch the top or the bottom - that is\n"
+    "normal. Watch the overall trend, not single moments.\n\n"
+    "Losing fights is normal too, even when you are doing well.\n\n"
+    "In the scanner the run will START with a fixation cross - just rest then,\n"
+    "and wait for the robots before you begin.\n\n"
     "Press SPACE to start.")
 
 # ---------------------------------------------------------------------------
 # STATE
 # ---------------------------------------------------------------------------
 clock = core.Clock(); clock.reset()
+shown_scores = []          # every displayed value, for the end-of-run report
 effort = 0.0
 noise = 0.0
-history = deque([(0.0, 50.0)])
-ys = deque([sy(50)] * N_TRACE, maxlen=N_TRACE)
+history = deque([(0.0, 0.0)])
+ys = deque([sy(0)] * N_TRACE, maxlen=N_TRACE)
 last_t = 0.0
 next_sample = 0.0
-next_dip = random.uniform(DIP_MIN, DIP_MAX)
 next_log = 0.0
 
 meter = 0.0
@@ -264,21 +282,19 @@ while True:
         break
 
     # ---------------- signal ----------------
+    # Scroll adds an upward push (effort) that leaks back toward 0 and is capped,
+    # so scrolling raises the line but can't hold it high. Harsh symmetric noise
+    # drags it around, so under constant scrolling it sits ~50 most of the time.
     dy = mouse.getWheelRel()[1]
     if INVERT_WHEEL:
         dy = -dy
     effort += dy * SCROLL_GAIN
     effort *= math.exp(-decay_k * dt)
-    if now >= next_dip:
-        if random.random() < P_RETURN:
-            effort -= random.uniform(*RETURN_FRAC) * effort
-        else:
-            effort -= random.uniform(*DROP_AMOUNT)
-        next_dip = now + random.uniform(DIP_MIN, DIP_MAX)
-    effort = max(-10.0, min(55.0, effort))
+    effort = max(0.0, min(EFFORT_CAP, effort))   # scrolling only pushes UP
 
     noise += (-noise / NOISE_TAU) * dt + NOISE_SD * math.sqrt(2.0 / NOISE_TAU) * math.sqrt(dt) * random.gauss(0, 1)
-    control = max(0.0, min(100.0, 50.0 + effort + noise))
+
+    control = max(0.0, min(100.0, SIGNAL_CENTER + effort + noise))
     history.append((now, control))
 
     # ---------------- exact 8 s delay ----------------
@@ -295,10 +311,12 @@ while True:
     g = 0
     while now >= next_sample and g < 5:
         ys.append(sy(disp)); next_sample += SAMPLE_DT; g += 1
+        shown_scores.append(disp)
 
     # ---------------- OUR meter -> our level ----------------
     if our_level < MAX_LEVEL:
-        meter += disp * dt                      # fill rate = the (delayed) line value
+        # fills only with the EXCESS over the midpoint, as in the real task
+        meter += max(0.0, disp - METER_THRESHOLD) * dt
         need = our_cost(our_level)
         if meter >= need:
             meter -= need
@@ -330,7 +348,8 @@ while True:
         streak += 1
         our_hp = opp_hp = GAME_HP
         our_atk_t = opp_atk_t = ATTACK_INTERVAL
-        if streak >= WIN_STREAK and enemy_level < MAX_LEVEL:
+        if streak >= WIN_STREAK and enemy_level < MAX_LEVEL and (
+                not ENEMY_CAP_AT_OUR_LEVEL or enemy_level < our_level):
             enemy_level += 1
             streak = 0
             flash_txt, flash_until = 'ENEMY LEVELS UP!', now + 1.3
@@ -397,12 +416,41 @@ while True:
 
 # ---------------------------------------------------------------------------
 log_file.close()
+if shown_scores:
+    _a = np.asarray(shown_scores, dtype=float)
+    mean_disp, med_disp = float(_a.mean()), float(np.median(_a))
+    sd_disp = float(_a.std(ddof=1)) if len(_a) > 1 else float('nan')
+    pct_above = 100.0 * float((_a > METER_THRESHOLD).mean())
+else:
+    mean_disp = med_disp = sd_disp = pct_above = float('nan')
+
 with open(base + "_summary.csv", 'w', newline='') as sf:
     sw = csv.writer(sf)
-    sw.writerow(['participant', 'session', 'duration_s', 'our_level', 'enemy_level', 'wins', 'losses'])
-    sw.writerow([pid, ses, "%.1f" % clock.getTime(), our_level, enemy_level, wins, losses])
+    sw.writerow(['participant', 'session', 'duration_s', 'mean_displayed',
+                 'median_displayed', 'sd_displayed', 'pct_above_threshold',
+                 'our_level', 'enemy_level', 'wins', 'losses'])
+    sw.writerow([pid, ses, "%.1f" % clock.getTime(), "%.2f" % mean_disp,
+                 "%.2f" % med_disp, "%.2f" % sd_disp, "%.1f" % pct_above,
+                 our_level, enemy_level, wins, losses])
 
-show_message("Done!\n\nYour level: %d\nEnemy level: %d\nWins: %d    Losses: %d\n\nPress SPACE to exit."
-             % (our_level, enemy_level, wins, losses))
+_report = ("RUN COMPLETE   %s  %s\n"
+           "  displayed score   mean %.2f   median %.2f   sd %.2f\n"
+           "                    above %.0f: %.1f%% of the time\n"
+           "  your level        %d\n"
+           "  enemy level       %d\n"
+           "  fights            %d won / %d lost%s\n"
+           "  run time          %.1fs"
+           % (pid, ses, mean_disp, med_disp, sd_disp, METER_THRESHOLD, pct_above,
+              our_level, enemy_level, wins, losses,
+              ("   (%.0f%% won)" % (100.0 * wins / (wins + losses))) if (wins + losses) else "",
+              clock.getTime()))
+print("\n" + "=" * 58 + "\n" + _report + "\n" + "=" * 58 + "\n", flush=True)
+
+show_message("Done!\n\n"
+             "Mean line height: %.1f  (above %.0f for %.0f%% of the time)\n\n"
+             "Your level: %d\nEnemy level: %d\nWins: %d    Losses: %d\n\n"
+             "Press SPACE to exit."
+             % (mean_disp, METER_THRESHOLD, pct_above,
+                our_level, enemy_level, wins, losses))
 win.close()
 core.quit()

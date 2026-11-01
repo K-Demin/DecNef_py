@@ -9,6 +9,9 @@ from fmri_rt_preproc.config import SubjectDayConfig
 from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
 from fmri_rt_preproc.native_fieldmap import find_source
 from fmri_rt_preproc.utils import ensure_dir, run  # <- to call fslmerge
+from rt_global_settings import (
+    add_registration_arguments, apply_registration_arguments, load_regressor_settings,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc")
@@ -270,6 +273,30 @@ def _fieldmap_pair_dir(fmap_root: Path, ap_block: int | None, pa_block: int | No
         return fmap_root
     return fmap_root / f"pair-ap{ap_block:03d}_pa{pa_block:03d}"
 
+
+def preflight_registration(
+    base_data: Path,
+    subject: str,
+    day: str,
+    ap_block: int | None = None,
+    pa_block: int | None = None,
+    registration_initialization: str = "identity",
+    registration_syn: bool = False,
+) -> None:
+    """Reject an incompatible prepared session before staging or waiting for scans."""
+    root = Path(base_data) / f"sub-{subject}" / day
+    fmap_dir = _fieldmap_pair_dir(root / "fmap", ap_block, pa_block)
+    cfg = SubjectDayConfig.for_single_run(
+        subject_id=subject, day_id=day, root=root, run_id="trans",
+        epi_file=root / "func" / "trans" / "epi_4d.nii.gz",
+        ap_file=fmap_dir / "AP.nii", pa_file=fmap_dir / "PA.nii",
+        fieldmap_dir=fmap_dir,
+        registration_initialization=registration_initialization,
+        registration_syn=registration_syn,
+    )
+    FMRIRealtimePreprocessor(cfg).validate_registration_request()
+
+
 def _find_structural(anat_dir: Path) -> Path:
     """Locate the first structural (T1) scan, converting DICOMs if necessary."""
 
@@ -347,7 +374,19 @@ def main():
         action="store_true",
         help="Do not write config.json (use only in-memory config).",
     )
+    parser.add_argument(
+        "--settings-file", default=None,
+        help="Optional realtime JSON profile supplying registration settings.",
+    )
+    add_registration_arguments(parser)
     args = parser.parse_args()
+    settings = load_regressor_settings(args.settings_file)
+    apply_registration_arguments(settings, args)
+
+    preflight_registration(
+        args.base_data, args.sub, args.day, args.ap_block, args.pa_block,
+        settings.registration_initialization, settings.registration_syn,
+    )
 
     # data/sub-0001/3
     day_root = args.base_data / f"sub-{args.sub}" / args.day
@@ -443,7 +482,12 @@ def main():
         ap_file=ap_path,
         pa_file=pa_path,
         fieldmap_dir=fmap_dir,
+        registration_initialization=settings.registration_initialization,
+        registration_syn=settings.registration_syn,
     )
+
+    pipe = FMRIRealtimePreprocessor(cfg)
+    pipe.validate_registration_request()
 
     # Optionally save config.json so you can re-use it later
     config_path = day_root / "config.json"
@@ -454,7 +498,6 @@ def main():
     # ------------------------------------------------------------------
     # 3) Run the pipeline (anat + fmap + this one run)
     # ------------------------------------------------------------------
-    pipe = FMRIRealtimePreprocessor(cfg)
     pipe.run_all()
 
     log.info("Preprocessing finished.")

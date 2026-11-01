@@ -242,7 +242,11 @@ class RtpVolreg(RTP):
              ctypes.c_void_p]
 
         # -- Define THD_rota_vol --
+        self.THD_rota_method = librtp.THD_rota_method
+        self.THD_rota_method.argtypes = [ctypes.c_int]
+        self.THD_rota_method.restype = None
         self.THD_rota_vol = librtp.THD_rota_vol
+        self.THD_rota_vol.restype = None
         self.THD_rota_vol.argtypes = \
             [ctypes.c_int, ctypes.c_int, ctypes.c_int,
              ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_void_p,
@@ -433,6 +437,43 @@ class RtpVolreg(RTP):
         tim = np.moveaxis(np.moveaxis(tim, 0, -1), 0, 1)
 
         return tim, motpar[1:]
+
+    def resample_support(self, support, vol_idx):
+        """Apply an estimated motion to acquisition support without fitting again.
+
+        Call after do_proc with the same zero-based volume index, from the
+        ordered processing stage: AFNI's interpolation mode is global. Support
+        is a 3D array of weights in [0, 1] on the incoming EPI grid. Linear
+        interpolation measures geometric coverage; it does not certify every
+        tap of the heptic interpolation used for BOLD intensities.
+        """
+        support = np.asarray(support, dtype=np.float32)
+        if support.shape != (self.nx, self.ny, self.nz):
+            raise ValueError("Acquisition support must match the motion reference grid.")
+        if not np.isfinite(support).all() or np.any(support < 0) or np.any(support > 1):
+            raise ValueError("Acquisition support must contain finite weights in [0, 1].")
+        if vol_idx < 0 or vol_idx >= len(self._motion):
+            raise IndexError("Motion volume index is out of range.")
+        # Public RTPSpy rows store translations as dz, dx, dy; AFNI uses dx, dy, dz.
+        motion = self._motion[vol_idx, [0, 1, 2, 4, 5, 3]]
+        if not np.isfinite(motion).all():
+            raise ValueError("Cannot resample support with nonfinite motion parameters.")
+        angles = np.deg2rad(motion[:3].astype(np.float64))
+        weights = np.transpose(support, (2, 1, 0)).copy(order="C")
+        pointer = weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        try:
+            self.THD_rota_method(self.regmode_dict["linear"])
+            self.THD_rota_vol(
+                self.nx, self.ny, self.nz, self.dx, self.dy, self.dz, pointer,
+                self.ax1, float(angles[0]), self.ax2, float(angles[1]),
+                self.ax3, float(angles[2]), -1,
+                float(motion[3]), float(motion[4]), float(motion[5]))
+        finally:
+            self.THD_rota_method(self.regmode_dict[self.regmode])
+        # Unlike rtp_align_one, do not clip to the input minimum (ones would
+        # otherwise fill the missing coverage back in).
+        np.clip(weights, 0., 1., out=weights)
+        return np.transpose(weights, (2, 1, 0))
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     class PlotMotion(QtCore.QObject):
