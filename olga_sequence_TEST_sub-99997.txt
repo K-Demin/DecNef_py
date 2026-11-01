@@ -1,3 +1,65 @@
+
+
+
+
+TEST SESSION - sub-9988
+=====================================================================
+
+
+--decoder-intercept 0
+
+# check which folder for 'session number' we can use today
+
+---------------------------------------------------------------------
+/SSD2/DecNef_py/rt_nf_events_prob_parallel.py      (
+/SSD2/DecNef_py/check_registration.py
+
+Leave /SSD2/DecNef_py/decoders/rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii in place
+(the preparation's MNI step needs it).
+
+
+#resting state
+ssss
+conda activate rt_pipe ssss
+cd /SSD2/DecNef_py
+
+python rs_realtime_parallel.py --sub 99988 --day 12 --run 15 --epi-block 15 \
+  --ap-block 13 --pa-block 14 --wait-epi-min 20 \
+  --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20261020.20261020_99988.OLGA\
+  --base-data /SSD2/DecNef_py/data \
+  --settings-file /SSD2/DecNef_py/minjoo_settings_1.json --max-trs 100 \
+  --decoder-template /SSD2/DecNef_py/decoders/Minjoo/sub-99988_wb_face-scene_sig_decoder.nii.gz --no-score --test-speed \
+
+Copy from my last session
+
+# for my offline test
+
+
+# Create the separate test-code folder.
+rsync -a \
+  --exclude='.git/' \
+  --exclude='data/' \
+  --exclude='decoders/' \
+  --exclude='.venv/' \
+  --exclude='__pycache__/' \
+  /SSD2/DecNef_py/ \
+  /SSD2/DecNef_py_replay_tests/
+
+# Extract the updates into that test folder.
+unzip -o /SSD2/olga-prob-feedback-replay-update.zip \
+  -d /SSD2/DecNef_py_replay_tests/
+
+cd /SSD2/DecNef_py_replay_tests
+
+
+
+
+
+
+
+
+
+
 TEST SESSION - sub-99997 (Sara) - does the pipeline run end to end?
 =====================================================================
 Decoder = sub-55555 weights from ANOTHER task, bias b = 0.  The feedback values mean
@@ -43,11 +105,17 @@ SCANNER ORDER  (block numbers = assumption; change them if the console shows oth
    start this in terminal 1 as soon as block 5 STARTS:
 
 #for resting state
-python rs_realtime_parallel.py --sub 99997 --day 2 --run 6 --epi-block 6 \
+
+
+python rs_realtime_parallel.py --sub 99997 --day 10 --run 6 --epi-block 6 \
   --ap-block 2 --pa-block 3 --wait-epi-min 20 \
-  --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20261013.20261013_55555.Olga/ --base-data /SSD2/DecNef_py/data --settings-file /SSD2/DecNef_py/olga_settings.json --max-trs 300 \
-  --decoder-template /SSD2/DecNef_py/decoders/Sara/55555/weights_PFC.nii.gz --no-score
-s
+  --incoming-root /home/sin/DecNef_pain_Dec23/realtime/incoming/pain7T/20261013.20261013_55555.Olga \
+  --base-data /SSD2/DecNef_py/data \
+  --settings-file /SSD2/DecNef_py/olga_settings.json --max-trs 300 \
+  --decoder-template /SSD2/DecNef_py/decoders/olga/sub-00307/arm_B/ --no-score --test-speed \
+
+
+
    (--no-score: the RS run computes no decoder score, as intended. The decoder is given
     only so the RS volumes are resampled to the same T1 grid as the NF runs.)
    First time for this subject it also builds anat (N4, FastSurfer, masks, SynthMorph):
@@ -80,6 +148,7 @@ python rt_nf_events_prob_parallel.py --sub 99997 --day 2 --run 8 --epi-block 8 \
    --score-delay 3 \
    --settings-file olga_settings.json \
    --rs 4 \
+
 
 5. NF block = EPI block 6, 385 volumes. Type in terminal 1 BEFORE the technician starts it:
 
