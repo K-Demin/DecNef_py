@@ -1,39 +1,94 @@
 #!/usr/bin/env python
-"""Pre-NF check: are the decoder voxels inside today's registered EPI?
+"""Check registration QC reports, or record explicit review of their images.
 
-Usage:
-  python check_registration.py --trans /SSD2/DecNef_py/data/sub-00307/1/func/trans \
-                               --weights /SSD2/DecNef_py/decoders/olga/<..._weights_PFC.nii.gz>
-Exit code 0 = OK, 1 = coverage below --min-frac (do NOT start NF; re-run the preparation).
+Optional decoder-intensity coverage retains a separate coverage guard. It never
+approves registration. Exit 0 means all checks pass; exit 1 means blocked.
 """
-import argparse, sys
+import argparse
+import json
 from pathlib import Path
-import numpy as np
+
 import nibabel as nib
+import numpy as np
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--trans", required=True, type=Path, help="<day>/func/trans folder")
-ap.add_argument("--weights", required=True, type=Path, help="decoder weights NIfTI (T1 space)")
-ap.add_argument("--min-frac", type=float, default=0.90)
-a = ap.parse_args()
+from fmri_rt_preproc.registration_qc import (
+    approve_registration_qc, assert_qc_gate, load_registration_qc_report,
+)
 
-warped = nib.load(str(a.trans / "epi2t1_Warped.nii"))
-w = nib.load(str(a.weights))
-wd = np.asanyarray(w.dataobj)
-ijk = np.argwhere(np.isfinite(wd) & (wd != 0))
-# decoder voxel centres -> world -> voxel indices of the registered EPI (nearest neighbour)
-xyz = nib.affines.apply_affine(w.affine, ijk)
-vox = np.rint(nib.affines.apply_affine(np.linalg.inv(warped.affine), xyz)).astype(int)
-ed = np.asanyarray(warped.dataobj).astype(np.float32)
-if ed.ndim > 3:
-    ed = ed[..., 0]
-inside = np.all((vox >= 0) & (vox < np.array(ed.shape[:3])), axis=1)
-vals = np.zeros(len(vox), np.float32)
-vals[inside] = ed[tuple(vox[inside].T)]
-thr = 0.10 * np.percentile(ed[ed > 0], 50) if (ed > 0).any() else 0.0
-n_in = int((vals > thr).sum()); n = len(vals); frac = n_in / max(n, 1)
-print(f"decoder voxels inside registered EPI: {n_in}/{n} ({100*frac:.1f} %)")
-if frac < a.min_frac:
-    print("REGISTRATION CHECK FAILED - do not start NF. Rename func/trans and re-run run_preproc.py.")
-    sys.exit(1)
-print("Registration check OK")
+
+def decoder_signal_coverage(trans, weights):
+    """Legacy signal-presence summary, not geometric registration accuracy."""
+    warped = nib.load(str(Path(trans) / "epi2t1_Warped.nii"))
+    decoder = nib.load(str(weights))
+    values = np.asarray(decoder.dataobj)
+    if values.ndim != 3:
+        raise ValueError("Decoder coverage requires a 3D weight image")
+    ijk = np.argwhere(np.isfinite(values) & (values != 0))
+    xyz = nib.affines.apply_affine(decoder.affine, ijk)
+    vox = np.rint(nib.affines.apply_affine(np.linalg.inv(warped.affine), xyz)).astype(int)
+    epi = np.asarray(warped.dataobj, dtype=np.float32)
+    if epi.ndim == 4:
+        epi = epi[..., 0]
+    if epi.ndim != 3:
+        raise ValueError("Decoder coverage requires a 3D or 4D registered EPI")
+    inside = np.all((vox >= 0) & (vox < np.array(epi.shape)), axis=1)
+    samples = np.zeros(len(vox), np.float32)
+    samples[inside] = epi[tuple(vox[inside].T)]
+    positive = epi[np.isfinite(epi) & (epi > 0)]
+    threshold = .10 * float(np.median(positive)) if positive.size else 0.
+    count = int(np.sum(np.isfinite(samples) & (samples > threshold)))
+    return {"signal_voxels": count, "decoder_voxels": len(vox),
+            "fraction": count / len(vox) if len(vox) else None,
+            "intensity_threshold": threshold}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trans", required=True, type=Path,
+                        help="Prepared transform folder containing registration_qc*.json and review PNGs")
+    parser.add_argument("--approve", action="store_true",
+                        help="Record that you visually reviewed all current report images; cannot waive failures")
+    parser.add_argument("--reviewer", help="Name of the person who inspected alignment and coverage (required with --approve)")
+    parser.add_argument("--note", default="", help="Optional review note saved with approval")
+    parser.add_argument("--weights", type=Path, help="Optional legacy decoder signal-coverage guard (T1-space weights)")
+    parser.add_argument("--min-frac", type=float, default=.90,
+                        help="Minimum decoder signal-coverage fraction when --weights is supplied; not alignment accuracy (default: 0.90)")
+    args = parser.parse_args(argv)
+    if args.approve and not (args.reviewer and args.reviewer.strip()):
+        parser.error("--approve requires --reviewer naming the person who reviewed the images")
+    if not 0 <= args.min_frac <= 1:
+        parser.error("--min-frac must be between 0 and 1")
+    try:
+        if args.weights:
+            coverage = decoder_signal_coverage(args.trans, args.weights)
+            fraction = coverage["fraction"]
+            text = f"{100 * fraction:.1f}%" if fraction is not None else "no nonzero decoder voxels"
+            print(f"Descriptive decoder signal coverage: {coverage['signal_voxels']}/{coverage['decoder_voxels']} ({text})")
+            if fraction is None or fraction < args.min_frac:
+                raise ValueError(f"Decoder signal-coverage guard failed (required {100 * args.min_frac:.1f}%). "
+                                 "Signal coverage does not establish anatomical alignment.")
+        paths = sorted(path for path in args.trans.glob("registration_qc*.json")
+                       if not path.name.endswith(".approval.json"))
+        if not paths:
+            raise ValueError("No registration QC reports. Generate the registration reports before approval or neurofeedback.")
+        reports = [load_registration_qc_report(path) for path in paths]
+        for path, report in zip(paths, reports):
+            print(f"{path.name}: {report['gate_status']} ({report['comparison']})")
+            print("  Metrics: " + json.dumps(report["metrics"], sort_keys=True))
+            if report.get("review_png"):
+                print("  Review image: " + report["review_png"])
+        if args.approve:
+            if any(report["gate_status"] == "fail" for report in reports):
+                raise ValueError("Failed registration QC cannot be approved; correct the registration or inputs first.")
+            for path in paths:
+                approve_registration_qc(path, reviewer=args.reviewer, note=args.note)
+        assert_qc_gate(paths)
+        print("Registration QC reports approved. The NF launcher also checks the session's required report set and assets.")
+        return 0
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"REGISTRATION QC BLOCKED: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

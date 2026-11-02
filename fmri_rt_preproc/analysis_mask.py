@@ -1,4 +1,5 @@
 """Experiment mask selection and one-time mapping into the final BOLD grid."""
+import json
 from pathlib import Path
 
 import nibabel as nib
@@ -6,6 +7,7 @@ import numpy as np
 from nibabel.processing import resample_from_to
 
 from .native_fieldmap import require_same_grid, source_identity
+from .offline_assets import t1_to_mni_transform
 
 # Cortical DKT labels used in the existing FastSurfer preparation. Excludes WM,
 # CSF, subcortical GM, cerebellum, and unknown/corpus-callosum labels.
@@ -22,11 +24,47 @@ def final_output_kind(fwhm_mm, mask_type="whole_brain"):
     return "smooth" if fwhm > 0 else ("masked" if mask_type != "whole_brain" else None)
 
 
+def session_epi_bridge(cfg):
+    """Current acquisition-to-stable EPI transform for NF or imported-asset RS.
+
+    preparation_only controls the NF gate, not spatial coordinates. A resting
+    run prepared against an offline EPI still needs its bridge for final output.
+    """
+    folder = getattr(cfg, "trans_dir", None)
+    if folder is None:
+        return None
+    folder = Path(folder)
+    bridge = folder / "session_to_reference_Composite.h5"
+    reference = folder / "reference_epi.nii"
+    mapped = folder.name == "session_trans" or bridge.exists() or reference.exists()
+    if not mapped:
+        registration = folder / "registration.json"
+        if registration.is_file():
+            saved = json.loads(registration.read_text())
+            mapped = bool(saved.get("settings", {}).get("offline_assets"))
+    if not mapped:
+        return None
+    for path in (bridge, reference):
+        if not path.is_file():
+            raise FileNotFoundError(f"Session EPI mapping is incomplete: {path}")
+    return bridge
+
+
+def epi_output_reference(cfg):
+    """Bridged EPI outputs share the preparation/offline grid, not the MC grid."""
+    if session_epi_bridge(cfg) is not None:
+        return cfg.trans_dir / "reference_epi.nii"
+    return cfg.rt_unwarped_analysis_ref_epi
+
+
 def mask_transforms(cfg, source_space, final_space):
+    bridge = session_epi_bridge(cfg) if final_space == "epi" else None
+    if bridge is not None and source_space in {"epi", "t1"}:
+        return [bridge] + ([cfg.trans_dir / "epi2t1_InverseComposite.h5"] if source_space == "t1" else [])
     if source_space == final_space or source_space == "final":
         return []
     forward = cfg.trans_dir / "epi2t1_Composite.h5"
-    mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
+    mni = t1_to_mni_transform(cfg)
     chains = {("epi", "t1"): [forward], ("epi", "mni"): [mni, forward],
               ("t1", "epi"): [cfg.trans_dir / "epi2t1_InverseComposite.h5"],
               ("t1", "mni"): [mni]}
@@ -39,6 +77,9 @@ def mask_source(cfg, mask_type, custom_file=None, custom_space="final"):
     if mask_type == "whole_brain":
         return cfg.rt_unwarped_analysis_ref_mask, "epi"
     if mask_type == "cortical_gm":
+        imported = cfg.trans_dir / "offline_anat" / "cortical_gm_mask.nii"
+        if imported.exists():
+            return imported, "t1"
         return (cfg.subject_root / "anat" / "fastsurfer" / cfg.subject / "mri"
                 / "aparc.DKTatlas+aseg.deep.mgz"), "t1"
     if mask_type != "custom" or not custom_file:
@@ -67,7 +108,7 @@ def prepare_analysis_mask(cfg, mask_type, space, reference, folder, run_command,
     values = np.asarray(image.dataobj).copy()
     if values.ndim != 3 or not np.isfinite(values).all():
         raise ValueError("Analysis mask source must be a finite 3D image.")
-    if mask_type == "cortical_gm":
+    if mask_type == "cortical_gm" and source.name != "cortical_gm_mask.nii":
         labels = [hemisphere + parcel for hemisphere in (1000, 2000) for parcel in DKT_PARCELS]
         mask = np.isin(values, labels)
     else:

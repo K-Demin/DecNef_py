@@ -1,4 +1,4 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 import json
 import os
@@ -17,29 +17,64 @@ def validate_registration_settings(initialization, syn):
     return "identity" if initialization == "auto" else initialization, syn
 
 
+def validate_registration_direction(direction):
+    direction = str(direction).lower()
+    if direction not in {"epi_to_t1", "t1_to_epi"}:
+        raise ValueError("registration_direction must be 'epi_to_t1' or 't1_to_epi'.")
+    return direction
+
+
+def validate_epi_reference_n4(enabled):
+    """Require an explicit boolean rather than interpreting strings as truthy."""
+    if not isinstance(enabled, bool):
+        raise ValueError("epi_reference_n4 must be a boolean.")
+    return enabled
+
+
+def optional_registration_path(value, setting):
+    """Normalize a configured path; existence is checked during preparation."""
+    if value is None:
+        return None
+    if not isinstance(value, (str, os.PathLike)) or not str(value).strip():
+        raise ValueError(f"{setting} must be a nonempty path or null.")
+    return Path(value).expanduser()
+
+
 def normalize_registration_config(payload):
     """Translate deprecated JSON keys without selecting a different recipe."""
     payload = dict(payload)
+    mode = None
     if "registration_mode" in payload:
         mode = str(payload.pop("registration_mode")).lower()
         if mode not in {"full_brain", "partial_epi"}:
             raise ValueError("Legacy registration_mode must be 'full_brain' or 'partial_epi'.")
         warnings.warn(
-            "registration_mode is deprecated and ignored; preparation now uses one "
-            "T1-to-EPI Translation + Rigid recipe for all EPI coverage.",
+            "registration_mode is deprecated and ignored; use registration_direction "
+            "to select EPI-to-T1 or T1-to-EPI with the shared anatomical recipe.",
             FutureWarning, stacklevel=2,
         )
     if "partial_epi_syn" in payload:
         old_syn = payload.pop("partial_epi_syn")
         if not isinstance(old_syn, bool):
             raise ValueError("Legacy partial_epi_syn must be a boolean.")
-        if "registration_syn" in payload and payload["registration_syn"] != old_syn:
-            raise ValueError("Conflicting partial_epi_syn and registration_syn values.")
-        warnings.warn(
-            "partial_epi_syn is deprecated; use registration_syn instead.",
-            FutureWarning, stacklevel=2,
-        )
-        payload.setdefault("registration_syn", old_syn)
+        if mode == "full_brain":
+            if old_syn:
+                raise ValueError("Legacy partial_epi_syn=true was invalid with registration_mode='full_brain'.")
+            # This old flag controlled only the partial recipe. Full-brain
+            # preparation always included SyN, even when this flag was false.
+            warnings.warn(
+                "partial_epi_syn=false had no effect in legacy full_brain mode and is ignored; "
+                "registration_syn separately controls SyN in the shared anatomical recipe.",
+                FutureWarning, stacklevel=2,
+            )
+        else:
+            if "registration_syn" in payload and payload["registration_syn"] != old_syn:
+                raise ValueError("Conflicting partial_epi_syn and registration_syn values.")
+            warnings.warn(
+                "partial_epi_syn is deprecated; use registration_syn instead.",
+                FutureWarning, stacklevel=2,
+            )
+            payload.setdefault("registration_syn", old_syn)
     return payload
 
 
@@ -63,7 +98,11 @@ class SubjectDayConfig:
     fieldmap_method: str = "pyhysco"
     epi_phase_encoding: str = "PA"
     registration_initialization: str = "identity"
-    registration_syn: bool = False
+    registration_syn: bool = True
+    registration_direction: str = "epi_to_t1"
+    offline_assets: Path | None = None
+    registration_qc_policy: str | None = None
+    epi_reference_n4: bool = True
     project_root = Path(__file__).resolve().parents[1]
     decoder_template = project_root / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
@@ -71,6 +110,11 @@ class SubjectDayConfig:
         (self.registration_initialization, self.registration_syn) = validate_registration_settings(
             self.registration_initialization, self.registration_syn
         )
+        self.registration_direction = validate_registration_direction(self.registration_direction)
+        self.epi_reference_n4 = validate_epi_reference_n4(self.epi_reference_n4)
+        self.offline_assets = optional_registration_path(self.offline_assets, "offline_assets")
+        policy = optional_registration_path(self.registration_qc_policy, "registration_qc_policy")
+        self.registration_qc_policy = str(policy) if policy is not None else None
 
     @classmethod
     def from_json(cls, path: str | Path) -> "SubjectDayConfig":
@@ -89,13 +133,17 @@ class SubjectDayConfig:
             ap_file=root / cfg.get("ap_file", "fmap/AP.nii"),
             pa_file=root / cfg.get("pa_file", "fmap/PA.nii"),
             fieldmap_dir=root / cfg.get("fieldmap_dir", "fmap"),
-            t1_file=subject_root / "anat" / "T1.nii",
+            t1_file=subject_root / cfg.get("t1_file", "anat/T1.nii"),
             mni_template=Path(cfg["templates"]["mni_t1"]),
             runs=runs,
             fieldmap_method=cfg.get("fieldmap_method", "pyhysco"),
             epi_phase_encoding=cfg.get("epi_phase_encoding", "PA"),
             registration_initialization=cfg.get("registration_initialization", "identity"),
-            registration_syn=cfg.get("registration_syn", False),
+            registration_syn=cfg.get("registration_syn", True),
+            registration_direction=cfg.get("registration_direction", "epi_to_t1"),
+            offline_assets=cfg.get("offline_assets"),
+            registration_qc_policy=cfg.get("registration_qc_policy"),
+            epi_reference_n4=cfg.get("epi_reference_n4", True),
         )
 
     @classmethod
@@ -106,7 +154,11 @@ class SubjectDayConfig:
         root: Path,
         epi_basename: str = "epi.nii",
         registration_initialization: str = "identity",
-        registration_syn: bool = False,
+        registration_syn: bool = True,
+        registration_direction: str = "epi_to_t1",
+        offline_assets: str | Path | None = None,
+        registration_qc_policy: str | Path | None = None,
+        epi_reference_n4: bool = True,
     ) -> "SubjectDayConfig":
         """
         Build config from a standard layout:
@@ -159,6 +211,10 @@ class SubjectDayConfig:
             epi_phase_encoding="PA",
             registration_initialization=registration_initialization,
             registration_syn=registration_syn,
+            registration_direction=registration_direction,
+            offline_assets=offline_assets,
+            registration_qc_policy=registration_qc_policy,
+            epi_reference_n4=epi_reference_n4,
         )
 
     @classmethod
@@ -174,7 +230,12 @@ class SubjectDayConfig:
         pa_file: Path | None = None,
         fieldmap_dir: Path | None = None,
         registration_initialization: str = "identity",
-        registration_syn: bool = False,
+        registration_syn: bool = True,
+        registration_direction: str = "epi_to_t1",
+        offline_assets: str | Path | None = None,
+        registration_qc_policy: str | Path | None = None,
+        mni_template: str | Path | None = None,
+        epi_reference_n4: bool = True,
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -186,20 +247,20 @@ class SubjectDayConfig:
               fmap/AP.nii, PA.nii
               func/<run_id>/epi_4d.nii.gz
         """
-        import os
-
-        # Infer MNI template from FREESURFER_HOME (same as in auto_from_layout)
-        fs_home = os.environ.get("FREESURFER_HOME")
-        if fs_home is None:
-            raise RuntimeError(
-                "FREESURFER_HOME is not set. Can't infer MNI template path."
+        # An imported offline bundle supplies its own template explicitly.
+        if mni_template is None:
+            fs_home = os.environ.get("FREESURFER_HOME")
+            if fs_home is None:
+                raise RuntimeError(
+                    "FREESURFER_HOME is not set. Can't infer MNI template path."
+                )
+            mni_template = (
+                Path(fs_home)
+                / "average"
+                / "mni_icbm152_nlin_asym_09c"
+                / "mni_icbm152_t1_tal_nlin_asym_09c.nii.gz"
             )
-        mni_template = (
-            Path(fs_home)
-            / "average"
-            / "mni_icbm152_nlin_asym_09c"
-            / "mni_icbm152_t1_tal_nlin_asym_09c.nii.gz"
-        )
+        mni_template = Path(mni_template).expanduser()
 
         runs = [RunConfig(id=run_id, epi_file=epi_file)]
 
@@ -233,6 +294,10 @@ class SubjectDayConfig:
             epi_phase_encoding="PA",
             registration_initialization=registration_initialization,
             registration_syn=registration_syn,
+            registration_direction=registration_direction,
+            offline_assets=offline_assets,
+            registration_qc_policy=registration_qc_policy,
+            epi_reference_n4=epi_reference_n4,
         )
 
 
@@ -243,6 +308,14 @@ class SubjectDayConfig:
         We store relative epi_file paths and template path.
         """
         root = self.root
+
+        def relative_or_absolute(value, base):
+            value = Path(value)
+            try:
+                return str(value.relative_to(base))
+            except ValueError:
+                return str(value.resolve())
+
         cfg = {
             "subject_id": self.subject_id,
             "day_id": self.day_id,
@@ -255,13 +328,18 @@ class SubjectDayConfig:
             "epi_phase_encoding": self.epi_phase_encoding,
             "registration_initialization": self.registration_initialization,
             "registration_syn": self.registration_syn,
-            "ap_file": str(self.ap_file.relative_to(root)),
-            "pa_file": str(self.pa_file.relative_to(root)),
-            "fieldmap_dir": str((self.fieldmap_dir or self.ap_file.parent).relative_to(root)),
+            "registration_direction": self.registration_direction,
+            "offline_assets": str(self.offline_assets) if self.offline_assets is not None else None,
+            "registration_qc_policy": self.registration_qc_policy,
+            "epi_reference_n4": self.epi_reference_n4,
+            "t1_file": relative_or_absolute(self.t1_file, self.subject_root),
+            "ap_file": relative_or_absolute(self.ap_file, root),
+            "pa_file": relative_or_absolute(self.pa_file, root),
+            "fieldmap_dir": relative_or_absolute(self.fieldmap_dir or self.ap_file.parent, root),
             "runs": [
                 {
                     "id": r.id,
-                    "epi_file": str(r.epi_file.relative_to(root))
+                    "epi_file": relative_or_absolute(r.epi_file, root)
                 }
                 for r in self.runs
             ],

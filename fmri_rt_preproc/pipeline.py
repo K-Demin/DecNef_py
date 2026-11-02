@@ -20,6 +20,16 @@ from fmri_rt_preproc.native_fieldmap import (
 )
 
 from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
+from fmri_rt_preproc.registration import (
+    ANATOMICAL_RECIPE, build_epi_t1_registration, build_epi_bridge_registration,
+)
+from fmri_rt_preproc.offline_assets import (
+    load_offline_assets, bundle_identity, install_anatomy, apply_image,
+    compose_transforms, t1_to_mni_transform, copy_image, publish_mni_transform,
+)
+from fmri_rt_preproc.epi_reference import (
+    EPI_REFERENCE_N4_RECIPE, prepare_epi_registration_reference,
+)
 
 def gunzip_python(gz_path):
     gz_path = Path(gz_path)
@@ -55,6 +65,10 @@ class FMRIRealtimePreprocessor:
         self.fastsurfer_env = fastsurfer_env
         self.ants_env = ants_env
         self.trans_dir = self.func_dir / "trans"
+        self.offline_assets = (load_offline_assets(cfg.offline_assets, cfg.subject_id)
+                               if getattr(cfg, "offline_assets", None) else None)
+        if self.offline_assets:
+            self.anat_dir = self.trans_dir / "offline_anat"
         self.fastsurfer_sid = self.cfg.subject_id
         self.fieldmap_method = str(getattr(cfg, "fieldmap_method", "pyhysco")).lower()
         self.epi_phase_encoding = str(getattr(cfg, "epi_phase_encoding", "PA")).upper()
@@ -81,6 +95,10 @@ class FMRIRealtimePreprocessor:
     # ---------- T1 / anatomical ----------
 
     def _prepare_anat(self):
+        if self.offline_assets:
+            install_anatomy(self.offline_assets, self.anat_dir)
+            publish_mni_transform(self.offline_assets["t1_to_mni"], self.trans_dir)
+            return
         ensure_dir(self.anat_dir)
 
         # ---------- 1. N4 BIAS CORRECTION ----------
@@ -401,6 +419,7 @@ class FMRIRealtimePreprocessor:
 
         # 7) EPI mean -> MNI
         self._warp_epi_mean_to_mni(run_dir, epi_mean)
+        self._write_registration_qc()
 
         # ----- Build ROI on *decoder/template* grid -----
         epi_mni_path = run_dir / "epi_in_MNI.nii"
@@ -507,6 +526,8 @@ class FMRIRealtimePreprocessor:
 
         # Prepare output arrays
         mc_data = np.zeros((*data_4d.shape[:3], n_use), dtype=np.float32)
+        observed_sum = np.zeros(data_4d.shape[:3], dtype=np.float64)
+        observed_count = np.zeros(data_4d.shape[:3], dtype=np.uint32)
         motion = np.zeros((n_use, 6), dtype=np.float32)
 
         # ------------------------------------------------------------------
@@ -536,7 +557,11 @@ class FMRIRealtimePreprocessor:
 
             # Extract corrected volume
             mc_vol = np.asanyarray(fmri_img.dataobj)
-            mc_data[..., t] = mc_vol.astype(np.float32)
+            support = vr.resample_support(np.ones(vol.shape, np.float32), t) >= 1 - 1e-5
+            support &= np.isfinite(mc_vol)
+            mc_data[..., t] = np.where(support, mc_vol, 0).astype(np.float32)
+            observed_sum += np.where(support, mc_vol, 0)
+            observed_count += support
 
             # Extract motion params (already re-ordered inside RtpVolreg)
             motion[t] = vr._motion[t]
@@ -551,7 +576,8 @@ class FMRIRealtimePreprocessor:
         #                COMPUTE MEANS (EPI + MASK)
         # ------------------------------------------------------------------
         if not epi_mean.exists():
-            mean_vol = mc_data.mean(axis=-1)
+            mean_vol = np.divide(observed_sum, observed_count,
+                                 out=np.zeros_like(observed_sum), where=observed_count > 0).astype(np.float32)
             nib.save(nib.Nifti1Image(mean_vol, affine, header), str(epi_mean))
 
     def _maybe_set_rt_reference(self, epi_mean: Path, epi_mask_mean: Path):
@@ -569,9 +595,17 @@ class FMRIRealtimePreprocessor:
         cfg = getattr(self, "cfg", None)
         initialization, syn = validate_registration_settings(
             getattr(cfg, "registration_initialization", "identity"),
-            getattr(cfg, "registration_syn", False),
+            getattr(cfg, "registration_syn", True),
         )
-        return {"recipe": "t1_to_epi", "initialization": initialization, "syn": syn}
+        assets = getattr(self, "offline_assets", None)
+        reference_n4 = getattr(cfg, "epi_reference_n4", True)
+        if not isinstance(reference_n4, bool):
+            raise ValueError("epi_reference_n4 must be a boolean.")
+        return {"recipe": ANATOMICAL_RECIPE, "initialization": initialization, "syn": syn,
+                "direction": getattr(cfg, "registration_direction", "epi_to_t1"),
+                "epi_reference_n4": reference_n4,
+                "epi_reference_n4_recipe": EPI_REFERENCE_N4_RECIPE if reference_n4 else None,
+                "offline_assets": bundle_identity(assets) if assets else None}
 
     def _registration_outputs(self):
         # Semantic directions never depend on the ANTs fixed/moving choice.
@@ -594,24 +628,14 @@ class FMRIRealtimePreprocessor:
         if marker.exists():
             saved = json.loads(marker.read_text())
             saved_settings = saved.get("settings")
-            if saved.get("version") == 1:
-                # The old partial recipe is identical to the common recipe.
-                # Preserve its provenance and assets without renaming/refitting.
-                old = saved_settings or {}
-                if old.get("mode") != "partial_epi":
-                    raise ValueError(error)
-                try:
-                    initialization, syn = validate_registration_settings(
-                        old["initialization"], old["partial_epi_syn"],
-                    )
-                except (KeyError, ValueError):
-                    raise ValueError(error) from None
-                saved_settings = {"recipe": "t1_to_epi", "initialization": initialization, "syn": syn}
-            elif saved.get("version") != 2:
+            if saved.get("version") != 3:
                 raise ValueError(error)
             if saved_settings != settings:
                 raise ValueError(error)
-            records = saved.get("inputs", []) + saved.get("outputs", [])
+            reference_records = saved.get("reference_preparation", [])
+            if settings["epi_reference_n4"] and not reference_records:
+                raise ValueError(error)
+            records = saved.get("inputs", []) + saved.get("outputs", []) + reference_records
             if not saved.get("inputs") or len(saved.get("outputs", [])) != len(outputs):
                 raise ValueError(error)
             for record in records:
@@ -631,12 +655,13 @@ class FMRIRealtimePreprocessor:
 
     def _register_epi_to_t1(self, run_dir: Path, epi_mean: Path, epi_mask_mean: Path):
         self.validate_registration_request()
+        if getattr(self, "offline_assets", None):
+            return self._register_to_offline_reference(epi_mean, epi_mask_mean)
         settings = self._registration_settings()
         t1_n4 = self.anat_dir / "T1_N4.nii"
         t1 = self.anat_dir / "T1_brain.nii"
-        fixed, moving = epi_mean, t1
-        masks = f"[{epi_mask_mean},NULL]"
-        inputs = [epi_mean, epi_mask_mean, t1, t1_n4]
+        t1_mask = self.anat_dir / "T1_combined_mask.nii"
+        inputs = [epi_mean, epi_mask_mean, t1, t1_n4, t1_mask]
         input_records = [source_identity(p) for p in dict.fromkeys(inputs)]
         outputs = self._registration_outputs()
         marker = self.trans_dir / "registration.json"
@@ -652,31 +677,17 @@ class FMRIRealtimePreprocessor:
         if not np.any(nib.load(str(epi_mask_mean)).get_fdata() > 0):
             raise ValueError("EPI registration mask is empty; check skull stripping of the EPI reference.")
 
-        prefix = self.trans_dir / "t1_to_epi_"
-        native = [Path(str(prefix) + suffix) for suffix in (
-            "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii"
-        )]
-        initialization = "Identity" if settings["initialization"] == "identity" else f"[{fixed},{moving},1]"
-        args = [
-            "antsRegistration", "--dimensionality", "3", "--float", "1", "--verbose", "1",
-            "--output", f"[{prefix},{native[2]},{native[3]}]", "--interpolation", "Linear",
-            "--winsorize-image-intensities", "[0.005,0.995]", "--use-histogram-matching", "0",
-            "--write-composite-transform", "1", "--initial-moving-transform", initialization,
-        ]
-        # One recipe for any EPI coverage, based on ANTs' partial-slab example.
-        # Header initialization avoids equating a cropped EPI's centroid with
-        # the whole T1's centroid. Translation and rotation are still optimized.
-        stages = [
-            ("Translation[0.1]", "[50,1e-6,10]", "1", "0vox", ",Random,0.25"),
-            ("Rigid[0.1]", "[500x250x50,1e-6,10]", "2x2x1", "2x1x0vox", ",Random,0.25"),
-        ]
-        if settings["syn"]:
-            stages.append(("SyN[0.1,3,0]", "[50x10,1e-6,10]", "2x1", "1x0vox", ""))
-        for transform, convergence, shrink, sigma, sampling in stages:
-            args += ["--transform", transform, "--metric", f"MI[{fixed},{moving},1,32{sampling}]",
-                     "--convergence", convergence, "--shrink-factors", shrink,
-                     "--smoothing-sigmas", sigma, "--masks", masks]
-        print(f"→ Running T1→EPI registration ({settings['initialization']}, SyN={settings['syn']})")
+        require_same_grid(nib.load(str(t1_mask)), nib.load(str(t1)))
+        epi_fit = epi_mean
+        if settings["epi_reference_n4"]:
+            epi_fit = prepare_epi_registration_reference(
+                epi_mean, epi_mask_mean, self.trans_dir / "epi_registration_reference.nii", run)
+        plan = build_epi_t1_registration(epi_fit, t1, epi_mask_mean, t1_mask,
+                                        self.trans_dir / (settings["direction"] + "_"),
+                                        direction=settings["direction"],
+                                        initialization=settings["initialization"], syn=settings["syn"])
+        fixed, moving, native, args = plan.fixed, plan.moving, plan.native_outputs, plan.args
+        print(f"→ Running {settings['direction']} ({settings['initialization']}, SyN={settings['syn']})")
         # A failed/interrupted new fit must not be mistaken for a legacy cache,
         # even if ANTs or publication happened to write all four output files.
         pending = self.trans_dir / "registration_pending.json"
@@ -690,17 +701,73 @@ class FMRIRealtimePreprocessor:
         require_same_grid(nib.load(str(native[3])), nib.load(str(moving)))
         # Publish the inverse fit as EPI→T1; keep native files for transparent QC.
         # No header changes: each diagnostic retains its ANTs reference grid.
-        for source, target in zip((native[1], native[0], native[3], native[2]), outputs):
-            shutil.copy2(source, target)
-        saved = {"version": 2, "settings": settings, "inputs": input_records,
+        for name, source in plan.semantic_outputs.items():
+            target = self.trans_dir / name
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+        if settings["epi_reference_n4"]:
+            # The fitted transform applies to the original image's coordinates.
+            # Keep canonical QC/output intensities independent of fitting N4.
+            apply_image(epi_mean, t1, self.trans_dir / "epi2t1_Warped.nii",
+                        [self.trans_dir / "epi2t1_Composite.h5"], run)
+        from .session_alignment import reference_preparation_outputs
+        saved = {"version": 3, "settings": settings, "inputs": input_records,
                  "outputs": [source_identity(p) for p in outputs],
+                 "reference_preparation": [source_identity(p) for p in reference_preparation_outputs(self.trans_dir)],
+                 "plan": plan.provenance,
                  "native_fixed": str(fixed.resolve()), "native_moving": str(moving.resolve()),
-                 "epi_to_t1_native": str(native[1].resolve()),
-                 "t1_to_epi_native": str(native[0].resolve())}
+                 "epi_to_t1_native": str(plan.semantic_outputs['epi2t1_Composite.h5'].resolve()),
+                 "t1_to_epi_native": str(plan.semantic_outputs['epi2t1_InverseComposite.h5'].resolve())}
         temporary = marker.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(saved, indent=2) + "\n")
         temporary.replace(marker)
         pending.unlink()
+
+    def _register_to_offline_reference(self, epi, mask):
+        from .session_alignment import register_session_bridge, reference_preparation_outputs
+        settings = self._registration_settings()
+        outputs = self._registration_outputs()
+        marker = self.trans_dir / "registration.json"
+        inputs = [epi, mask] + [p for p in self.offline_assets.values() if isinstance(p, Path)]
+        input_records = [source_identity(p) for p in dict.fromkeys(inputs)]
+        if marker.exists():
+            self.validate_registration_request()
+            if json.loads(marker.read_text())["inputs"] != input_records:
+                raise ValueError("Registration input selection changed. Use a fresh session directory.")
+            return
+        pending = self.trans_dir / "registration_pending.json"
+        if pending.exists():
+            raise ValueError("Interrupted registration; use a fresh session directory.")
+        pending.write_text(json.dumps(settings, indent=2) + "\n")
+        plan = register_session_bridge(self.offline_assets, epi, mask, self.trans_dir, run,
+                                       settings["initialization"],
+                                       epi_reference_n4=settings["epi_reference_n4"])
+        payload = {"version": 3, "settings": settings, "plan": plan.provenance,
+                   "inputs": input_records,
+                   "reference_preparation": [source_identity(p) for p in reference_preparation_outputs(self.trans_dir)],
+                   "outputs": [source_identity(p) for p in outputs]}
+        marker.write_text(json.dumps(payload, indent=2) + "\n")
+        pending.unlink()
+
+    def _write_registration_qc(self):
+        from .session_alignment import write_registration_reports
+        from types import SimpleNamespace
+        assets = getattr(self, "offline_assets", None)
+        reports = write_registration_reports(
+            self.trans_dir, self.rt_unwarped_analysis_ref_epi, self.rt_unwarped_analysis_ref_mask,
+            self.anat_dir / "T1_N4.nii", self.anat_dir / "T1_combined_mask.nii",
+            self.cfg.mni_template,
+            t1_to_mni_transform(SimpleNamespace(trans_dir=self.trans_dir, subject_root=self.cfg.subject_root)),
+            run, getattr(self.cfg, "registration_qc_policy", None),
+            assets["epi_mask"] if assets else None)
+        # Preserve template selection even when the launcher uses --no-save-config.
+        from .offline_assets import file_identity
+        (self.trans_dir / "preparation_assets.json").write_text(json.dumps({
+            "version": 1, "mni_template": file_identity(self.cfg.mni_template),
+            "offline_manifest": file_identity(assets["manifest"])
+            if assets and assets.get("manifest") else None,
+        }, indent=2) + "\n")
+        return reports
 
     def _make_rtp_nuisance_masks(self):
         """
@@ -748,11 +815,15 @@ class FMRIRealtimePreprocessor:
         # If you prefer your DKT aparc+aseg:
         aseg_mgz = fs_mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
 
-        if not aseg_mgz.exists():
+        imported = getattr(self, "offline_assets", None)
+        if not imported and not aseg_mgz.exists():
             raise FileNotFoundError(f"FastSurfer aseg not found: {aseg_mgz}")
 
         wm_t1 = self.trans_dir / "WM_T1.nii"
         vent_t1 = self.trans_dir / "Vent_T1.nii"
+        if imported:
+            copy_image(imported["wm_mask"], wm_t1)
+            copy_image(imported["vent_mask"], vent_t1)
 
         # Common FreeSurfer aseg labels:
         # WM: 2 (LH WM), 41 (RH WM)
@@ -831,19 +902,17 @@ class FMRIRealtimePreprocessor:
 
     def _warp_epi_mean_to_mni(self, run_dir: Path, epi_mean: Path):
         mni = self.cfg.mni_template
-        warp_t1_mni = self.anat_dir / "warp_T1_to_MNI_synth.nii"
+        from types import SimpleNamespace
+        warp_t1_mni = (t1_to_mni_transform(SimpleNamespace(trans_dir=self.trans_dir,
+                                                         subject_root=self.cfg.subject_root))
+                       if getattr(self, "offline_assets", None)
+                       else self.anat_dir / "warp_T1_to_MNI_synth.nii")
         composite = self.trans_dir / "epi2t1_Composite.h5"
         out_epi_mni = self.trans_dir / "epi_in_MNI.nii"
 
         if out_epi_mni.exists():
             print(f"✓ epi_in_MNI already exists for {self.trans_dir.name} — skipping warp")
             return
-
-        if not self.decoder_template.exists():
-            raise FileNotFoundError(
-                f"Decoder template not found at {self.decoder_template} "
-                f"(expected relative to {self.cfg.root})"
-            )
 
         if not composite.exists():
             raise FileNotFoundError(
@@ -860,7 +929,7 @@ class FMRIRealtimePreprocessor:
             antsApplyTransforms \
               -d 3 \
               -i {shlex.quote(str(epi_mean))} \
-              -r {shlex.quote(str(self.decoder_template))} \
+              -r {shlex.quote(str(mni))} \
               -o {shlex.quote(str(out_epi_mni))} \
               -t {shlex.quote(str(warp_t1_mni))} \
               -t {shlex.quote(str(composite))} \

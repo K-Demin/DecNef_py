@@ -13,7 +13,8 @@ from typing import Optional
 import numpy as np
 from scipy.stats import norm
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import load_regressor_settings, add_registration_arguments, apply_registration_arguments
+from fmri_rt_preproc.normalization_timing import normalization_startup_hint, first_trial_window_volumes
 
 
 log = logging.getLogger(__name__)
@@ -590,7 +591,8 @@ def main() -> None:
         default=0,
         help="TRs to skip entirely after trigger (excluded from baseline/trials/scoring).",
     )
-    parser.add_argument("--baseline-trs", type=int, default=None, help="Baseline duration before trial 1 (TRs).")
+    parser.add_argument("--baseline-trs", type=int, default=None,
+                        help="Presentation baseline before trial1; does not change the JSON normalization window.")
     parser.add_argument("--iti-trs", type=int, default=3, help="ITI duration (TRs).")
     parser.add_argument("--cue-trs", type=int, default=4, help="Cue duration (TRs).")
     parser.add_argument("--scans-trs", type=int, default=3, help="Scans-collection duration (TRs).")
@@ -678,12 +680,14 @@ def main() -> None:
         help="PA b0 block to use",
     )
 
+    add_registration_arguments(parser)
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS, load_reference_score_stats
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
 
     baseline_trs = (
         int(args.baseline_trs)
@@ -699,6 +703,23 @@ def main() -> None:
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
 
+    startup = normalization_startup_hint(REGRESSOR_SETTINGS)
+    first_window = first_trial_window_volumes(
+        baseline_trs=baseline_trs, skip_first_trs=args.skip_first_trs,
+        iti_trs=args.iti_trs, cue_trs=args.cue_trs, scans_trs=args.scans_trs,
+        score_delay=args.score_delay,
+    ) if args.n_trials else None
+    log.info("[WARMUP] First usable input volume cannot be earlier than %d; "
+             "GLM design, coverage and processing may delay it further.",
+             startup["first_score_volume_lower_bound"])
+    if first_window and first_window[0] < startup["first_score_volume_lower_bound"]:
+        log.warning("[WARMUP] Trial1 score window covers input volumes %d-%d, before normalization can "
+                    "be ready (not before volume%d). Scores may be missing or incomplete. "
+                    "The schedule is unchanged; increase --baseline-trs if appropriate. "
+                    "JSON voxel_norm_ref_volumes remains %d independently of presentation duration.",
+                    *first_window, startup["first_score_volume_lower_bound"],
+                    REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
+
     from biopac_rt.biopac_receiver import BiopacReceiverConfig
 
     cfg = RTSessionConfig(
@@ -713,12 +734,13 @@ def main() -> None:
         pa_block=args.pa_block
     )
 
+    from rt_pipeline import prepare_nf_run
+    prepare_nf_run(cfg)
+
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
-    # Baseline TRs define the warmup window for voxel-wise normalization and
-    # denoising startup; keep pipeline normalization in sync with presentation.
-    settings_payload["voxel_norm_ref_volumes"] = max(1, baseline_trs)
+    # Presentation baseline duration does not change the JSON calibration window.
     settings_payload.update(
         {
             "enable_biopac_physio": args.biopac_enable,
@@ -744,6 +766,8 @@ def main() -> None:
                 "n_trials": args.n_trials,
                 "skip_first_trs": args.skip_first_trs,
                 "baseline_trs": baseline_trs,
+                "normalization_startup": startup,
+                "first_trial_score_window_input_volumes": first_window,
                 "iti_trs": args.iti_trs,
                 "cue_trs": args.cue_trs,
                 "scans_trs": args.scans_trs,

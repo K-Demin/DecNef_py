@@ -122,6 +122,23 @@ def test_plot_handles_warmup_only_and_no_data(tmp_path):
     assert result.read_bytes().startswith(b"\x89PNG")
 
 
+def test_plot_accepts_historical_csv_without_normalization_stage(tmp_path):
+    clock = Clock()
+    speed = SpeedRecorder(tmp_path / "speed.csv", clock)
+    speed.arrive(1)
+    started = speed.conversion_start(1)
+    clock.now = .1
+    speed.conversion_end(1, started)
+    speed.finish(1, True)
+    rows = read_rows(speed.path)
+    fields = [key for key in FIELDS if key != "NORM_ms"]
+    with speed.path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    assert plot_speed(speed.path).read_bytes().startswith(b"\x89PNG")
+
+
 def test_recording_module_does_not_import_matplotlib():
     subprocess.run([sys.executable, "-c", "import sys, rt_speed; "
                     "assert 'matplotlib' not in sys.modules"], check=True)

@@ -12,7 +12,8 @@ from typing import Optional
 
 import numpy as np
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import load_regressor_settings, add_registration_arguments, apply_registration_arguments
+from fmri_rt_preproc.normalization_timing import normalization_startup_hint, first_trial_window_volumes
 
 
 log = logging.getLogger(__name__)
@@ -189,8 +190,50 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
         receiver.stop()
 
 
+def _make_direct_scorer(intercept: float):
+    """Consume centrally normalized reg-ready features exactly once: w.x + b.
+
+    The pipeline owns post-GLM normalization and readiness. Its existing
+    accumulate_baseline/score_from_array calls form a readiness handshake here;
+    this scorer does not estimate or update another voxel mean or SD.
+    """
+    from decoder_score import DecoderScorer
+
+    intercept = float(intercept)
+    if not np.isfinite(intercept):
+        raise ValueError("Decoder intercept must be finite")
+
+    class DirectScorer(DecoderScorer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.bias = intercept
+            self.n_baseline = 10 ** 12  # keep the readiness handshake active
+            self._decoder_weights = self.w.astype(np.float64)
+            self._pending = None
+
+        def accumulate_baseline(self, vol_arr):
+            vox = np.asanyarray(vol_arr, dtype=np.float64)[self.mask].ravel()
+            self._pending = (vol_arr, vox)
+            self.baseline_count += 1
+
+        def finalize_baseline(self):
+            return
+
+        def score_from_array(self, vol_arr):
+            if self._pending is None or self._pending[0] is not vol_arr:
+                # An optional original stream must not consume the ready stream.
+                return float("nan")
+            _, vox = self._pending
+            self._pending = None
+            return float(np.dot(vox, self._decoder_weights) + self.bias)
+
+    return DirectScorer
+
+
 def _make_runwise_zscore_scorer(intercept: float, min_volumes: int, sd_floor: float = 1e-6):
-    """DecoderScorer subclass: run-wise voxel z-scoring (Busch et al., 2026, eq. 1), then f = w.z + b.
+    """Historical comparison helper; the active NF launcher NEVER installs it.
+
+    Former decoder-space run-wise voxel z-scoring, then f = w.z + b.
 
     For each decoder voxel, the value of volume t is z-scored with the mean and SD of
     the previous regression-ready volumes 1..t-1 of the *current* run:
@@ -260,10 +303,8 @@ def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, sett
     import rt_pipeline
 
     settings = dict(settings)
-    runwise = settings.pop("_runwise_zscore")
-    rt_pipeline.DecoderScorer = _make_runwise_zscore_scorer(
-        runwise["intercept"], runwise["min_volumes"]
-    )
+    intercept = settings.pop("_decoder_intercept")
+    rt_pipeline.DecoderScorer = _make_direct_scorer(intercept)
     for key, value in settings.items():
         if hasattr(REGRESSOR_SETTINGS, key):
             setattr(REGRESSOR_SETTINGS, key, value)
@@ -357,10 +398,11 @@ def _append_trial_score(csv_path: Path, row: dict) -> None:
 
 
 def _score_to_percentile(score_raw: float, reference_stats: Optional[dict]) -> float:
-    """Feedback 0-100 = 100 * sigmoid(f) = decoder probability of the target class (%).
+    """Feedback 0-100 = 100 * sigmoid(mean trial-window decision value).
 
-    score_raw = f = mean over the trial window of w.z_t + b (log-odds; voxels z-scored
-    within the run). reference_stats is unused (kept for the original call signature).
+    Features are normalized centrally after the cumulative GLM. Decoder weights
+    and intercept must match that representation; sigmoid alone does not prove
+    probability calibration. reference_stats is unused.
     """
     if not np.isfinite(score_raw):
         return float("nan")
@@ -683,7 +725,8 @@ def main() -> None:
         default=0,
         help="TRs to skip entirely after trigger (excluded from baseline/trials/scoring).",
     )
-    parser.add_argument("--baseline-trs", type=int, default=None, help="Baseline duration before trial 1 (TRs).")
+    parser.add_argument("--baseline-trs", type=int, default=None,
+                        help="Presentation baseline before trial1; does not change the JSON normalization window.")
     parser.add_argument("--iti-trs", type=int, default=3, help="ITI duration (TRs).")
     parser.add_argument("--cue-trs", type=int, default=4, help="Cue duration (TRs).")
     parser.add_argument("--scans-trs", type=int, default=3, help="Scans-collection duration (TRs).")
@@ -692,7 +735,7 @@ def main() -> None:
     parser.add_argument(
         "--rs",
         dest="reference_score_run",
-        help="Ignored (no reference run): voxels are z-scored within each NF run.",
+        help="Ignored: probability feedback does not use a reference-score run.",
     )
     parser.add_argument(
         "--decoder-extras-json",
@@ -708,9 +751,8 @@ def main() -> None:
     parser.add_argument(
         "--zscore-min-volumes",
         type=int,
-        default=10,
-        help="Reg-ready volumes used to start the run-wise voxel z-scoring before the first score "
-             "(Busch et al.: 10).",
+        default=None,
+        help="Removed: configure central post-GLM voxel normalization in the settings JSON instead.",
     )
     parser.add_argument(
         "--score-delay",
@@ -789,12 +831,17 @@ def main() -> None:
         help="PA b0 block to use",
     )
 
+    add_registration_arguments(parser)
     args = parser.parse_args()
+    if args.zscore_min_volumes is not None:
+        parser.error("--zscore-min-volumes controlled a second decoder normalization, which is no longer applied. "
+                     "Configure central post-GLM voxel normalization in the settings JSON.")
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
 
     baseline_trs = (
         int(args.baseline_trs)
@@ -824,8 +871,11 @@ def main() -> None:
         pa_block=args.pa_block
     )
 
+    from rt_pipeline import prepare_nf_run
+    prepare_nf_run(cfg)
+
     if args.reference_score_run:
-        log.warning("--rs %s ignored: voxels are z-scored within this run (no reference run).",
+        log.warning("--rs %s ignored: probability feedback uses no reference-score run.",
                     args.reference_score_run)
     cfg.reference_score_run = None
     cfg.reference_score_stats = None
@@ -843,7 +893,7 @@ def main() -> None:
         extras = json.loads(extras_path.read_text())
         if extras.get("scaler_folded", False):
             raise ValueError("Weights were exported with the scaler folded in; use unfolded weights "
-                             "(voxels are z-scored online).")
+                             "compatible with the configured post-GLM voxel normalization.")
         neg_w = "_negated" in Path(args.decoder_template).name
         neg_j = "_negated" in extras_path.name
         if neg_w != neg_j:
@@ -854,8 +904,8 @@ def main() -> None:
         intercept = float(extras["intercept"])
     else:
         raise ValueError("No intercept: pass --decoder-extras-json (with 'intercept') or --decoder-intercept.")
-    if args.zscore_min_volumes < 2:
-        raise ValueError("--zscore-min-volumes must be >= 2")
+    if not np.isfinite(intercept):
+        raise ValueError("Decoder intercept must be finite")
 
     # Files made by the preparation run (offline preproc in rs/task_realtime_parallel.py).
     # Fail here, before PsychoPy opens, rather than inside the pipeline process.
@@ -870,29 +920,33 @@ def main() -> None:
         )
     space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     if space == "mni":
-        required.append(cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+        from fmri_rt_preproc.offline_assets import t1_to_mni_transform
+        required.append(t1_to_mni_transform(cfg))
         missing = [str(p) for p in required if not p.exists()]
         if missing:
             raise FileNotFoundError(f"Missing preparation-run outputs for MNI scoring: {missing}")
-    log.info("[ZSCORE] run-wise voxel z-scoring, start after %d reg-ready volumes; intercept b=%+.4f",
-             args.zscore_min_volumes, intercept)
-    # Reg-ready starts after the baseline TRs; the first score comes zscore_min_volumes later.
-    first_scored_tr = baseline_trs + args.zscore_min_volumes
-    # Scanner volume index of trial 1's first score TR (skipped TRs come before the baseline).
-    first_window_start = args.skip_first_trs + baseline_trs + args.iti_trs + 1 + args.score_delay
-    if first_scored_tr > first_window_start:
-        msg = (f"[ZSCORE] trial 1 score window starts at TR {first_window_start}, but the first z-scored "
-               f"score is expected at TR ~{first_scored_tr}; trial 1 will use fewer TRs (or none). "
-               f"Use --zscore-min-volumes {max(2, first_window_start - baseline_trs)} for a full trial-1 window, "
-               f"or treat trial 1 as practice.")
-        log.warning(msg)
-        print(msg)
+    startup = normalization_startup_hint(REGRESSOR_SETTINGS)
+    first_window = first_trial_window_volumes(
+        baseline_trs=baseline_trs, skip_first_trs=args.skip_first_trs,
+        iti_trs=args.iti_trs, cue_trs=args.cue_trs, scans_trs=args.scans_trs,
+        score_delay=args.score_delay,
+    ) if args.n_trials else None
+    log.info("[SCORE] Direct decoder decision after pipeline post-GLM normalization; mode=%s reference=%s "
+             "N=%d intercept b=%+.4f; first usable input volume cannot be earlier than %d "
+             "(GLM design/coverage/processing may delay it).",
+             REGRESSOR_SETTINGS.voxel_norm_mode, REGRESSOR_SETTINGS.voxel_norm_reference,
+             REGRESSOR_SETTINGS.voxel_norm_ref_volumes, intercept, startup["first_score_volume_lower_bound"])
+    if first_window and first_window[0] < startup["first_score_volume_lower_bound"]:
+        log.warning("[WARMUP] Trial1 score window covers input volumes %d-%d, before normalization can "
+                    "be ready (not before volume%d). Scores may be missing or incomplete. "
+                    "The schedule is unchanged; increase --baseline-trs if appropriate. "
+                    "JSON voxel_norm_ref_volumes remains %d independently of presentation duration.",
+                    *first_window, startup["first_score_volume_lower_bound"],
+                    REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
-    # Baseline TRs define the warmup window for voxel-wise normalization and
-    # denoising startup; keep pipeline normalization in sync with presentation.
-    settings_payload["voxel_norm_ref_volumes"] = max(1, baseline_trs)
-    settings_payload["_runwise_zscore"] = {"intercept": intercept, "min_volumes": int(args.zscore_min_volumes)}
+    # Presentation baseline duration does not change the JSON calibration window.
+    settings_payload["_decoder_intercept"] = intercept
     settings_payload.update(
         {
             "enable_biopac_physio": args.biopac_enable,
@@ -915,8 +969,12 @@ def main() -> None:
         {
             "psychopy": {
                 "script": "rt_nf_events_prob_parallel.py",
-                "feedback": "100*sigmoid(mean_trial(w.z_t) + b); z_t: voxel z-score within run vs volumes 1..t-1",
-                "zscore_min_volumes": int(args.zscore_min_volumes),
+                "feedback": "100*sigmoid(mean_trial(w.x_t + b)); x_t: pipeline post-GLM normalized features",
+                "voxel_norm_mode": REGRESSOR_SETTINGS.voxel_norm_mode,
+                "voxel_norm_reference": REGRESSOR_SETTINGS.voxel_norm_reference,
+                "normalization_startup": startup,
+                "first_trial_score_window_input_volumes": first_window,
+                "decoder_normalization": "none; performed centrally after cumulative GLM",
                 "decoder_intercept": intercept,
                 "decoder_extras_json": args.decoder_extras_json,
                 "n_trials": args.n_trials,

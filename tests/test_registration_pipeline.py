@@ -32,7 +32,8 @@ def registration(tmp_path, monkeypatch):
     pipe.trans_dir = tmp_path / "session transforms"
     pipe.anat_dir.mkdir()
     pipe.trans_dir.mkdir()
-    pipe.cfg = SimpleNamespace(registration_initialization="identity", registration_syn=False)
+    pipe.cfg = SimpleNamespace(registration_initialization="identity", registration_syn=False,
+                               registration_direction="t1_to_epi", epi_reference_n4=False)
     epi = pipe.trans_dir / "epi_unwarped_mean.nii"
     mask = pipe.trans_dir / "epi_mask_mean.nii"
     epi_affine = np.diag([2., 2., 3., 1.])
@@ -72,12 +73,12 @@ def test_semantic_directions_and_image_grids(registration, epi_shape):
     t1 = pipe.anat_dir / "T1_brain.nii"
     fixed, moving = epi, t1
     stages = [value.split("[")[0] for value in values(args, "--transform")]
-    assert stages == ["Translation", "Rigid"]
-    expected_mask = f"[{mask},NULL]"
+    assert stages == ["Rigid", "Affine"]
+    expected_mask = f"[{mask},{pipe.anat_dir / 'T1_combined_mask.nii'}]"
     assert values(args, "--masks") == [expected_mask] * len(stages)
     assert all(metric.startswith(f"MI[{fixed},{moving},") for metric in values(args, "--metric"))
     assert values(args, "--initial-moving-transform") == ["Identity"]
-    assert values(args, "--shrink-factors") == ["1", "2x2x1"]
+    assert values(args, "--shrink-factors") == ["8x4x2x1", "8x4x2x1"]
     forward, inverse, warped, inv_warped = pipe._registration_outputs()
     assert forward.read_bytes() == b"native-inverse"
     assert inverse.read_bytes() == b"native-forward"
@@ -95,7 +96,7 @@ def test_semantic_directions_and_image_grids(registration, epi_shape):
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     assert len(calls) == 1  # valid repeat reuses the pair together
     saved = json.loads((pipe.trans_dir / "registration.json").read_text())
-    assert saved["version"] == 2
+    assert saved["version"] == 3
     assert saved["native_fixed"] == str(epi.resolve())
     assert saved["native_moving"] == str(t1.resolve())
     assert saved["epi_to_t1_native"] == str((pipe.trans_dir / "t1_to_epi_InverseComposite.h5").resolve())
@@ -107,10 +108,47 @@ def test_optional_syn_and_explicit_com(registration):
     pipe.cfg.registration_syn = True
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     args = calls[0]
-    assert values(args, "--transform") == ["Translation[0.1]", "Rigid[0.1]", "SyN[0.1,3,0]"]
-    assert values(args, "--shrink-factors") == ["1", "2x2x1", "2x1"]
+    assert values(args, "--transform") == ["Rigid[0.1]", "Affine[0.1]", "SyN[0.1,1,0]"]
+    assert values(args, "--shrink-factors") == ["8x4x2x1", "8x4x2x1", "6x4x2x1"]
     assert values(args, "--initial-moving-transform") == [f"[{epi},{pipe.anat_dir / 'T1_brain.nii'},1]"]
-    assert values(args, "--masks") == [f"[{mask},NULL]"] * 3
+    assert values(args, "--masks") == [f"[{mask},{pipe.anat_dir / 'T1_combined_mask.nii'}]"] * 3
+
+
+def test_forward_fit_keeps_semantic_names_and_distinct_grids(registration):
+    pipe, epi, mask, calls = registration
+    pipe.cfg.registration_direction = "epi_to_t1"
+    pipe.cfg.registration_syn = True
+    pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    forward, inverse, warped, inverse_warped = pipe._registration_outputs()
+    assert forward.read_bytes() == b"native-forward"
+    assert inverse.read_bytes() == b"native-inverse"
+    np.testing.assert_array_equal(nib.load(warped).affine, nib.load(pipe.anat_dir / "T1_N4.nii").affine)
+    np.testing.assert_array_equal(nib.load(inverse_warped).affine, nib.load(epi).affine)
+    assert values(calls[0], "--masks") == [f"[{pipe.anat_dir / 'T1_combined_mask.nii'},{mask}]"] * 3
+
+
+def test_preparation_mean_does_not_average_missing_mc_slices_as_zero(registration, monkeypatch):
+    pipe, epi, _, _ = registration
+    source = epi.with_name("input.nii")
+    output = epi.with_name("new_mean.nii")
+    nib.save(nib.Nifti1Image(np.full((4, 5, 3, 2), 100, np.float32), np.eye(4)), source)
+    pipe.rt_unwarped_analysis_ref_epi = output
+
+    class Volreg:
+        def __init__(self, **kwargs):
+            self._motion = np.zeros((2, 6))
+        def set_ref_vol(self, reference):
+            pass
+        def do_proc(self, img, vol_idx):
+            pass
+        def resample_support(self, support, vol_idx):
+            if vol_idx == 1:
+                support[..., -1] = 0
+            return support
+
+    monkeypatch.setattr("fmri_rt_preproc.pipeline.RtpVolreg", Volreg)
+    pipe._motion_correct_and_mean(source, output, 2)
+    np.testing.assert_array_equal(nib.load(output).get_fdata(), 100)
 
 
 @pytest.mark.parametrize("syn", [False, True])
@@ -211,7 +249,7 @@ def test_incompatible_cache_is_not_reinterpreted_or_overwritten(registration, ca
 
 
 @pytest.mark.parametrize("initialization,syn", [("identity", False), ("center_of_mass", True)])
-def test_equivalent_version_one_partial_cache_reused_without_rewriting(registration, initialization, syn):
+def test_short_version_one_partial_cache_rejected_without_rewriting(registration, initialization, syn):
     pipe, epi, mask, calls = registration
     pipe.cfg.registration_initialization = initialization
     pipe.cfg.registration_syn = syn
@@ -228,7 +266,8 @@ def test_equivalent_version_one_partial_cache_reused_without_rewriting(registrat
         saved[key] = str(old_path)
     marker.write_text(json.dumps(saved))
     original = {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()}
-    pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    with pytest.raises(ValueError, match="fresh day/preparation directory"):
+        pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
     assert len(calls) == 1
     assert {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()} == original
     pipe.cfg.registration_syn = not syn

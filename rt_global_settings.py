@@ -8,7 +8,36 @@ from typing import Any, Optional
 
 import numpy as np
 
-from fmri_rt_preproc.config import normalize_registration_config, validate_registration_settings
+from fmri_rt_preproc.config import (
+    normalize_registration_config, optional_registration_path,
+    validate_registration_direction, validate_registration_settings,
+    validate_epi_reference_n4,
+)
+
+
+REGISTRATION_KEYS = ("registration_initialization", "registration_syn",
+                     "registration_direction", "offline_assets", "registration_qc_policy", "epi_reference_n4")
+VOXEL_NORMALIZATION_KEYS = ("voxel_norm_mode", "voxel_norm_reference", "voxel_norm_ref_volumes")
+
+
+def validate_voxel_normalization_settings(mode: str, reference: str, ref_volumes: int) -> tuple[str, str, int]:
+    """Validate a complete normalization choice before updating live settings."""
+    mode = str(mode).lower()
+    reference = str(reference).lower()
+    if mode not in {"zscore", "mean"}:
+        raise ValueError("voxel_norm_mode must be 'zscore' or 'mean'.")
+    if reference not in {"fixed", "running"}:
+        raise ValueError("voxel_norm_reference must be 'fixed' or 'running'.")
+    try:
+        count = int(ref_volumes)
+        integral = not isinstance(ref_volumes, (bool, np.bool_)) and float(ref_volumes) == count
+    except (TypeError, ValueError, OverflowError):
+        integral = False
+        count = 0
+    minimum = 2 if mode == "zscore" else 1
+    if not integral or count < minimum:
+        raise ValueError(f"voxel_norm_ref_volumes must be an integer >= {minimum} for {mode} mode.")
+    return mode, reference, count
 
 
 @dataclass
@@ -24,14 +53,17 @@ class RegressorSettings:
     analysis_mask_space: str = "final"  # custom mask coordinates: final, epi, t1, mni
     use_gpu_resampler: bool = False
     gpu_resampler_device: str = "cuda"
+    gpu_resampler_interpolation: str = "linear"  # linear or lanczos (CUDA + Triton)
     use_gs: bool = False
     use_wm: bool = True
     use_vent: bool = True
 
-    # Shared normalization window (N>=1) for both processing paths:
-    # - regression ON: mapped to RTPSpy wait_num=N-1 for Y_mean scaling
-    # - regression OFF: average first N MC volumes for the same scaling
-    voxel_norm_ref_volumes: int = 1
+    # Normalize after native-unit GLM, before spatial transforms/smoothing.
+    # zscore calibrates on N emitted ready residuals; mean uses N raw MC volumes.
+    # N also sets the GLM startup minimum. Running references use prior data only.
+    voxel_norm_mode: str = "zscore"  # zscore (sample SD), mean (100 * residual / raw mean)
+    voxel_norm_reference: str = "fixed"  # fixed first N, or running prior observations
+    voxel_norm_ref_volumes: int = 30
     enable_fd_censor_reg: bool = True
     fd_thr: float = 0.3
 
@@ -61,7 +93,11 @@ class RegressorSettings:
     truncate_t1_to_epi_fov: bool = True
     truncate_t1_padding_vox: int = 2
     registration_initialization: str = "identity"
-    registration_syn: bool = False
+    registration_syn: bool = True
+    registration_direction: str = "epi_to_t1"
+    offline_assets: Optional[Path] = None
+    registration_qc_policy: Optional[str] = None
+    epi_reference_n4: bool = True  # N4 reference copy for fitting; original MC target is retained
     fieldmap_method: str = "pyhysco"  # "pyhysco" or "ants"
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
@@ -77,19 +113,35 @@ class RegressorSettings:
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
 
     def __post_init__(self) -> None:
-        (self.registration_initialization, self.registration_syn) = validate_registration_settings(
-            self.registration_initialization, self.registration_syn
-        )
+        self.update({})
 
     def update(self, overrides: dict[str, Any]) -> None:
         overrides = normalize_registration_config(overrides)
-        registration_keys = ("registration_initialization", "registration_syn")
-        registration_values = validate_registration_settings(
-            *(overrides.get(key, getattr(self, key)) for key in registration_keys)
+        registration_values = {key: overrides.get(key, getattr(self, key)) for key in REGISTRATION_KEYS}
+        registration_values["registration_initialization"], registration_values["registration_syn"] = validate_registration_settings(
+            registration_values["registration_initialization"], registration_values["registration_syn"]
         )
+        registration_values["registration_direction"] = validate_registration_direction(registration_values["registration_direction"])
+        registration_values["epi_reference_n4"] = validate_epi_reference_n4(registration_values["epi_reference_n4"])
+        registration_values["offline_assets"] = optional_registration_path(registration_values["offline_assets"], "offline_assets")
+        policy = optional_registration_path(registration_values["registration_qc_policy"], "registration_qc_policy")
+        registration_values["registration_qc_policy"] = str(policy) if policy is not None else None
+        normalization_values = validate_voxel_normalization_settings(*(
+            overrides.get(key, getattr(self, key)) for key in VOXEL_NORMALIZATION_KEYS
+        ))
+        interpolation = str(overrides.get(
+            "gpu_resampler_interpolation", self.gpu_resampler_interpolation)).lower()
+        if interpolation not in {"linear", "lanczos"}:
+            raise ValueError("gpu_resampler_interpolation must be 'linear' or 'lanczos'.")
+        if interpolation == "lanczos":
+            enabled = overrides.get("use_gpu_resampler", self.use_gpu_resampler)
+            device = str(overrides.get("gpu_resampler_device", self.gpu_resampler_device))
+            if not enabled or not device.startswith("cuda"):
+                raise ValueError("Lanczos requires use_gpu_resampler=true and a CUDA device.")
         known = {f.name: f for f in fields(self)}
         for key, value in overrides.items():
-            if key not in known or key in registration_keys:
+            if (key not in known or key in REGISTRATION_KEYS or key in VOXEL_NORMALIZATION_KEYS
+                    or key == "gpu_resampler_interpolation"):
                 continue
             if key == "biopac_file" and value is not None:
                 setattr(self, key, Path(value))
@@ -106,8 +158,6 @@ class RegressorSettings:
                 if not np.isfinite(fwhm) or fwhm < 0:
                     raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
                 self.smoothing_fwhm_mm = fwhm
-            elif key == "voxel_norm_ref_volumes":
-                setattr(self, key, max(1, int(value)))
             elif key == "skip_first_trs":
                 setattr(self, key, max(0, int(value)))
             elif key == "rt_max_scan_length":
@@ -128,13 +178,17 @@ class RegressorSettings:
                 setattr(self, key, max(1, int(value)))
             else:
                 setattr(self, key, value)
-        for key, value in zip(registration_keys, registration_values):
+        for key, value in registration_values.items():
             setattr(self, key, value)
+        for key, value in zip(VOXEL_NORMALIZATION_KEYS, normalization_values):
+            setattr(self, key, value)
+        self.gpu_resampler_interpolation = interpolation
 
     def to_json_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        if payload["biopac_file"] is not None:
-            payload["biopac_file"] = str(payload["biopac_file"])
+        for key in ("biopac_file", "offline_assets"):
+            if payload[key] is not None:
+                payload[key] = str(payload[key])
         if np.isinf(payload["max_poly_order"]):
             payload["max_poly_order"] = "inf"
         return payload
@@ -166,15 +220,33 @@ def save_regressor_settings(path: str | Path, settings: RegressorSettings | None
 def add_registration_arguments(parser: argparse.ArgumentParser) -> None:
     """Use identical, opt-in CLI overrides in every preparation launcher."""
     parser.add_argument(
+        "--registration-direction", choices=["epi_to_t1", "t1_to_epi"], default=None,
+        help="Native anatomical fit direction (default: epi_to_t1). "
+             "Both directions preserve the same canonical EPI-to-T1 output names.",
+    )
+    parser.add_argument(
         "--registration-initialization", choices=["identity", "center_of_mass", "auto"],
         default=None,
-        help="T1-to-EPI initialization: identity uses headers (default); "
+        help="Anatomical registration initialization: identity uses headers (default); "
              "center_of_mass is an explicit alternative; auto aliases identity.",
     )
     parser.add_argument(
         "--registration-syn", action=argparse.BooleanOptionalAction, default=None,
-        help="Enable optional SyN refinement after Translation + Rigid "
-             "(default: disabled; overrides the settings file only when supplied).",
+        help="Enable SyN refinement after Rigid + Affine "
+             "(default: enabled; overrides the settings file only when supplied).",
+    )
+    parser.add_argument(
+        "--epi-reference-n4", action=argparse.BooleanOptionalAction, default=None,
+        help="Bias-correct a reference copy before spatial registration (default: enabled); "
+             "does not N4-correct incoming volumes or replace the motion-correction target.",
+    )
+    parser.add_argument(
+        "--offline-assets", default=None, type=Path,
+        help="Offline anatomical/EPI asset manifest to reuse for session preparation.",
+    )
+    parser.add_argument(
+        "--registration-qc-policy", default=None,
+        help="Registration QC policy JSON path; omission requires manual review.",
     )
 
 
@@ -182,6 +254,22 @@ def apply_registration_arguments(settings: RegressorSettings, args: argparse.Nam
     """Apply explicit CLI choices after loading a profile, preserving omitted values."""
     settings.update({
         key: getattr(args, key)
-        for key in ("registration_initialization", "registration_syn")
+        for key in REGISTRATION_KEYS
         if getattr(args, key, None) is not None
     })
+
+
+def registration_cli_arguments(settings: RegressorSettings) -> list[str]:
+    """Forward resolved choices explicitly, independently of child defaults."""
+    arguments = [
+        "--registration-direction", settings.registration_direction,
+        "--registration-initialization", settings.registration_initialization,
+        "--registration-syn" if settings.registration_syn else "--no-registration-syn",
+        "--epi-reference-n4" if settings.epi_reference_n4 else "--no-epi-reference-n4",
+    ]
+    for key, flag in (("offline_assets", "--offline-assets"),
+                      ("registration_qc_policy", "--registration-qc-policy")):
+        value = getattr(settings, key)
+        if value is not None:
+            arguments += [flag, str(value)]
+    return arguments

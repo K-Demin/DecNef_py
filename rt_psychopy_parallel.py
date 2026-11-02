@@ -16,7 +16,7 @@ from typing import Optional
 
 import numpy as np
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import load_regressor_settings, add_registration_arguments, apply_registration_arguments
 import rs_pca_runtime as pca_rt
 
 
@@ -919,12 +919,14 @@ def main() -> None:
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
     )
+    add_registration_arguments(parser)
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
     max_trs = args.max_trs
     if max_trs is None and args.duration_min is not None:
         max_trs = int(round((float(args.duration_min) * 60.0) / float(REGRESSOR_SETTINGS.TR)))
@@ -957,6 +959,9 @@ def main() -> None:
         ap_block=args.ap_block,
         pa_block=args.pa_block,
     )
+
+    from rt_pipeline import prepare_nf_run
+    prepare_nf_run(cfg)
 
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)

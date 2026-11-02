@@ -140,7 +140,12 @@ def _run_preproc(
     pa_block: Optional[int],
     epi_block: int,
     registration_initialization: str = "identity",
-    registration_syn: bool = False,
+    registration_syn: bool = True,
+    registration_direction: str = "epi_to_t1",
+    offline_assets=None,
+    registration_qc_policy=None,
+    settings_file=None,
+    epi_reference_n4: bool = True,
 ) -> None:
     cmd = [
         sys.executable,
@@ -158,7 +163,16 @@ def _run_preproc(
         "--registration-initialization",
         registration_initialization,
         "--registration-syn" if registration_syn else "--no-registration-syn",
+        "--registration-direction", registration_direction,
+        "--epi-reference-n4" if epi_reference_n4 else "--no-epi-reference-n4",
     ]
+    if offline_assets is not None:
+        cmd += ["--offline-assets", str(offline_assets)]
+    if registration_qc_policy is not None:
+        cmd += ["--registration-qc-policy", str(registration_qc_policy)]
+    if settings_file is not None:
+        # Preparation must share phase-encoding/method settings with live BOLD.
+        cmd += ["--settings-file", str(Path(settings_file).expanduser().resolve())]
     if struct_block is not None:
         cmd += ["--struct-block", str(struct_block)]
     if ap_block is not None:
@@ -510,6 +524,11 @@ def main() -> None:
         help="Disable decoder scoring during rt_pipeline.",
     )
     parser.add_argument(
+        "--enable-original-score", action="store_true", default=False,
+        help="Save the original-intensity comparison stream in the final grid. "
+             "Needed for subsequent transformed-grid PCA tSNR preparation; adds per-TR processing and I/O.",
+    )
+    parser.add_argument(
         "--struct-block",
         type=int,
         help="Block/run id for the structural (UNI/T1) DICOMs inside incoming-root.",
@@ -681,7 +700,7 @@ def main() -> None:
         "--baseline-trs",
         type=int,
         default=None,
-        help="TRs for voxel-wise normalization baseline (defaults to settings voxel_norm_ref_volumes).",
+        help="Baseline duration recorded in presentation metadata; normalization window stays in JSON settings.",
     )
     parser.add_argument(
         "--settings-file",
@@ -746,6 +765,10 @@ def main() -> None:
         base_data, args.sub, args.day, args.ap_block, args.pa_block,
         REGRESSOR_SETTINGS.registration_initialization,
         REGRESSOR_SETTINGS.registration_syn,
+        registration_direction=REGRESSOR_SETTINGS.registration_direction,
+        offline_assets=REGRESSOR_SETTINGS.offline_assets,
+        registration_qc_policy=REGRESSOR_SETTINGS.registration_qc_policy,
+        epi_reference_n4=REGRESSOR_SETTINGS.epi_reference_n4,
     )
 
     run_dir = base_data / f"sub-{args.sub}" / args.day / "func" / args.run
@@ -823,6 +846,11 @@ def main() -> None:
             epi_block=epi_block,
             registration_initialization=REGRESSOR_SETTINGS.registration_initialization,
             registration_syn=REGRESSOR_SETTINGS.registration_syn,
+            registration_direction=REGRESSOR_SETTINGS.registration_direction,
+            offline_assets=REGRESSOR_SETTINGS.offline_assets,
+            registration_qc_policy=REGRESSOR_SETTINGS.registration_qc_policy,
+            epi_reference_n4=REGRESSOR_SETTINGS.epi_reference_n4,
+            settings_file=args.settings_file,
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, args.sub, args.day)
@@ -858,6 +886,7 @@ def main() -> None:
         log.info("[FMAP] RT will use fieldmap: %s", native_paths(fieldmap_dir)[1])
 
         cfg = RTSessionConfig(
+            preparation_only=True,
             subject=args.sub,
             day=args.day,
             run=args.run,
@@ -869,6 +898,7 @@ def main() -> None:
                 else pca_reference_image
             ),
             enable_scoring=enable_scoring,
+            enable_original_score=args.enable_original_score,
             test_speed=args.test_speed,
             ap_block=args.ap_block,
             pa_block=args.pa_block,
@@ -885,7 +915,6 @@ def main() -> None:
         settings_payload.update(
             {
                 "skip_first_trs": args.skip_first_trs,
-                "voxel_norm_ref_volumes": max(1, baseline_trs),
                 "enable_biopac_physio": args.biopac_enable,
                 "biopac_host": args.biopac_host,
                 "biopac_port": args.biopac_port,

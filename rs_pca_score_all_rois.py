@@ -175,6 +175,8 @@ def run_realtime_all_roi_pca_scorer(
                 continue
 
             if not validated_grid:
+                pca_rt.validate_pca_processing(
+                    decoders=decoders, run_dir=run_dir, volume_kind=volume_kind)
                 pca_rt.validate_pca_decoder_volume_grid(
                     decoders=decoders,
                     volume_shape=vol.shape[:3],
@@ -242,6 +244,7 @@ def run_realtime_all_roi_pca_scorer(
         "n_scored": int(scored_count),
         "n_seen_or_skipped": int(len(processed)),
         "initial_volume_filter": filter_meta,
+        "upstream_processing": pca_rt.run_upstream_processing(run_dir, volume_kind),
         "rois": sorted(decoders.keys()),
         "pc_counts": pc_counts,
         "selected_pcs": {
@@ -271,6 +274,8 @@ def run_realtime_all_roi_pca_scorer(
 
     if scored_count < 2:
         raise ValueError(f"Need at least 2 scored TRs for daily PCA scores, got {scored_count}")
+    reference = pca_rt.load_reference_stats_from_score_csv(out_csv, score_columns)
+    pca_rt.save_reference_stats(score_root / "pca_reference_stats.json", reference)
     log.info("Saved realtime PCA ROI scores: %s", out_csv)
 
 
@@ -428,9 +433,14 @@ def main() -> None:
         "--baseline-trs",
         type=int,
         default=None,
-        help="TRs for voxel-wise normalization baseline.",
+        help="Baseline duration recorded in presentation metadata; normalization window stays in JSON settings.",
     )
     parser.add_argument("--settings-file", default=None)
+    parser.add_argument(
+        "--enable-original-score", action="store_true", default=False,
+        help="Save the original-intensity comparison stream in the final grid. "
+             "Needed for subsequent transformed-grid PCA tSNR preparation; adds per-TR processing and I/O.",
+    )
     add_registration_arguments(parser)
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--rt-max-scan-length", type=int, default=None)
@@ -490,6 +500,10 @@ def main() -> None:
         base_data, sub, args.day, args.ap_block, args.pa_block,
         REGRESSOR_SETTINGS.registration_initialization,
         REGRESSOR_SETTINGS.registration_syn,
+        registration_direction=REGRESSOR_SETTINGS.registration_direction,
+        offline_assets=REGRESSOR_SETTINGS.offline_assets,
+        registration_qc_policy=REGRESSOR_SETTINGS.registration_qc_policy,
+        epi_reference_n4=REGRESSOR_SETTINGS.epi_reference_n4,
     )
 
     subject_root = base_data / f"sub-{sub}"
@@ -562,6 +576,11 @@ def main() -> None:
             epi_block=epi_block,
             registration_initialization=REGRESSOR_SETTINGS.registration_initialization,
             registration_syn=REGRESSOR_SETTINGS.registration_syn,
+            registration_direction=REGRESSOR_SETTINGS.registration_direction,
+            offline_assets=REGRESSOR_SETTINGS.offline_assets,
+            registration_qc_policy=REGRESSOR_SETTINGS.registration_qc_policy,
+            epi_reference_n4=REGRESSOR_SETTINGS.epi_reference_n4,
+            settings_file=args.settings_file,
         )
         if args.prep_surface_rois:
             _run_prep_surface_rois(base_data, sub, args.day)
@@ -605,7 +624,6 @@ def main() -> None:
         settings_payload.update(
             {
                 "skip_first_trs": args.skip_first_trs,
-                "voxel_norm_ref_volumes": max(1, baseline_trs),
                 "enable_biopac_physio": args.biopac_enable,
                 "biopac_host": args.biopac_host,
                 "biopac_port": args.biopac_port,
@@ -625,6 +643,7 @@ def main() -> None:
             settings_payload["rt_max_scan_length"] = max(1, int(args.rt_max_scan_length))
 
         cfg = RTSessionConfig(
+            preparation_only=True,
             subject=sub,
             day=args.day,
             run=args.run,
@@ -632,6 +651,7 @@ def main() -> None:
             base_data=base_data,
             decoder_template=pca_reference_image,
             enable_scoring=False,
+            enable_original_score=args.enable_original_score,
             ap_block=args.ap_block,
             pa_block=args.pa_block,
         )

@@ -14,6 +14,7 @@ import subprocess
 
 import numpy as np
 from fmri_rt_preproc.analysis_mask import final_output_kind
+from fmri_rt_preproc.processing_mask import canonical_upstream_processing, upstream_processing_spec
 
 
 @dataclass(frozen=True)
@@ -678,12 +679,65 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
+class PCAReferenceStats(dict):
+    """Score columns with processing provenance retained across process spawn."""
+    def __init__(self, *args, upstream_processing=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.upstream_processing = upstream_processing
+
+
+def run_upstream_processing(run_dir: Path, volume_kind: str) -> dict | None:
+    path = Path(run_dir) / "session_metadata.json"
+    metadata = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    stage = "raw_mc" if str(volume_kind).lower() in {"mc", "unwarped"} else "normalized"
+    return upstream_processing_spec(metadata, stage)
+
+
+def validate_pca_processing(*, decoders, run_dir, volume_kind, reference_stats=None):
+    """Reject unverified/mismatched modern PCA inputs before emitting a score."""
+    try:
+        current = run_upstream_processing(run_dir, volume_kind)
+
+        def compare(recorded, label, modern_hint=None):
+            if recorded is None:
+                if current is None and modern_hint is None:
+                    return  # Both sides are genuinely legacy.
+                raise ValueError(f"{label} lacks verified upstream processing metadata")
+            if canonical_upstream_processing(recorded) != current:
+                raise ValueError(f"{label} uses different upstream preprocessing")
+
+        for roi, decoder in decoders.items():
+            metadata = decoder.get("_metadata") or {}
+            compare(metadata.get("upstream_processing"), f"PCA decoder {roi!r}",
+                    metadata.get("upstream_normalization"))
+        if reference_stats is not None:
+            compare(getattr(reference_stats, "upstream_processing", None), "PCA RS reference")
+    except (ValueError, TypeError) as exc:
+        raise PCAReferenceMismatchError(
+            f"PCA preprocessing compatibility failed: {exc}. "
+            "Rebuild PCA assets and collect/reprocess the RS reference with matching preprocessing; "
+            "legacy or unverifiable assets cannot calibrate a normalized run."
+        ) from exc
+    return current
+
+
+def _reference_stats_with_provenance(columns, metadata):
+    recorded = metadata.get("upstream_processing")
+    if recorded is not None:
+        recorded = canonical_upstream_processing(recorded)
+    elif metadata.get("upstream_normalization") is not None:
+        raise PCAReferenceMismatchError("PCA RS reference declares normalization without spatial processing provenance; rebuild it.")
+    return PCAReferenceStats(columns, upstream_processing=recorded)
+
+
 def load_reference_stats(path: Optional[Path]) -> dict[str, dict[str, float]]:
     if path is None:
         return {}
     with Path(path).open("r", encoding="utf-8") as f:
         payload = json.load(f)
-    return payload.get("columns", payload)
+    columns = payload.get("columns", {key: value for key, value in payload.items()
+                                      if key not in {"upstream_processing", "upstream_normalization"}})
+    return _reference_stats_with_provenance(columns, payload)
 
 
 def load_reference_stats_from_score_csv(
@@ -729,7 +783,16 @@ def load_reference_stats_from_score_csv(
             "p50": float(np.percentile(arr, 50)),
             "p95": float(np.percentile(arr, 95)),
         }
-    return stats
+    sidecar = scores_csv.with_name(scores_csv.stem + "_metadata.json")
+    metadata = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
+    return _reference_stats_with_provenance(stats, metadata)
+
+
+def save_reference_stats(path: Path, stats: PCAReferenceStats) -> None:
+    """Write portable reference statistics with their verified upstream method."""
+    payload = {"version": 1, "columns": dict(stats),
+               "upstream_processing": getattr(stats, "upstream_processing", None)}
+    Path(path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def plot_pca_scores_motion(
@@ -1016,15 +1079,23 @@ def volume_path_for_kind(run_dir: Path, volume_idx: int, volume_kind: str) -> Pa
     # Metadata is written before processing begins, so polling never grabs an
     # unsmoothed file while its smoothed counterpart is still being produced.
     metadata = run_dir / "session_metadata.json"
-    if volume_kind in {"reg", "t1", "mni", "smooth", "masked"} and metadata.exists():
+    if volume_kind in {"reg", "mc", "unwarped", "t1", "mni", "smooth", "masked"} and metadata.exists():
         info = json.loads(metadata.read_text(encoding="utf-8"))
         output_kind = final_output_kind(info.get("smoothing_fwhm_mm", 0), info.get("analysis_mask", "whole_brain"))
         if volume_kind in {"smooth", "masked"} and volume_kind != output_kind:
             raise ValueError(f"PCA {volume_kind} input requested, but this stage is disabled for this run.")
         space = info.get("regression", {}).get("analysis_space", "mni")
+        mapped_epi = space == "epi" and info.get("epi_reference_mapped", False)
+        if mapped_epi and volume_kind in {"mc", "unwarped"}:
+            raise ValueError("PCA EPI decoding requires the stable reference EPI grid; "
+                             "select reg to use the aligned final stream, not current-session MC.")
         final_kind = "reg" if space == "epi" else space
         if output_kind is not None and volume_kind == final_kind:
             volume_kind = output_kind
+        elif mapped_epi and volume_kind == "reg":
+            return run_dir / "epi_ref" / f"vol_{volume_idx:05d}_epi_ref.nii"
+        elif volume_kind == "reg" and info.get("normalization"):
+            return run_dir / "norm" / f"vol_{volume_idx:05d}_norm.nii"
     if volume_kind in {"smooth", "masked"}:
         return run_dir / volume_kind / f"vol_{volume_idx:05d}_{volume_kind}.nii"
     if volume_kind == "reg":
@@ -1089,7 +1160,24 @@ def run_realtime_pca_scorer(
     import nibabel as nib
 
     decoder = load_decoder_artifacts(pca_root / condition.roi)
+    # Launchers pass an empty plain dict when no RS calibration was requested.
+    # That is the supported raw/directed-score path, not an unverifiable RS.
+    has_reference = (bool(reference_stats) or reference_stats_path is not None
+                     or isinstance(reference_stats, PCAReferenceStats))
     loaded_reference_stats = reference_stats or load_reference_stats(reference_stats_path)
+    if has_reference:
+        column = loaded_reference_stats.get(condition.score_column)
+        try:
+            valid_reference = (isinstance(column, dict)
+                               and np.isfinite(float(column["mean"]))
+                               and np.isfinite(float(column["std"])) and float(column["std"]) > 0)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid_reference = False
+        if not valid_reference:
+            raise PCAReferenceMismatchError(
+                f"Requested PCA RS reference has no valid mean and positive SD for {condition.score_column!r}. "
+                "Collect/reprocess the reference or omit it to use unreferenced directed scores."
+            )
     metric = normalize_score_metric(score_metric)
     if metric in LEGACY_COMPONENT_METRICS and target_pc is None:
         target_pc = condition.score_label
@@ -1099,6 +1187,36 @@ def run_realtime_pca_scorer(
     scored_count = 0
     volume_idx = 1
     validated_grid = False
+
+    def normalization_readiness(index):
+        # New runs publish zero-valued calibration images. File existence alone
+        # cannot distinguish them from valid acquired zeros. Legacy runs have
+        # no normalization metadata and retain their historical scoring policy.
+        metadata_path = run_dir / "session_metadata.json"
+        try:
+            if not metadata_path.exists():
+                return True
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if "normalization" not in metadata:
+                return True
+            text = (run_dir / "regression_status_rt.csv").read_text(encoding="utf-8")
+        except (OSError, json.JSONDecodeError):
+            return None  # Metadata/status can still be in flight.
+        # Ignore a row until its terminating newline is visible; a producer may
+        # be appending the remaining fields while the volume already exists.
+        text = text[:text.rfind("\n") + 1]
+        ready = None
+        for row in csv.DictReader(text.splitlines()):
+            try:
+                if int(row.get("volume_idx", "")) != index:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            value = str(row.get("reg_ready", "")).strip().lower()
+            if value in {"0", "1", "false", "true"}:
+                ready = value in {"1", "true"}
+        return ready
+
     while True:
         if max_trs is not None and volume_idx > max_trs:
             break
@@ -1108,6 +1226,12 @@ def run_realtime_pca_scorer(
             volume_idx += 1
             continue
 
+        reg_ready = normalization_readiness(volume_idx)
+        if reg_ready is None:
+            if stop_event.is_set():
+                break
+            time.sleep(poll_interval)
+            continue
         vol_path = volume_path_for_kind(run_dir, volume_idx, volume_kind)
         if not vol_path.exists():
             if stop_event.is_set():
@@ -1116,26 +1240,35 @@ def run_realtime_pca_scorer(
             continue
 
         try:
-            img = nib.load(str(vol_path))
-            vol = np.asanyarray(img.dataobj)
-            if not validated_grid:
-                validate_pca_decoder_volume_grid(
-                    decoders={condition.roi: decoder},
-                    volume_shape=vol.shape[:3],
-                    volume_affine=img.affine,
-                    volume_source=vol_path,
+            if reg_ready:
+                img = nib.load(str(vol_path))
+                vol = np.asanyarray(img.dataobj)
+                if not validated_grid:
+                    validate_pca_processing(
+                        decoders={condition.roi: decoder}, run_dir=run_dir,
+                        volume_kind=volume_kind,
+                        reference_stats=loaded_reference_stats if has_reference else None)
+                    validate_pca_decoder_volume_grid(
+                        decoders={condition.roi: decoder},
+                        volume_shape=vol.shape[:3],
+                        volume_affine=img.affine,
+                        volume_source=vol_path,
+                    )
+                    validated_grid = True
+                raw_score = score_pca_scalar(
+                    vol,
+                    decoder,
+                    normalization=normalization,
+                    score_metric=score_metric,
+                    target_pc=target_pc,
+                    top_pcs=top_pcs,
+                    top_pc_variance=top_pc_variance,
                 )
-                validated_grid = True
-            raw_score = score_pca_scalar(
-                vol,
-                decoder,
-                normalization=normalization,
-                score_metric=score_metric,
-                target_pc=target_pc,
-                top_pcs=top_pcs,
-                top_pc_variance=top_pc_variance,
-            )
-            feedback = feedback_from_score(raw_score, condition, loaded_reference_stats)
+                feedback = feedback_from_score(raw_score, condition, loaded_reference_stats)
+            else:
+                raw_score = float("nan")
+                feedback = {key: float("nan") for key in
+                            ("directed_score", "score_z", "feedback_score")}
             row = {
                 "volume_idx": volume_idx,
                 "timestamp": time.time(),
@@ -1146,9 +1279,9 @@ def run_realtime_pca_scorer(
                 **feedback,
             }
             append_pca_score(out_csv, row)
-            scored_count += 1
+            scored_count += int(reg_ready)
             if (
-                qc_plot_path is not None
+                reg_ready and qc_plot_path is not None
                 and qc_update_every > 0
                 and scored_count % qc_update_every == 0
             ):
@@ -1172,7 +1305,7 @@ def run_realtime_pca_scorer(
                     {
                         **row,
                         "score_raw": row["feedback_score"],
-                        "reg_ready": True,
+                        "reg_ready": reg_ready,
                         "blind_condition": True,
                     }
                 )

@@ -98,6 +98,7 @@ class RtpRegress(RTP):
                  mask_src_proc=None, phys_reg='None', rtp_physio=None,
                  tshift=0.0, desMtx=None, wait_num=0, mask_file=0,
                  max_scan_length=800, onGPU=gpu_available, reg_retro_proc=True, spike_reg_num=200,
+                 scale_before_glm=True,
                  **kwargs):
         """
         Parameters
@@ -172,6 +173,12 @@ class RtpRegress(RTP):
         reg_retro_proc : bool, optional
             Flag to retroactively process the volumes before starting regress.
             Default is True.
+        scale_before_glm : bool, optional
+            Preserve legacy percent-of-reference-mean scaling and the upper
+            clip at 200 before fitting when True (the standalone default).
+            False fits and returns residuals in native input units, including
+            valid zero-mean signals. The frozen raw startup reference is
+            exposed separately for optional normalization after regression.
 
         """
         super(RtpRegress, self).__init__(**kwargs)
@@ -202,6 +209,7 @@ class RtpRegress(RTP):
         self.max_scan_length = max_scan_length
         self.onGPU = onGPU
         self.reg_retro_proc = reg_retro_proc
+        self.scale_before_glm = bool(scale_before_glm)
         self.wait_num = wait_num
 
         self.spike_reg_num = int(spike_reg_num) if spike_reg_num else 0
@@ -224,6 +232,18 @@ class RtpRegress(RTP):
         # Data matrix
         self.YMtx = None  # Data matrix
         self.Y_mean = None  # Mean signal for data scaling
+        # One-dimensional tensors in maskV voxel order. The mean/counts are
+        # frozen at startup; validity here describes that reference, whereas
+        # output_support can shrink as acquisition coverage is lost later.
+        self.raw_reference_mean = None
+        self.raw_reference_count = None
+        self.raw_reference_valid = None
+        self._reference_sum = None
+        self._reference_count = None
+        self._complete_support = None
+        self._valid_design_rows = None
+        self.output_support = None
+        self.last_proc_ready = False
 
         # --- Set the number of volumes to wait ---
         self.set_wait_num()
@@ -303,6 +323,7 @@ class RtpRegress(RTP):
         self._vol_num: Number of volumes received in this module.
         """
 
+        self.last_proc_ready = False
         try:
             # Increment the number of received volumes
             self._vol_num += 1  # 1-base number of volumes recieved by this
@@ -327,6 +348,30 @@ class RtpRegress(RTP):
                 self.set_mask(dataV)
                 msg = f"Mask is set with a volume index {vol_idx}."
                 self._logger.info(msg)
+
+            support = kwargs.get('support_mask')
+            if support is None:
+                support = np.ones(dataV.shape, dtype=bool)
+            else:
+                support = np.asarray(support)
+                if support.shape != dataV.shape or support.dtype.kind != 'b':
+                    raise ValueError('Regression support must be a boolean array on the input grid.')
+            observed = support[self.maskV]
+            raw_values = dataV[self.maskV]
+            if not np.isfinite(raw_values[observed]).all():
+                raise ValueError('Nonfinite acquired values inside the regression mask.')
+            if self._complete_support is None:
+                self._complete_support = np.ones(observed.shape, dtype=bool)
+            # Shared-SVD policy: fit only voxels observed throughout the history.
+            # Keep fixed feature indexing; a voxel that loses coverage remains
+            # unavailable for this run, rather than inserting measured zeros.
+            self._complete_support &= observed
+            self.output_support = np.zeros_like(self.maskV)
+            self.output_support[self.maskV] = self._complete_support
+            masked_input = np.zeros_like(dataV, dtype=np.float32)
+            masked_input[self.output_support] = dataV[self.output_support]
+            fmri_img.uncache()
+            fmri_img._dataobj = masked_input
 
             # Read global signal mask
             if self.GS_reg and self.GS_maskdata is None:
@@ -410,6 +455,9 @@ class RtpRegress(RTP):
                 self.YMtx = torch.empty(
                         self.desMtx0.shape[0]-self._proc_start_idx, vox_num,
                         dtype=torch.float32)
+                self._valid_design_rows = np.zeros(self.desMtx0.shape[0], dtype=bool)
+                self._reference_sum = np.zeros(vox_num, dtype=np.float64)
+                self._reference_count = np.zeros(vox_num, dtype=np.int32)
                 try:
                     self.YMtx = self.YMtx.to(self.device)
                 except Exception as e:
@@ -429,13 +477,17 @@ class RtpRegress(RTP):
 
             # --- Update data -------------------------------------------------
             # Y matrix
-            ydata = dataV[self.maskV]
+            if self.Y_mean is None:
+                self._reference_sum[observed] += raw_values[observed]
+                self._reference_count[observed] += 1
+            ydata = np.where(observed, raw_values, 0.)
             ydata = torch.from_numpy(ydata.astype(np.float32)).to(self.device)
             if self.Y_mean is not None:
-                # Scaling data
-                ydata[self.Y_mean_mask] = \
-                    ydata[self.Y_mean_mask]/self.Y_mean[self.Y_mean_mask]*100
-                ydata[ydata > 200] = 200
+                self.Y_mean_mask &= torch.as_tensor(self._complete_support, device=self.device)
+                if self.scale_before_glm:
+                    ydata[self.Y_mean_mask] = \
+                        ydata[self.Y_mean_mask]/self.Y_mean[self.Y_mean_mask]*100
+                    ydata[ydata > 200] = 200
 
             self.YMtx[vol_idx, :] = ydata
 
@@ -479,25 +531,32 @@ class RtpRegress(RTP):
                     self._logger.warning("Ran out of preallocated spike regressors; censor event ignored.")
 
             # Append mask mean signal regressor from mask_src_proc
+            valid_design = True
             if self.GS_reg or self.WM_reg or self.Vent_reg:
                 msk_src_data = self.mask_src_proc.proc_data[self.maskV]
-                if self.GS_reg:
-                    self.desMtx[vol_idx, self.GS_col] =  \
-                        float(msk_src_data[self.GS_maskdata].mean())
-
-                if self.WM_reg:
-                    self.desMtx[vol_idx, self.WM_col] =  \
-                        float(msk_src_data[self.WM_maskdata].mean())
-
-                if self.Vent_reg:
-                    self.desMtx[vol_idx, self.Vent_col] = \
-                        float(msk_src_data[self.Vent_maskdata].mean())
+                for label in ('GS', 'WM', 'Vent'):
+                    if not getattr(self, label + '_reg'):
+                        continue
+                    tissue = getattr(self, label + '_maskdata') & observed
+                    values = msk_src_data[tissue]
+                    if not values.size or not np.isfinite(values).all():
+                        self._logger.error(f'No finite acquired {label} signal at volume {vol_idx+1}; '
+                                           'excluding this time point from nuisance fitting.')
+                        valid_design = False
+                    else:
+                        self.desMtx[vol_idx, getattr(self, label + '_col')] = float(values.mean())
+            self._valid_design_rows[vol_idx] = valid_design
 
             # --- If the number of samples is not enough, return --------------
-            if self._vol_num <= self.wait_num:
+            if np.count_nonzero(self._valid_design_rows[self._proc_start_idx:vol_idx+1]) <= self.wait_num:
                 wait_idx = self._proc_start_idx+self.wait_num
                 msg = f"#{vol_idx+1}:Wait until volume #{wait_idx+1}"
                 self._logger.info(msg)
+                return
+
+            if not valid_design or not self._complete_support.any():
+                self.output_support[:] = False
+                fmri_img._dataobj = np.zeros_like(dataV, dtype=np.float32)
                 return
 
             # --- Update retroicor regressors ---------------------------------
@@ -517,22 +576,37 @@ class RtpRegress(RTP):
                                     ).to(self.device)
 
             # --- Run the procress --------------------------------------------
-            # Set Y_mean for scaling data
+            # Freeze a raw startup reference, independently of GLM units.
             if self.Y_mean is None:
-                # Scaling
                 YMtx = self.YMtx[self._proc_start_idx:vol_idx+1, :]
                 # YMtx is the reference to the original data, self.YMtx
-                self.Y_mean = YMtx.mean(axis=0)
-                self.Y_mean_mask = self.Y_mean.abs() > 1e-6
-
-                YMtx[:, self.Y_mean_mask] = \
-                    YMtx[:, self.Y_mean_mask] / \
-                    self.Y_mean[self.Y_mean_mask] * 100
-                YMtx[YMtx > 200] = 200
+                reference = np.divide(self._reference_sum, self._reference_count,
+                                      out=np.zeros_like(self._reference_sum),
+                                      where=self._reference_count > 0)
+                self.Y_mean = torch.as_tensor(reference, dtype=torch.float32, device=self.device)
+                self.raw_reference_mean = self.Y_mean
+                self.raw_reference_count = torch.as_tensor(
+                    self._reference_count.copy(), device=self.device)
+                self.raw_reference_valid = (
+                    torch.isfinite(self.Y_mean) & (self.raw_reference_count > 0) &
+                    torch.as_tensor(self._complete_support, device=self.device))
+                self.Y_mean_mask = self.raw_reference_valid.clone()
+                if self.scale_before_glm:
+                    self.Y_mean_mask &= self.Y_mean.abs() > 1e-6
+                    YMtx[:, self.Y_mean_mask] = \
+                        YMtx[:, self.Y_mean_mask] / \
+                        self.Y_mean[self.Y_mean_mask] * 100
+                    YMtx[YMtx > 200] = 200
                 YMtx[:, ~self.Y_mean_mask] = 0.0
-                # The operation is done on the original data,
-                # so no need to return like below
-                # ydata = self.YMtx[vol_idx, :]
+                self._reference_sum = None
+                self._reference_count = None
+            # The legacy first fit scales stored history in place, not the
+            # local input tensor. Always subtract predictions in matching units.
+            ydata = self.YMtx[vol_idx, :]
+            self.output_support[self.maskV] = self.Y_mean_mask.cpu().numpy()
+            if not self.Y_mean_mask.any():
+                fmri_img._dataobj = np.zeros_like(dataV, dtype=np.float32)
+                return
 
             # Add polynomials to the design matrix
             polyreg = self.poly_reg(vol_idx-self._proc_start_idx+1, self.TR)
@@ -545,6 +619,8 @@ class RtpRegress(RTP):
             # Extract a part of regressors (until the current volume)
             Xp = self.desMtx[self._proc_start_idx:vol_idx+1,
                              :reg0_num+polyreg_num].clone()
+            fit_rows = torch.as_tensor(
+                self._valid_design_rows[self._proc_start_idx:vol_idx+1], device=self.device)
 
             # Standardizing regressors of motion, GS, WM, Vent
             norm_regs = ('roll', 'pitch', 'yaw', 'dS', 'dL', 'dP',
@@ -553,19 +629,30 @@ class RtpRegress(RTP):
             for ii, reg_name in enumerate(self.reg_names):
                 if reg_name in norm_regs:
                     reg = Xp[:, ii]
-                    reg = (reg - reg.mean()) / reg.std()
+                    fit_reg = reg[fit_rows]
+                    scale = fit_reg.std()
+                    # A stationary motion/tissue regressor is a redundant
+                    # constant, not an undefined NaN column.
+                    reg = ((reg - fit_reg.mean()) / scale if scale > 1e-6
+                           else torch.zeros_like(reg))
                     Xp[:, ii] = reg
 
             # Extract a part of Y (until the current volume)
             Yp = self.YMtx[self._proc_start_idx:vol_idx+1, :]
 
             # Calculate Beta with the least sqare error, ||Y - XB||^2
-            Beta = lstsq_SVDsolver(Xp, Yp[:, self.Y_mean_mask])
+            fit_y = Yp[:, self.Y_mean_mask]
+            if self._valid_design_rows[self._proc_start_idx:vol_idx+1].all():
+                # The usual path needs no extra time-by-voxel matrix copy.
+                Beta = lstsq_SVDsolver(Xp, fit_y)
+            else:
+                Beta = lstsq_SVDsolver(Xp[fit_rows], fit_y[fit_rows])
             Yh = torch.matmul(Xp, Beta)
 
             if self.reg_retro_proc and self._vol_num == self.wait_num+1:
                 # Process (and save) the previous volumes retrospectively.
                 Resids = Yp[:, self.Y_mean_mask] - Yh
+                Resids[~fit_rows] = 0.
 
                 vi0 = vol_idx - (Resids.shape[0]-1)
                 vilast = vol_idx - 1
@@ -630,6 +717,7 @@ class RtpRegress(RTP):
             fmri_img.uncache()
             fmri_img._dataobj = vol_data
             fmri_img.set_data_dtype = vol_data.dtype
+            self.last_proc_ready = True
 
             # --- Post procress -----------------------------------------------
             # Record process time
@@ -674,6 +762,16 @@ class RtpRegress(RTP):
                                           save_temp=self.online_saving)
 
         except Exception:
+            # A failed frame is not a valid raw replacement for a residual.
+            # Preserve temporal/feature indexing, expose unavailable support,
+            # and let the wrapper report reg_ready=False for this frame.
+            self.last_proc_ready = False
+            self.output_support = np.zeros(fmri_img.shape[:3], dtype=bool)
+            if (self._valid_design_rows is not None and vol_idx is not None
+                    and 0 <= vol_idx < len(self._valid_design_rows)):
+                self._valid_design_rows[vol_idx] = False
+            fmri_img.uncache()
+            fmri_img._dataobj = np.zeros(fmri_img.shape[:3], dtype=np.float32)
             exc_type, exc_obj, exc_tb = sys.exc_info()
             errmsg = f'{exc_type}, {exc_tb.tb_frame.f_code.co_filename}' + \
                      f':{exc_tb.tb_lineno}'
@@ -695,6 +793,15 @@ class RtpRegress(RTP):
         self.YMtx = None
         self.Y_mean = None
         self.Y_mean_mask = None
+        self.raw_reference_mean = None
+        self.raw_reference_count = None
+        self.raw_reference_valid = None
+        self._reference_sum = None
+        self._reference_count = None
+        self._complete_support = None
+        self._valid_design_rows = None
+        self.output_support = None
+        self.last_proc_ready = False
         self.GS_maskdata = None
         self.WM_maskdata = None
         self.Vent_maskdata = None
@@ -1799,6 +1906,7 @@ class RtpRegress(RTP):
                       'mask_byte', 'retrocols', 'volreg', 'YMtx', 'TR',
                       'desMtx', 'maskV', 'motcols', 'rtp_retrots',
                       'col_names_read', 'Y_mean', 'Y_mean_mask', 'GS_maskdata',
+                      'raw_reference_mean', 'raw_reference_count', 'raw_reference_valid',
                       'WM_maskdata', 'Vent_maskdata', 'GS_col', 'WM_col',
                       'Vent_col', 'desMtx_read', 'mask_src_proc', 'work_dir')
         sel_opts = {}

@@ -1,4 +1,6 @@
 {
+  "epi_reference_n4": true,
+  "_comment_epi_reference_n4": "N4-correct a reference copy before spatial registration; keep the original MC target and incoming BOLD intensities.",
   "smoothing_fwhm_mm": 0.0,
   "analysis_mask": "whole_brain",
   "analysis_mask_file": null,

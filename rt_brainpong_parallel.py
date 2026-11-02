@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from brainpong_adapter import BrainPongScoreAdapter, BrainPongScoreState, PaddleDynamics, BinaryBrainPongScoreAdapter
 from task.Minjoo.brain_pong_inputs.binary import BalancedTargets, decoder_state, target_position
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import load_regressor_settings, add_registration_arguments, apply_registration_arguments
 
 
 log = logging.getLogger(__name__)
@@ -1199,6 +1199,7 @@ def main() -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
+    add_registration_arguments(parser)
     args = parser.parse_args()
 
     cfg = load_brainpong_settings(args.brainpong_settings)
@@ -1241,6 +1242,7 @@ def main() -> None:
     if uses_reference_score and runs_pipeline and not args.reference_score_run:
         parser.error("Brain-pong zscore_mode='reference' requires --rs REFERENCE_RUN")
     rt_settings = load_regressor_settings(args.settings_file) if args.settings_file else load_regressor_settings()
+    apply_registration_arguments(rt_settings, args)
     for key in ["TR", "analysis_space"]:
         if key in cfg and hasattr(rt_settings, key):
             setattr(rt_settings, key, cfg[key])
@@ -1252,6 +1254,8 @@ def main() -> None:
 
     if runs_pipeline:
         rt_cfg = _prepare_rt_config(args, cfg)
+        from rt_pipeline import prepare_nf_run
+        prepare_nf_run(rt_cfg, rt_settings)
         if uses_reference_score:
             from rt_pipeline import load_reference_score_stats
 
