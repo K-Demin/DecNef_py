@@ -123,7 +123,6 @@ def _wait_for_epi_dicoms(
     )
     while True:
         count = _count_epi_dicoms(incoming_dir, epi_block, keep_start, keep_end)
-        print(count, incoming_dir, epi_block, keep_start, keep_end, min_vols)
         if count >= min_vols:
             log.info("Detected %d EPI DICOMs; proceeding with preprocessing.", count)
             return
