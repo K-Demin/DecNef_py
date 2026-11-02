@@ -12,12 +12,15 @@ from rt_global_settings import load_regressor_settings
 
 
 @pytest.mark.parametrize("reference", ["fixed", "running"])
-@pytest.mark.parametrize("mode,regression,expected", [("zscore", True, 60), ("mean", True, 31),
-                                                      ("zscore", False, 31), ("mean", False, 31)])
-def test_startup_bound_includes_prior_calibration_values(mode, regression, expected, reference):
+@pytest.mark.parametrize("mode", ["zscore", "mean"])
+@pytest.mark.parametrize("regression", [True, False])
+@pytest.mark.parametrize("count", [2, 30, 60])
+def test_startup_bound_reuses_glm_history_without_second_calibration(mode, regression, reference, count):
     settings = SimpleNamespace(voxel_norm_mode=mode, voxel_norm_reference=reference,
-                               voxel_norm_ref_volumes=30, enable_motion_regression=regression)
-    assert normalization_startup_hint(settings)["first_score_volume_lower_bound"] == expected
+                               voxel_norm_ref_volumes=count, enable_motion_regression=regression)
+    hint = normalization_startup_hint(settings)
+    assert hint["first_score_volume_lower_bound"] == count + 1
+    assert hint["glm_first_ready_lower_bound"] == (count if regression else 1)
 
 
 def test_extending_presentation_baseline_moves_trial_window_without_changing_calibration():
@@ -26,7 +29,7 @@ def test_extending_presentation_baseline_moves_trial_window_without_changing_cal
     timing = dict(skip_first_trs=10, iti_trs=3, cue_trs=4, scans_trs=3, score_delay=3)
     assert first_trial_window_volumes(baseline_trs=30, **timing) == (47, 50)
     assert first_trial_window_volumes(baseline_trs=60, **timing) == (77, 80)
-    assert normalization_startup_hint(settings)["first_score_volume_lower_bound"] == 60
+    assert normalization_startup_hint(settings)["first_score_volume_lower_bound"] == 31
     assert settings.voxel_norm_ref_volumes == 30
 
 
@@ -78,7 +81,7 @@ def test_launcher_payload_preserves_json_window_when_cli_baseline_is_longer(tmp_
     assert settings.voxel_norm_ref_volumes == 30
 
 
-@pytest.mark.parametrize("requested", [0., 45., 75.])
+@pytest.mark.parametrize("requested", [0., 30., 31., 45., 75.])
 def test_robot_warns_without_extending_requested_lead(requested):
     filename = Path(__file__).resolve().parents[1] / "rt_robot_parallel.py"
     tree = ast.parse(filename.read_text(encoding="utf-8"))
@@ -105,4 +108,4 @@ def test_robot_warns_without_extending_requested_lead(requested):
                      log=SimpleNamespace(warning=lambda *args: warnings.append(args), info=lambda *args: None))
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(filename), "exec"), namespace)
     assert namespace["rest_lead_s"] == requested
-    assert bool(warnings) == (requested < 60)
+    assert bool(warnings) == (requested < 31)

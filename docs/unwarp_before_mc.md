@@ -7,7 +7,7 @@ The pipeline order is `unwarp_then_mc_v1`.
 3. Estimate PyHySCO's field from those native means.
 4. Apply that field to each incoming raw BOLD volume, using the configured AP or PA polarity.
 5. Motion-correct the unwarped volume to the fixed, corrected session reference (`func/trans/epi_unwarped_mean.nii[.gz]`).
-6. Compute motion/FD and DVARS, regress nuisance signals, and use the existing EPI-to-T1/MNI transforms and decoder.
+6. Compute motion/FD and DVARS on corrected EPI. Apply the selected spatial transforms and optional smoothing, then denoise and normalize on the final analysis grid before decoding. Nuisance signals retain their native, unsmoothed MC source.
 
 For a new session, offline preparation also unwarps before MC. Its first corrected BOLD volume supplies the initial MC target; the resulting aligned mean becomes the fixed online reference. Subsequent runs retain that reference. Changing the calibration pair does not rebuild anatomical segmentation, nuisance masks, or spatial transforms.
 
@@ -19,15 +19,15 @@ Existing corrected session references and their matching masks/transforms can be
 
 Use a fresh run output directory for replaying old processed runs. The pipeline rejects mixing old MC-first outputs, changed calibration, or a changed reference with a run's new products. To regenerate offline reference assets, prepare in a fresh day directory; do not overwrite a previous reference while retaining its transforms.
 
-Output names remain compatible with existing consumers:
+Current output products include:
 
 | Product | Contents |
 | --- | --- |
 | `raw/vol_*.nii` | Raw distorted BOLD |
 | `unwarped/vol_*_uw_native.nii` | Unwarped BOLD before MC, when intermediate saving is enabled (also written by file fallback) |
 | `mc/vol_*_mc.nii` | Unwarped and motion-corrected BOLD |
-| `reg/vol_*_reg.nii` | Native-unit cumulative-GLM output |
-| `norm/` | Post-GLM voxel-normalized EPI volume, before spatial transforms |
+| `reg/vol_*_reg.nii` | Original-intensity cumulative-GLM output on the final analysis grid |
+| `norm/` | Final normalized decoder features, after spatial mapping, optional smoothing and denoising |
 
 Fully corrected volumes are written once, in `mc/`. The `unwarped` PCA/stream option is a compatibility alias for this product; historical runs can still be read from their old `unwarped/vol_*_mc_uw.nii` paths. No duplicate is written for new runs. FD describes registration of corrected BOLD; DVARS uses corrected and aligned BOLD with the corrected reference mask.
 

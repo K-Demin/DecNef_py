@@ -98,7 +98,8 @@ class RtpRegress(RTP):
                  mask_src_proc=None, phys_reg='None', rtp_physio=None,
                  tshift=0.0, desMtx=None, wait_num=0, mask_file=0,
                  max_scan_length=800, onGPU=gpu_available, reg_retro_proc=True, spike_reg_num=200,
-                 scale_before_glm=True,
+                 scale_before_glm=True, startup_ref_volumes=None,
+                 startup_ref_reference='fixed',
                  **kwargs):
         """
         Parameters
@@ -179,6 +180,13 @@ class RtpRegress(RTP):
             False fits and returns residuals in native input units, including
             valid zero-mean signals. The frozen raw startup reference is
             exposed separately for optional normalization after regression.
+        startup_ref_volumes : int or None, optional
+            Export one-time residual moments from the first successful fit with
+            at least this many valid rows. None disables this export. No prior
+            volumes are replayed, saved again, or passed to the next processor.
+        startup_ref_reference : {'fixed', 'running'}, optional
+            Fixed uses the first startup_ref_volumes valid fitted rows; running
+            uses every valid fitted row available at that first fit.
 
         """
         super(RtpRegress, self).__init__(**kwargs)
@@ -210,6 +218,19 @@ class RtpRegress(RTP):
         self.onGPU = onGPU
         self.reg_retro_proc = reg_retro_proc
         self.scale_before_glm = bool(scale_before_glm)
+        if startup_ref_reference not in {'fixed', 'running'}:
+            raise ValueError('Startup residual reference must be fixed or running.')
+        if startup_ref_volumes is not None:
+            try:
+                n_startup = int(startup_ref_volumes)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError('Startup residual reference needs an integer count >= 2.') from exc
+            if (isinstance(startup_ref_volumes, (bool, np.bool_)) or
+                    n_startup != startup_ref_volumes or n_startup < 2):
+                raise ValueError('Startup residual reference needs an integer count >= 2.')
+            startup_ref_volumes = n_startup
+        self.startup_ref_volumes = startup_ref_volumes
+        self.startup_ref_reference = startup_ref_reference
         self.wait_num = wait_num
 
         self.spike_reg_num = int(spike_reg_num) if spike_reg_num else 0
@@ -244,6 +265,8 @@ class RtpRegress(RTP):
         self._valid_design_rows = None
         self.output_support = None
         self.last_proc_ready = False
+        self.startup_residual_moments = None
+        self._startup_reference_generated = False
 
         # --- Set the number of volumes to wait ---
         self.set_wait_num()
@@ -317,10 +340,15 @@ class RtpRegress(RTP):
         return self._proc_ready
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-    def do_proc(self, fmri_img, vol_idx=None, pre_proc_time=None, **kwargs):
+    def do_proc(self, fmri_img, vol_idx=None, pre_proc_time=None,
+                nuisance_means=None, **kwargs):
         """
         vol_idx: 0-based index of imaging volume from the scan start
         self._vol_num: Number of volumes received in this module.
+        nuisance_means: optional per-volume dictionary of GS/WM/Vent scalars
+            extracted independently of the response image grid. Enabled
+            regressors require finite scalar values; missing/nonfinite values
+            invalidate this design row. None retains mask_src_proc extraction.
         """
 
         self.last_proc_ready = False
@@ -374,7 +402,7 @@ class RtpRegress(RTP):
             fmri_img._dataobj = masked_input
 
             # Read global signal mask
-            if self.GS_reg and self.GS_maskdata is None:
+            if nuisance_means is None and self.GS_reg and self.GS_maskdata is None:
                 if Path(self.GS_mask).is_file():
                     GSimg = nib.load(self.GS_mask)
                     if not np.all(dataV.shape == GSimg.shape):
@@ -394,7 +422,7 @@ class RtpRegress(RTP):
                     return
 
             # Read WM mask
-            if self.WM_reg and self.WM_maskdata is None:
+            if nuisance_means is None and self.WM_reg and self.WM_maskdata is None:
                 if Path(self.WM_mask).is_file():
                     WMimg = nib.load(self.WM_mask)
                     if not np.all(dataV.shape == WMimg.shape):
@@ -413,7 +441,7 @@ class RtpRegress(RTP):
                     return
 
             # Read ventricle mask
-            if self.Vent_reg and self.Vent_maskdata is None:
+            if nuisance_means is None and self.Vent_reg and self.Vent_maskdata is None:
                 if Path(self.Vent_mask).is_file():
                     Ventimg = nib.load(self.Vent_mask)
                     if not np.all(dataV.shape == Ventimg.shape):
@@ -530,21 +558,31 @@ class RtpRegress(RTP):
                 else:
                     self._logger.warning("Ran out of preallocated spike regressors; censor event ignored.")
 
-            # Append mask mean signal regressor from mask_src_proc
+            # Optional native-space means are independent of response geometry.
+            # Legacy callers still extract from mask_src_proc on this grid.
             valid_design = True
             if self.GS_reg or self.WM_reg or self.Vent_reg:
-                msk_src_data = self.mask_src_proc.proc_data[self.maskV]
+                if nuisance_means is None:
+                    msk_src_data = self.mask_src_proc.proc_data[self.maskV]
                 for label in ('GS', 'WM', 'Vent'):
                     if not getattr(self, label + '_reg'):
                         continue
-                    tissue = getattr(self, label + '_maskdata') & observed
-                    values = msk_src_data[tissue]
-                    if not values.size or not np.isfinite(values).all():
+                    if nuisance_means is None:
+                        tissue = getattr(self, label + '_maskdata') & observed
+                        values = msk_src_data[tissue]
+                        valid_mean = bool(values.size and np.isfinite(values).all())
+                        mean_value = float(values.mean()) if valid_mean else np.nan
+                    else:
+                        value = np.asarray(nuisance_means.get(label, np.nan))
+                        valid_mean = (value.ndim == 0 and value.dtype.kind in 'iuf'
+                                      and bool(np.isfinite(value)))
+                        mean_value = float(value) if valid_mean else np.nan
+                    if not valid_mean:
                         self._logger.error(f'No finite acquired {label} signal at volume {vol_idx+1}; '
                                            'excluding this time point from nuisance fitting.')
                         valid_design = False
                     else:
-                        self.desMtx[vol_idx, getattr(self, label + '_col')] = float(values.mean())
+                        self.desMtx[vol_idx, getattr(self, label + '_col')] = mean_value
             self._valid_design_rows[vol_idx] = valid_design
 
             # --- If the number of samples is not enough, return --------------
@@ -648,6 +686,7 @@ class RtpRegress(RTP):
             else:
                 Beta = lstsq_SVDsolver(Xp[fit_rows], fit_y[fit_rows])
             Yh = torch.matmul(Xp, Beta)
+            startup_moments = self._make_startup_residual_moments(fit_y, Yh, fit_rows)
 
             if self.reg_retro_proc and self._vol_num == self.wait_num+1:
                 # Process (and save) the previous volumes retrospectively.
@@ -761,6 +800,12 @@ class RtpRegress(RTP):
                 self.keep_processed_image(fmri_img,
                                           save_temp=self.online_saving)
 
+            # Publish only after this fit completed successfully. The caller can
+            # consume and clear the payload without triggering another export.
+            if startup_moments is not None:
+                self.startup_residual_moments = startup_moments
+                self._startup_reference_generated = True
+
         except Exception:
             # A failed frame is not a valid raw replacement for a residual.
             # Preserve temporal/feature indexing, expose unavailable support,
@@ -777,6 +822,36 @@ class RtpRegress(RTP):
                      f':{exc_tb.tb_lineno}'
             self._logger.error(errmsg)
             traceback.print_exc(file=self._err_out)
+
+    def _make_startup_residual_moments(self, fitted_data, prediction, fit_rows):
+        """Reduce the existing fit history; do not refit or replay volumes."""
+        if self.startup_ref_volumes is None or self._startup_reference_generated:
+            return None
+        rows = torch.nonzero(fit_rows, as_tuple=False).flatten()
+        if rows.numel() < self.startup_ref_volumes:
+            return None
+        if self.startup_ref_reference == 'fixed':
+            rows = rows[:self.startup_ref_volumes]
+        count = int(rows.numel())
+        if bool(fit_rows[:count].all()):
+            # Usual case: views avoid two additional time-by-voxel copies.
+            residuals = fitted_data[:count] - prediction[:count]
+        else:
+            residuals = (fitted_data.index_select(0, rows) -
+                         prediction.index_select(0, rows))
+        variance, mean = torch.var_mean(residuals, dim=0, unbiased=False)
+        if not (torch.isfinite(mean).all() and torch.isfinite(variance).all()):
+            raise ValueError('Nonfinite startup residual moments.')
+        # Transfer only per-voxel moments, not the full time-by-voxel history.
+        support = np.zeros_like(self.maskV, dtype=bool)
+        support[self.maskV] = self.Y_mean_mask.detach().cpu().numpy()
+        means = np.zeros(self.maskV.shape, dtype=np.float64)
+        m2 = np.zeros(self.maskV.shape, dtype=np.float64)
+        counts = np.zeros(self.maskV.shape, dtype=np.int64)
+        means[support] = mean.detach().cpu().numpy()
+        m2[support] = variance.detach().cpu().numpy().astype(np.float64) * count
+        counts[support] = count
+        return dict(mean=means, m2=m2, count=counts, reference_count=count)
 
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def end_reset(self):
@@ -802,6 +877,8 @@ class RtpRegress(RTP):
         self._valid_design_rows = None
         self.output_support = None
         self.last_proc_ready = False
+        self.startup_residual_moments = None
+        self._startup_reference_generated = False
         self.GS_maskdata = None
         self.WM_maskdata = None
         self.Vent_maskdata = None
@@ -1907,6 +1984,7 @@ class RtpRegress(RTP):
                       'desMtx', 'maskV', 'motcols', 'rtp_retrots',
                       'col_names_read', 'Y_mean', 'Y_mean_mask', 'GS_maskdata',
                       'raw_reference_mean', 'raw_reference_count', 'raw_reference_valid',
+                      'startup_residual_moments',
                       'WM_maskdata', 'Vent_maskdata', 'GS_col', 'WM_col',
                       'Vent_col', 'desMtx_read', 'mask_src_proc', 'work_dir')
         sel_opts = {}

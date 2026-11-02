@@ -1,7 +1,8 @@
 """Pure ANTs command plans with explicit image-resampling directions.
 
-The anatomical recipe restores the Affine and SyN schedules in June commit
+The anatomical recipe retains the Affine and SyN schedules in June commit
 30e6b5d and September commit 0335a2e, with the Rigid stage added in 71381f0.
+Dense MI evaluation replaces the sampling-sensitive 20% anatomical metric.
 Fixed/moving mask and initialization order are corrected in either direction.
 Building a plan does not run ANTs or establish anatomical alignment quality.
 """
@@ -9,14 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-ANATOMICAL_RECIPE = "rigid_affine_syn_historical_v1"
+ANATOMICAL_RECIPE = "rigid_affine_syn_dense_v1"
 BRIDGE_RECIPE = "session_reference_rigid_v1"
 OUTPUT_SUFFIXES = ("Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii")
 
 # transform, convergence, shrink factors, smoothing sigmas, metric sampling
-_RIGID = ("Rigid[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", "Regular,0.2")
-_AFFINE = ("Affine[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", "Regular,0.2")
-_SYN = ("SyN[0.1,1,0]", "[100x70x50x20,1e-7,15]", "6x4x2x1", "3x2x1x0vox", "Regular,0.2")
+_RIGID = ("Rigid[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", "None,1")
+_AFFINE = ("Affine[0.1]", "[1000x500x250x100,1e-7,15]", "8x4x2x1", "3x2x1x0vox", "None,1")
+_SYN = ("SyN[0.1,1,0]", "[100x70x50x20,1e-7,15]", "6x4x2x1", "3x2x1x0vox", "None,1")
 _BRIDGE_RIGID = ("Rigid[0.1]", "[500x250x50,1e-6,10]", "2x2x1", "2x1x0vox", "Regular,0.2")
 
 

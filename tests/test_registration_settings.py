@@ -192,7 +192,10 @@ def test_preparation_refuses_cache_before_staging_or_config_write(tmp_path, monk
     assert calls[0].registration_direction == 'epi_to_t1'
 
 
-def test_preparation_records_profile_selection_only_after_preflight(tmp_path, monkeypatch):
+@pytest.mark.parametrize('qc_decoder_exists', [False, True],
+                         ids=['no_qc_decoder', 'qc_decoder_present'])
+def test_preparation_records_profile_selection_only_after_preflight(
+        tmp_path, monkeypatch, qc_decoder_exists):
     cfg = session_config(tmp_path, monkeypatch)
     for path in (cfg.ap_file, cfg.pa_file, cfg.t1_file, cfg.runs[0].epi_file):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +206,14 @@ def test_preparation_records_profile_selection_only_after_preflight(tmp_path, mo
     profile.write_text(json.dumps({'registration_initialization': 'center_of_mass', 'registration_syn': True,
                                   'epi_phase_encoding': 'AP', 'fieldmap_method': 'pyhysco'}))
     checks = []
+    qc_decoder = Path('/SSD2/DecNef_py/decoders/rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii')
+    original_exists = Path.exists
+
+    def exists(path):
+        # Exercise both branches independently of decoder files on the host.
+        return qc_decoder_exists if path == qc_decoder else original_exists(path)
+
+    monkeypatch.setattr(Path, 'exists', exists)
 
     class Pipeline:
         def __init__(self, request):
@@ -221,6 +232,12 @@ def test_preparation_records_profile_selection_only_after_preflight(tmp_path, mo
             assert 'registration_mode' not in recorded and 'partial_epi_syn' not in recorded
             checks.append('run')
 
+        def qc_plot_epi_in_mni(self, run_dir, *, decoder_path):
+            assert checks == ['preflight', 'preflight', 'run']
+            assert run_dir == cfg.runs[0].epi_file.parent
+            assert decoder_path == qc_decoder
+            checks.append('qc')
+
     monkeypatch.setitem(sys.modules, 'fmri_rt_preproc.pipeline',
                         SimpleNamespace(FMRIRealtimePreprocessor=Pipeline))
     script = load_script('run_preproc')
@@ -228,7 +245,7 @@ def test_preparation_records_profile_selection_only_after_preflight(tmp_path, mo
     monkeypatch.setattr(sys, 'argv', ['run_preproc.py', '--sub', '001', '--day', 'day',
         '--base-data', str(tmp_path), '--settings-file', str(profile)])
     script.main()
-    assert checks == ['preflight', 'preflight', 'run']
+    assert checks == ['preflight', 'preflight', 'run'] + (['qc'] if qc_decoder_exists else [])
 
 
 @pytest.mark.parametrize('launcher', ['run_preproc', 'rs_realtime_parallel', 'rs_pca_score_all_rois'])

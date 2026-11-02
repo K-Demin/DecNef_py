@@ -35,7 +35,7 @@ SEED = 0
 # Choose which data to use for PCA (NOT for tSNR):
 #   "auto" : prefer final normalized/denoised stream (legacy: reg/, then mc/)
 #   "mc"   : force motion-corrected only (avoid regressed/denoised)
-#   "reg"  : normalized EPI stream (norm/ or bridged epi_ref/; legacy: reg/)
+#   "reg"  : final normalized stream (new order: norm/ in the analysis grid)
 #   "t1"   : force T1-space realtime outputs
 PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg", "t1"
 SEPARATE_OUTPUTS_BY_MODE = True  # True => write outputs under .../PCA/<run>/pca_<mode>/
@@ -73,6 +73,7 @@ from dataclasses import dataclass
 from importlib import util
 from pathlib import Path
 from fmri_rt_preproc.processing_mask import upstream_processing_spec
+from rs_pca_runtime import final_normalized_series
 from typing import Iterable, List, Optional, Sequence, Tuple
 import time
 
@@ -277,16 +278,28 @@ def _modern_series_4d(run_dir: Path, folder: str, suffix: str, info: dict) -> Pa
 def _discover_modern_rs_inputs(run_dir: Path, pca_mode: str, info: dict) -> Tuple[Path, Path]:
     space = info.get("regression", {}).get("analysis_space", "mni")
     mapped = space == "epi" and info.get("epi_reference_mapped", False)
-    kind = ("epi_ref" if mapped else "norm") if pca_mode in {"auto", "reg"} else pca_mode
-    pca_rs = _modern_series_4d(run_dir, kind, kind, info)
-    if kind in {"norm", "mc"} or (kind in {"smooth", "masked"} and space == "epi" and not mapped):
-        original_folder = original_suffix = "mc"
+    final_series = final_normalized_series(info, pca_mode)
+    if final_series is not None:
+        # Spatial stages now contain original intensities; norm/ is already
+        # denoised and normalized in that same final analysis grid.
+        folder, suffix = final_series
+        original_folder = original_suffix = ("epi_ref" if mapped else "mc") if space == "epi" else space
     else:
-        original_folder = ("epi_ref" if mapped else space) if kind in {"smooth", "masked"} else kind
-        original_suffix = original_folder + "_orig"
+        folder = suffix = ("epi_ref" if mapped else "norm") if pca_mode in {"auto", "reg"} else pca_mode
+        if folder in {"norm", "mc"} or (folder in {"smooth", "masked"} and space == "epi" and not mapped):
+            original_folder = original_suffix = "mc"
+        else:
+            original_folder = ("epi_ref" if mapped else space) if folder in {"smooth", "masked"} else folder
+            original_suffix = original_folder + "_orig"
+    pca_rs = _modern_series_4d(run_dir, folder, suffix, info)
     try:
         tsnr_rs = _modern_series_4d(run_dir, original_folder, original_suffix, info)
     except FileNotFoundError as exc:
+        if final_series is not None:
+            raise FileNotFoundError(
+                "PCA preparation needs pre-denoising original-intensity data in the final grid for tSNR; "
+                f"expected {original_folder}/vol_*_{original_suffix}.nii[.gz]."
+            ) from exc
         raise FileNotFoundError(
             "Modern PCA preparation needs original-intensity data in the same grid for tSNR voxel ranking; "
             "normalized residuals cannot supply tSNR. Keep mc/ for native EPI, or use "
@@ -308,12 +321,19 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
         (from 3D series if needed)
     """
     pca_mode = (pca_mode or "auto").lower()
+    metadata = run_dir / "session_metadata.json"
+    info = json.loads(metadata.read_text(encoding="utf-8")) if metadata.exists() else None
+    if info is not None and info.get("temporal_processing_order") == "spatial_smooth_glm_norm_v1":
+        if pca_mode not in {"auto", "mc", "unwarped", "reg", "norm", "t1", "mni", "epi_ref", "smooth", "masked"}:
+            pca_mode = "auto"
+        if final_normalized_series(info, pca_mode) is not None:
+            return _discover_modern_rs_inputs(run_dir, pca_mode, info)
+        if pca_mode == "unwarped":
+            pca_mode = "mc"
     if pca_mode not in ("auto", "mc", "reg", "t1", "smooth", "masked"):
         pca_mode = "auto"
 
-    metadata = run_dir / "session_metadata.json"
     if metadata.exists():
-        info = json.loads(metadata.read_text(encoding="utf-8"))
         space = info.get("regression", {}).get("analysis_space", "mni")
         final_kind = "reg" if space == "epi" else space
         output_kind = final_output_kind(info.get("smoothing_fwhm_mm", 0), info.get("analysis_mask", "whole_brain"))
@@ -737,9 +757,19 @@ def _load_regression_keep_mask(
     return keep, meta
 
 
+def _pca_reference_space(run_dir: Path, pca_input_mode: str) -> str:
+    """Resolve aliases such as reg to the actual grid used for ROI placement."""
+    path = run_dir / "session_metadata.json"
+    if path.exists():
+        info = json.loads(path.read_text(encoding="utf-8"))
+        if final_normalized_series(info, pca_input_mode) is not None:
+            return info["final_output"]["space"]
+    return pca_input_mode
+
+
 def _requires_regression_ready_filter(pca_input_mode: str, pca_rs_path: Optional[Path] = None) -> bool:
     mode = str(pca_input_mode).lower()
-    if mode in {"reg", "t1", "smooth", "masked"}:
+    if mode in {"reg", "norm", "epi_ref", "t1", "mni", "smooth", "masked"}:
         return True
     if pca_rs_path is None:
         return False
@@ -1015,6 +1045,7 @@ def process_dataset(
     gm_mask_path = _discover_optional_mask(mask_dirs, ["gm_mask", "gmmask", "ribbon", "gm"])
 
     pca_rs_path, tsnr_rs_path = _discover_rs_inputs(run_dir, PCA_INPUT_MODE)
+    reference_space = _pca_reference_space(run_dir, PCA_INPUT_MODE)
     tsnr_data, tsnr_affine, tsnr_hdr = _load_nifti(tsnr_rs_path)
     print("[DEBUG PCA INPUT]")
     print("  pca_rs_path =", pca_rs_path)
@@ -1128,7 +1159,7 @@ def process_dataset(
             gm_mask,
             roi_dir,
             run_dir,
-            reference_space=PCA_INPUT_MODE,
+            reference_space=reference_space,
         )
 
         vox_orig = int(np.sum(roi_original_mask))
@@ -1637,6 +1668,11 @@ def _load_mask_in_epi_space(
     """
     # First try direct load
     data, aff, _ = _load_nifti(roi_mask_path)
+    if reference_space.lower() == "mni":
+        if data.shape != tsnr_map_3d.shape or not _affine_close(aff, tsnr_img_3d.affine):
+            raise ValueError("MNI PCA requires an ROI mask in the final MNI reference grid; "
+                             "a T1-to-EPI mask transform cannot place it there.")
+        return (data > 0), aff
     if data.shape == tsnr_map_3d.shape:
         return (data > 0), aff
 

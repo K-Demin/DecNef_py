@@ -61,11 +61,15 @@ def test_epi_bridge_maps_cleaned_original_and_support_before_scoring(session_cfg
     brain = np.ones(shape, bool)
     brain[0, 0] = False
     valid = support & brain
+    target_brain = np.pad(brain, ((1, 1), (0, 0), (0, 0)))
+    target_valid = np.pad(valid, ((1, 1), (0, 0), (0, 0)))
+    handler.processing_mask = handler.final_brain_mask = target_brain
     handler.volreg = SimpleNamespace(do_proc=lambda *args, **kwargs: None,
         _motion=np.zeros((1, 6)), resample_support=lambda data, idx: support.astype(float))
     handler.biopac_receiver = None
-    handler.motion_regressor = SimpleNamespace(apply=lambda *args, **kwargs: (np.full(shape, -2.), True),
-        get_regressors=lambda idx: ([], None), output_support=valid, brain_mask=brain)
+    handler.motion_regressor = SimpleNamespace(apply=lambda *args, **kwargs: (np.full(target_shape, -2.), True),
+        get_regressors=lambda idx: ([], None), output_support=target_valid, brain_mask=target_brain,
+        take_startup_reference=lambda: None)
     handler.smoother = MaskedGaussianSmoother(np.ones(target_shape, bool), np.eye(4), fwhm) if fwhm else None
     if fwhm:
         (cfg.rt_work_dir / "smooth").mkdir()
@@ -110,7 +114,7 @@ def test_epi_bridge_maps_cleaned_original_and_support_before_scoring(session_cfg
         np.testing.assert_array_equal(data[~expected], 0.)
     np.testing.assert_array_equal(nib.load(cfg.rt_work_dir / "support" / "vol_00001_epi_ref.nii").get_fdata(), expected)
     assert not list((cfg.rt_work_dir / "epi_ref").glob(".vol*"))
-    assert (len(calls) == 4) if not gpu else (len(calls) == 0)
+    assert (len(calls) == 3) if not gpu else (len(calls) == 0)
 
 
 def test_epi_decoder_grid_mismatch_rejected_even_when_shape_matches(session_cfg):

@@ -188,6 +188,19 @@ class DecoderScorer:
 
     # ---------- Scoring ----------
 
+    def contributions_from_array(self, vol_arr: np.ndarray) -> np.ndarray:
+        """Voxel terms of the raw linear score, excluding the scalar bias.
+
+        Use the effective ROI weights, including ROI-TXT overrides. This is
+        stateless: extracting a map must not score/consume a volume again.
+        """
+        values = np.asanyarray(vol_arr, dtype=np.float32)
+        if values.shape != self.mask.shape:
+            raise ValueError("Contribution volume must match the decoder grid.")
+        contributions = np.zeros(values.shape, dtype=np.float32)
+        contributions[self.mask] = values[self.mask] * self.w
+        return contributions
+
     def score_from_array(self, vol_arr: np.ndarray):
         """
         vol_arr: 3D volume in the same space as the decoder/ROI.

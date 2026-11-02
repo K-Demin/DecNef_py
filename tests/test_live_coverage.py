@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import nibabel as nib
 import numpy as np
 import pytest
-from scipy.ndimage import shift
+from scipy.ndimage import shift, gaussian_filter
 
 import test_rt_pipeline_parallel as headless
 import rt_pipeline as rt
@@ -60,13 +60,15 @@ def test_missing_mc_slices_do_not_enter_final_image_or_smoothing(tmp_path, monke
         return data, True
 
     brain = np.ones(shape, bool)
-    eligible = support.astype(bool)
+    eligible = (support.astype(bool) if space == "epi" else shift(
+        support, (0, 0, -.25), order=1, mode="constant", cval=0, prefilter=False) >= rt.SUPPORT_THRESHOLD)
     if brain_and_history:
         brain[0] = False  # Acquired extracranial voxels are not brain support.
         eligible &= brain
         eligible[:, 0] = False  # A prior unavailable sample excludes this GLM voxel.
     handler.motion_regressor = SimpleNamespace(apply=regress, get_regressors=lambda idx: ([], None),
-        output_support=eligible, brain_mask=brain)
+        output_support=eligible, brain_mask=brain, take_startup_reference=lambda: None)
+    handler.processing_mask = handler.final_brain_mask = brain
     decoder_mask = np.ones(shape, bool)
     handler.scorer = SimpleNamespace(mask=decoder_mask)
     kind = "smooth" if fwhm else "masked"
@@ -89,7 +91,7 @@ def test_missing_mc_slices_do_not_enter_final_image_or_smoothing(tmp_path, monke
 
     def apply_file(source, destination):
         data = nib.load(source).get_fdata()
-        if Path(source).parent.name == "norm":
+        if Path(source).parent.name == "mc":
             transform_inputs.append(data.copy())
         nib.save(nib.Nifti1Image(transform(data), np.eye(4)), destination)
 
@@ -112,22 +114,30 @@ def test_missing_mc_slices_do_not_enter_final_image_or_smoothing(tmp_path, monke
     def mapped(mask):
         return mask if space == "epi" else shift(mask.astype(float), (0, 0, -.25),
             order=1, mode="constant", cval=0, prefilter=False) >= rt.SUPPORT_THRESHOLD
-    expected_cleaned = mapped(eligible)
-    expected_orig = mapped(brain & support.astype(bool))
+    expected_cleaned = eligible
+    expected_orig = brain & expected_support
     coverage = tmp_path / "coverage" / f"vol_00001_{space}.nii"
     np.testing.assert_array_equal(nib.load(coverage).get_fdata(), expected_support)
     np.testing.assert_array_equal(nib.load(tmp_path / "support" / f"vol_00001_{space}.nii").get_fdata(),
                                   expected_cleaned)
+    original_support_path = tmp_path / "support_original" / f"vol_00001_{space}.nii"
+    if not np.array_equal(expected_orig, expected_cleaned):
+        np.testing.assert_array_equal(nib.load(original_support_path).get_fdata(), expected_orig)
+    else:
+        assert not original_support_path.exists()
     cleaned = nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata()
     np.testing.assert_array_equal(cleaned[..., -1], 0)
     np.testing.assert_array_equal(cleaned[~eligible], 0)
     if space != "epi":
-        assert len(transform_inputs) == 1
+        assert len(transform_inputs) == 2
         np.testing.assert_array_equal(transform_inputs[0][..., -1], 0)
-    for suffix, value, final_valid in (("", -4, expected_cleaned), ("_orig", 7, expected_orig)):
+    for suffix, value, final_valid in (("", 7, expected_orig), ("_orig", 7, expected_orig)):
         final = nib.load(tmp_path / kind / f"vol_00001_{kind}{suffix}.nii").get_fdata()
         np.testing.assert_allclose(final[final_valid], value, atol=1e-6)
         np.testing.assert_array_equal(final[~final_valid], 0)
+    normalized = nib.load(tmp_path / "norm" / "vol_00001_norm.nii").get_fdata()
+    np.testing.assert_array_equal(normalized[expected_cleaned], -4)
+    np.testing.assert_array_equal(normalized[~expected_cleaned], 0)
     with (tmp_path / "coverage_rt.csv").open() as stream:
         row = next(csv.DictReader(stream))
     assert int(row["brain_voxels"]) == brain.sum()
@@ -138,13 +148,13 @@ def test_missing_mc_slices_do_not_enter_final_image_or_smoothing(tmp_path, monke
     assert handler.decoder_support_complete is False
     assert handler.scorer.mask is decoder_mask  # No feature squeezing/reweighting.
     # Identical acquisition/analysis/original support is resampled only once.
-    assert len(support_transforms) == (0 if space == "epi" else 3 if brain_and_history else 1)
+    assert len(support_transforms) == (0 if space == "epi" else 1)
     assert streamed[0][0] == 1
     assert streamed[0][1] == cfg.rt_mc_dir / "vol_00001_mc.nii"
     assert streamed[0][2] == (tmp_path / "t1" / "vol_00001_t1.nii" if space == "t1" else None)
     if space == "t1":
         before_smoothing = nib.load(streamed[0][2]).get_fdata()
-        np.testing.assert_array_equal(before_smoothing[~expected_cleaned], 0)
+        np.testing.assert_array_equal(before_smoothing[~expected_orig], 0)
 
 
 def test_unavailable_zero_is_not_inferred_from_residual_value(tmp_path):
@@ -169,8 +179,9 @@ def test_dvars_excludes_entering_and_leaving_acquisition_coverage():
 
 @pytest.mark.parametrize("mode", ["zscore", "mean"])
 @pytest.mark.parametrize("reference", ["fixed", "running"])
-def test_native_glm_then_prior_sample_normalization_then_mapping_and_score(
-        tmp_path, monkeypatch, mode, reference):
+@pytest.mark.parametrize("fwhm", [0, 3])
+def test_spatial_smoothing_glm_then_prior_normalization_and_score(
+        tmp_path, monkeypatch, mode, reference, fwhm):
     # Execute the real CPU Torch GLM and real normalizer, with only scanner/MC/
     # spatial native-library work replaced by known synthetic operators.
     from test_regression_coverage import _wrapper
@@ -197,23 +208,46 @@ def test_native_glm_then_prior_sample_normalization_then_mapping_and_score(
     offset = np.arange(np.prod(shape)).reshape(shape) / 3.
     timecourse = np.array([1000., 1100., 950., 1300., 900., 1050., 1500., 980., 1250., 1020.])
     native = np.asarray([value * gain + offset for value in timecourse], dtype=np.float32)
+    native += np.random.default_rng(72).normal(0, 5, native.shape).astype(np.float32)
+    target_affine = np.diag([2., 2., 2., 1.])
+    def spatial(values):
+        return np.pad(np.flip(values, axis=0), ((1, 1), (0, 0), (0, 0)))
+    final_brain = spatial(brain)
+    final_valid = spatial(valid)
+    target_shape = final_brain.shape
+    mapped_history = np.asarray([np.where(final_valid, spatial(v), 0) for v in native])
+    if fwhm:
+        sigma = fwhm / (np.sqrt(8 * np.log(2)) * 2.)
+        denominator = gaussian_filter(final_valid.astype(float), sigma, mode="constant", cval=0)
+        responses = np.asarray([np.where(final_valid, gaussian_filter(v, sigma, mode="constant", cval=0) /
+                               np.maximum(denominator, 1e-12), 0) for v in mapped_history], dtype=np.float32)
+    else:
+        responses = mapped_history.copy()
     ref_path = tmp_path / "reference.nii"
     nib.save(nib.Nifti1Image(native[0], np.eye(4)), ref_path)
-    cfg.rt_motion_ref_epi = cfg.decoder_template = ref_path
+    cfg.rt_motion_ref_epi = ref_path
+    cfg.decoder_template = tmp_path / "target.nii"
+    nib.save(nib.Nifti1Image(spatial(native[0]), target_affine), cfg.decoder_template)
     handler.pyhysco_applier = SimpleNamespace(apply_volume=lambda data: data)
     handler.volreg = SimpleNamespace(do_proc=lambda *args, **kwargs: None,
         _motion=np.zeros((len(native), 6)), resample_support=lambda data, idx: acquired.astype(float))
     handler.biopac_receiver = None
-    handler.motion_regressor = _wrapper(tmp_path, brain, n=4, motion="None", scale_before_glm=False)
+    handler.motion_regressor = _wrapper(tmp_path, final_brain, n=4, motion="None", scale_before_glm=False,
+                                       normalization_mode=mode, normalization_reference=reference)
+    # Model a design that becomes fit-ready after the requested three samples.
+    handler.motion_regressor._regress.startup_ref_volumes = 3 if mode == "zscore" else None
     handler.motion_regressor._regress.mask_src_proc = handler.proc_src
-    handler.voxel_normalizer = VoxelNormalizer(mode, reference, 3, brain)
-    handler.smoother = None
+    handler.voxel_normalizer = VoxelNormalizer(mode, reference, 3, final_brain)
+    handler.processing_mask = handler.final_brain_mask = final_brain
+    handler.smoother = MaskedGaussianSmoother(final_brain, target_affine, fwhm) if fwhm else None
+    if fwhm:
+        (tmp_path / "smooth").mkdir()
     handler.gpu_resampler = None
     handler.volume_streamer = SimpleNamespace(publish=lambda *args: None)
     handler.reference_score_stats = None
     handler.score_event_tracker = SimpleNamespace(for_volume=lambda idx: None)
     scored, baseline = [], []
-    score_mask = np.flip(valid, axis=0)
+    score_mask = final_valid
 
     def score(data):
         scored.append(data.copy())
@@ -235,7 +269,7 @@ def test_native_glm_then_prior_sample_normalization_then_mapping_and_score(
         if source.parent.name == "norm":
             transformed_normalized.append(data.copy())
         # An exactly known spatial permutation preserves values and support.
-        nib.save(nib.Nifti1Image(np.flip(data, axis=0).copy(), np.eye(4)), destination)
+        nib.save(nib.Nifti1Image(spatial(data), target_affine), destination)
 
     monkeypatch.setattr(rt, "run", run)
     monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", SimpleNamespace(
@@ -251,35 +285,39 @@ def test_native_glm_then_prior_sample_normalization_then_mapping_and_score(
         glm_ready = index >= 4
         if glm_ready:
             design = np.column_stack((np.ones(index), np.linspace(-1., 1., index)))
-            target = native[:index, valid].astype(np.float64)
-            native_residual = target[-1] - design[-1] @ np.linalg.lstsq(design, target, rcond=None)[0]
+            target = responses[:index, final_valid].astype(np.float64)
+            fitted_residuals = target - design @ np.linalg.lstsq(design, target, rcond=None)[0]
+            native_residual = fitted_residuals[-1]
         else:
-            native_residual = frame[valid]
-        expected_reg = np.zeros(shape)
-        expected_reg[valid] = native_residual
-        expected_norm = np.zeros(shape)
+            native_residual = responses[index - 1][final_valid]
+        expected_reg = np.zeros(target_shape)
+        expected_reg[final_valid] = native_residual
+        expected_norm = np.zeros(target_shape)
         ready = glm_ready and len(history) >= 3
         expected_ready.append(ready)
         expected_prior_counts.append(len(history))
         if ready:
             samples = np.asarray(history)
             if mode == "zscore":
-                expected_norm[valid] = (native_residual - samples.mean(axis=0)) / samples.std(axis=0, ddof=1)
+                expected_norm[final_valid] = (native_residual - samples.mean(axis=0)) / samples.std(axis=0, ddof=1)
             else:
-                expected_norm[valid] = 100. * native_residual / samples.mean(axis=0)
-            expected_scores.append(np.flip(expected_norm, axis=0))
+                expected_norm[final_valid] = 100. * native_residual / samples.mean(axis=0)
+            expected_scores.append(expected_norm.copy())
         assert rt.process_volume(cfg, handler, source, index, raw_nii=source, volume_timestamp=float(index))
         np.testing.assert_allclose(nib.load(cfg.rt_reg_dir / f"vol_{index:05d}_reg.nii").get_fdata(),
                                    expected_reg, atol=.002, rtol=1e-5)
         normalized = nib.load(tmp_path / "norm" / f"vol_{index:05d}_norm.nii").get_fdata()
         np.testing.assert_allclose(normalized, expected_norm, atol=.002, rtol=1e-5)
         mapped = nib.load(tmp_path / "t1" / f"vol_{index:05d}_t1.nii").get_fdata()
-        np.testing.assert_allclose(mapped, np.flip(expected_norm, axis=0), atol=.002, rtol=1e-5)
+        np.testing.assert_allclose(mapped, mapped_history[index - 1], atol=.002, rtol=1e-5)
+        np.testing.assert_array_equal(nib.load(tmp_path / "norm" / f"vol_{index:05d}_norm.nii").affine, target_affine)
         assert handler.score_queue.get_nowait()["reg_ready"] == ready
-        if (mode == "mean" or glm_ready) and (reference == "running" or len(history) < 3):
-            history.append(frame[valid] if mode == "mean" else native_residual.copy())
+        if mode == "zscore" and index == 4:
+            history = list(fitted_residuals[:3 if reference == "fixed" else index].copy())
+        elif (mode == "mean" or glm_ready) and (reference == "running" or len(history) < 3):
+            history.append(responses[index - 1][final_valid] if mode == "mean" else native_residual.copy())
 
-    assert len(transformed_normalized) == len(native)
+    assert len(transformed_normalized) == 0
     assert len(scored) == len(baseline) == sum(expected_ready)
     for actual, expected in zip(scored, expected_scores):
         np.testing.assert_allclose(actual, expected, atol=.002, rtol=1e-5)
@@ -297,6 +335,6 @@ def test_native_glm_then_prior_sample_normalization_then_mapping_and_score(
     # The startup snapshot must reproduce the reference used for the first
     # normalized volume; running updates must not overwrite that snapshot here.
     saved = json.loads((tmp_path / "norm" / "reference.json").read_text())
-    assert saved["reference_count"] == 3
-    assert saved["sample_source"] == ("raw_mc" if mode == "mean" else "regression_ready_output")
+    assert saved["reference_count"] == (4 if mode == "zscore" and reference == "running" else 3)
+    assert saved["sample_source"] == ("pre_glm_transformed_smoothed_bold" if mode == "mean" else "regression_ready_output")
     assert handler.voxel_normalizer.reference_count == len(history)

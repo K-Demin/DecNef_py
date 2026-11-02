@@ -79,7 +79,7 @@ def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
 
 
 def _requires_regression_ready_filter(volume_kind: str) -> bool:
-    return str(volume_kind).lower() in {"reg", "t1", "mni", "smooth", "masked"}
+    return str(volume_kind).lower() in {"reg", "norm", "epi_ref", "t1", "mni", "smooth", "masked"}
 
 
 def run_realtime_all_roi_pca_scorer(

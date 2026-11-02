@@ -5,15 +5,18 @@ def normalization_startup_hint(settings):
     """Earliest possible scored volume, not a promise of processing completion.
 
     Volume indices are one-based pipeline input indices. Presentation-only
-    skipped TRs are not added. Additional GLM/design, coverage, and processing
-    delays can make actual readiness later than this lower bound.
+    skipped TRs are not added. The first successful GLM fit seeds z-scoring
+    from its stored residual history; no second calibration window is added.
+    Scoring starts on the next input volume, using prior observations only.
+    Additional GLM/design, coverage, and processing delays can make actual
+    readiness later than this lower bound.
     """
     count = int(settings.voxel_norm_ref_volumes)
     mode = str(settings.voxel_norm_mode)
     if count < 1 or mode not in {"zscore", "mean"}:
         raise ValueError("Expected a positive JSON normalization window and zscore or mean mode")
     first_glm = count if settings.enable_motion_regression else 1
-    first_score = first_glm + count if mode == "zscore" else max(first_glm, count + 1)
+    first_score = count + 1
     return {
         "voxel_norm_mode": mode,
         "voxel_norm_reference": str(settings.voxel_norm_reference),

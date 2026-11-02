@@ -1,104 +1,122 @@
 # Brain selection and the processing mask
 
-The pipeline keeps the intended brain region separate from the region processed
-before spatial interpolation. Denoising only inside a tight brain mask would
-replace neighbouring measured signals with zeros before Lanczos or Linear
-interpolation can use them.
+Incoming BOLD is unwarped and motion-corrected on the session EPI grid, then
+processed in this order:
 
-## Automatic construction
+**Spatial mapping → optional masked smoothing → cumulative-GLM denoising →
+voxel normalization.**
+
+The response data, denoising mask and normalization statistics all use the final
+analysis grid: EPI, T1 or MNI, as selected by `analysis_space`. For EPI analysis
+with a session-to-reference bridge, this is the stable reference EPI grid.
+
+## Anatomical selection and temporal processing
 
 Preparation supplies the session EPI brain mask, normally SynthStrip's
 `epi_mask_mean.nii` from the unwarped, motion-corrected reference mean. Review
-that anatomical mask against the corrected EPI and aligned anatomy: adding a
-processing margin does not correct a brain mask that excludes cortex.
+that mask against the corrected EPI and aligned anatomy: changing the processing
+order does not recover cortex omitted by the anatomical mask.
 
-At run initialization, the pipeline makes a separate processing mask on the same
-EPI grid. The margin follows the selected spatial interpolation automatically;
-there is no additional JSON setting.
+At run initialization, the anatomical brain mask is mapped onto the final grid
+with nearest-neighbour interpolation. The temporal processing mask is that
+mapped brain mask intersected with the selected analysis mask. Consequently,
+`analysis_mask: "whole_brain"`, `"cortical_gm"` and `"custom"` control the response
+voxels processed by denoising and normalization as well as smoothing. A zero
+FWHM skips Gaussian filtering; a cortex/custom selection still applies.
 
-| Spatial operation after temporal processing | Processing margin |
-| --- | --- |
-| Lanczos-3 | Three source voxels in each direction along each axis |
-| Linear | One source voxel in each direction along each axis |
-| Native EPI output with no spatial mapping | None |
+Spatial mapping receives acquired motion-corrected BOLD before response
+masking or temporal processing. There is no response-processing interpolation
+margin: spatial interpolation has already happened by the time denoising starts.
+The native cubic-margin helper is retained for historical callers and separate
+native nuisance support; it no longer defines the response GLM mask.
 
-These are **cubic** margins, clipped to the source array. For 1.5 mm EPI voxels,
-the Lanczos margin is 4.5 mm along each axis. An EPI-to-reference-EPI bridge is a
-spatial mapping and receives a margin too. The kernel-based construction covers
-the interpolation neighbours of output points whose nearest-neighbour source
-centre is inside the anatomical mask. It does not assert that every selected
-voxel was acquired or has a valid temporal estimate.
+GS, WM and ventricular nuisance signals are sampled separately from the
+**native, unsmoothed, motion-corrected** volume using their native masks and
+available acquisition support. Selecting cortex as the response region therefore
+does not discard the WM/ventricular signals needed by the nuisance model. Motion
+estimation, FD, DVARS, registration masks and fitted transforms retain their
+native inputs and existing definitions.
 
-Both cumulative-GLM denoising and subsequent voxel normalization use the same
-processing mask. Intermediate `reg/` and `norm/` files can therefore contain
-processed values just outside the anatomical brain mask. Those values supply
-interpolation neighbours; they do not enlarge the final analysis region.
+## Missing samples
 
-The original anatomical mask continues to define whole-brain selection, global
-signal sampling and brain-based QC. WM/ventricle nuisance masks, configured
-DVARS masks, and cortical/custom analysis selections are unchanged. This does
-not rerun SynthStrip or change registration masks or fitted transforms.
+Per-volume acquisition support is mapped to the final grid once, using Linear
+interpolation and a threshold of `1 - 1e-5` for both Linear and Lanczos signal
+interpolation. It is then intersected with the anatomical/analysis selections.
+This availability rule does not require every Lanczos neighbour to be acquired.
+It is not a guarantee that every contributor exists at the acquisition boundary.
 
-## Final output and missing samples
+Masked smoothing excludes unavailable samples from both its numerator and its
+normalizing denominator, and leaves those output samples unavailable. cGLM's
+complete-history support and normalization's valid-statistics checks can further
+reduce usable support. Neither smoothing nor a broader mask recovers missing
+slices. Temporal support is already on the final grid and is not spatially
+warped a second time. `coverage_rt.csv` records the corresponding final-grid
+coverage; native MC support remains a separate input to motion/DVARS processing.
 
-The anatomical brain mask is mapped to the final grid with nearest-neighbour
-interpolation. Per-volume acquisition and usable-processing support are mapped
-separately with **Linear** interpolation and thresholded at `1 - 1e-5`, for both
-Linear and Lanczos signal interpolation. Final usable support intersects the
-mapped brain mask. It no longer requires every Lanczos neighbour to lie inside
-the anatomical brain mask.
-
-The processing margin does not recover missing slices, voxels rejected by the
-GLM's complete-history policy, or voxels without valid normalization statistics.
-Lanczos can still be affected by unavailable neighbours near those boundaries;
-the availability rule is not a guarantee that every Lanczos contributor exists.
-The established per-volume support rules and `coverage_rt.csv` remain relevant.
-
-## Saved files and restarting
+## Saved files and warmup
 
 Each run saves these files under `func/<run>/processing_mask/`:
 
 | File | Meaning |
 | --- | --- |
-| `brain_epi.nii` | Original anatomical selection on the session EPI grid |
-| `processing_epi.nii` | Expanded region used by denoising and normalization |
-| `brain_final.nii` | Anatomical selection mapped onto the final output grid |
-| `policy.json` | Policy/version, interpolation, margin, source identity and voxel counts |
+| `brain_epi.nii` | Anatomical brain selection on the session EPI grid |
+| `brain_final.nii` | Anatomical brain selection mapped onto the final analysis grid |
+| `processing_final.nii` | Final-grid response selection used by denoising and normalization |
+| `policy.json` | Policy/version, processing order, nuisance source, interpolation, source identity and voxel counts |
 
-Processing policy is also recorded in run metadata and
-`preprocessing_order.json`. **Use a fresh run output directory:** the new margin
-changes processed values, including potentially the default Linear path, and
-old temporal output/calibration must not be mixed with the new run. Compatible
-unchanged anatomical registrations can still be reused.
+`mc/` retains native motion-corrected BOLD. `t1/`, `mni/` or bridged `epi_ref/`
+contain spatially mapped BOLD in original intensity units. Optional `smooth/`
+or `masked/` outputs are the next, pre-denoising stage. `reg/` contains the
+denoising output; `norm/` is the final normalized feature source for decoding.
+All stages from spatial mapping onward use the final analysis affine.
 
-Scalar RS score references and PCA assets/references record and check the
-normalization, coverage policy and mask policy/version/interpolation. PCA also
-records whether its source was raw MC or normalized data. Missing or conflicting
-modern provenance requires rebuilding/reprocessing the reference; it is not
-silently accepted because voxel grids happen to match. Acquisition-specific
-mask paths, hashes and padding widths are not required to match across RS/NF.
+Spatial and smoothed images remain visible during calibration. Unready `norm/`
+volumes are zero-filled, their usable `support/` masks are empty and the decoder
+score remains unavailable. Check `glm_ready`, `normalization_ready` and
+`reg_ready` in `regression_status_rt.csv`; visible anatomy alone does not imply
+analysis readiness. Normalization reference images in `norm/` also use the
+final analysis grid.
+
+### Decoder contribution volumes
+
+`save_decoder_contributions: true` (default) saves the linear decoder's voxel
+terms to `func/<run>/decoder_contributions/vol_XXXXX_decoder_contributions.nii`.
+Each float32 voxel is the final `norm/` value multiplied by its effective decoder
+weight, using ROI-TXT weights when supplied. The image keeps the input affine and
+grid; voxels outside the decoder mask are zero. No further masking is applied.
+
+Summing the image and adding the scalar `bias` in `decoder_contributions/decoder.json`
+reconstructs `scores.csv`'s `score_raw`, within floating-point rounding. The bias
+is not distributed across voxels. These are raw decision-value contributions,
+before scalar score normalization or probability/percentile feedback.
+
+Only ready volumes with finite scores produce maps; warmup and scoring-disabled
+runs do not. This covers the standard volumetric linear decoder and the active
+Olga direct scorer, not the separate PCA scoring pathway. Set the option to
+`false` to skip the additional files. Their calculation and uncompressed NIfTI
+write are included in the existing `SCORE` stage timing.
+
+## Processing provenance and reuse
+
+The response policy is `final_analysis_grid`, version 1. Metadata records the
+order `spatial_transform`, `smoothing`, `denoising`, `normalization` and nuisance
+source `native_unsmoothed_mc`. The former `source_grid_cubic_halo` policy remains
+recognizable as historical provenance and is not treated as equivalent.
+
+**Use a fresh run output directory and rebuild RS score/PCA calibration assets
+after this order change.** Scalar score references and PCA assets compare
+normalization, coverage and processing-mask provenance. Missing or incompatible
+modern provenance is rejected. Source mask paths, hashes and native nuisance
+padding widths are acquisition-specific and need not match across RS and NF.
+Compatible unchanged anatomical registrations can still be reused.
 
 Lanczos remains opt-in through `gpu_resampler_interpolation: "lanczos"`; the
-default stays `"linear"`. Lanczos requires the CUDA/Triton backend. The margin
-is constructed once, while processing additional voxels increases temporal
-processing work.
+default is `"linear"`. Lanczos requires the CUDA/Triton backend. Temporal work
+now scales with the selected final-grid response voxels, so a finer T1/MNI grid
+can cost more than native EPI processing.
 
-Kernel-footprint and runtime tests cover the padding construction, actual GLM
-and normalization, final masks, missing slices, original-volume outputs and QC.
-
-On 2026-11-02, an isolated Linux/RTX 4090 control replay used 48 saved Olga MC
-volumes (61–108), native-unit CUDA GLM, fixed post-GLM z-scoring and GPU Lanczos.
-Three- and four-voxel margins produced identical final support across 17 ready
-volumes; their maximum final-value difference was 0.00007424 in normalized
-units. All finite-value, final-brain and mapped-coverage checks passed. The
-anatomical mask contained 375,245 voxels; the three-voxel processing mask
-contained 478,804 (27.6% more), without enlarging final anatomical selection.
-
-This was a controlled restart using the same original-brain GS regressor and
-polynomial order 1, not the original study's complete temporal model or an NF
-score replay. It used historical PA-reference MC data with one fixed transform
-from the earlier AP-reference comparison, so it does not validate registration
-accuracy. A fresh end-to-end scanner replay, decoder calibration and complete
-runtime measurement remain separate checks. Reproducible script and results:
-`output/processing_mask_integration_20261102/validate_native.py` and
-`output/processing_mask_integration_20261102/native_results/results.json`.
+The earlier 2026-11-02 Linux/RTX 4090 margin comparison used the historical
+temporal-before-spatial order. Its three- versus four-voxel margin result does
+not validate the current order. The runtime tests separately exercise current
+final-grid processing with actual smoothing, GLM and normalization; scanner
+replay, registration quality and decoder recalibration remain distinct checks.

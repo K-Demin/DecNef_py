@@ -125,6 +125,48 @@ class VoxelNormalizer:
         self.count[observed] = counts
         self.reference_count += 1
 
+    def initialize_from_moments(self, mean, m2, count, reference_count):
+        """Seed an empty reference from supported retrospective residuals.
+
+        ``m2`` is the sum of squared deviations, not variance. Counts exclude
+        unavailable samples. Initialization does not transform a volume or set
+        output support; the caller must not observe the seeded current sample
+        again. Inputs are copied so later fitting cannot change the reference.
+        """
+        if self.reference_count or (self.count is not None and self.count.any()):
+            raise ValueError('Normalization reference already contains observations.')
+        try:
+            n_reference = int(reference_count)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError('Moment reference count must be a positive integer.') from exc
+        if (isinstance(reference_count, (bool, np.bool_)) or
+                n_reference != reference_count or n_reference < 1 or
+                n_reference > np.iinfo(np.int64).max):
+            raise ValueError('Moment reference count must be a positive integer.')
+        if self.reference == 'fixed' and n_reference > self.ref_volumes:
+            raise ValueError('Fixed reference moments exceed the configured reference length.')
+        mean, m2, count = (np.asarray(values) for values in (mean, m2, count))
+        if (mean.ndim != 3 or m2.shape != mean.shape or count.shape != mean.shape or
+                any(values.dtype.kind not in 'iuf' for values in (mean, m2, count))):
+            raise ValueError('Normalization moments must be real numeric arrays on one 3D grid.')
+        if self.mean is not None and mean.shape != self.mean.shape:
+            raise ValueError('Normalization moments differ from the reference grid.')
+        if not all(np.isfinite(values).all() for values in (mean, m2, count)):
+            raise ValueError('Normalization moments must be finite.')
+        if ((count < 0).any() or (count > n_reference).any() or
+                (count != np.floor(count)).any() or not (count > 0).any()):
+            raise ValueError('Voxel moment counts must be integers within the reference count.')
+        if ((m2 < 0).any() or (m2[count < 2] != 0).any() or
+                (mean[count == 0] != 0).any()):
+            raise ValueError('Moment values are inconsistent with observation counts.')
+        if self.brain_mask is not None and (count[~self.brain_mask] != 0).any():
+            raise ValueError('Normalization moments contain observations outside the brain mask.')
+        self.mean = mean.astype(np.float64, copy=True)
+        self._m2 = m2.astype(np.float64, copy=True)
+        self.count = count.astype(np.int64, copy=True)
+        self.reference_count = n_reference
+        self.output_support = np.zeros(mean.shape, dtype=bool)
+
     def transform(self, data, support_mask=None):
         """Return float32 normalized values using existing statistics only.
 
