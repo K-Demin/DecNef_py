@@ -17,7 +17,8 @@ from typing import Optional
 import numpy as np
 from scipy.stats import norm
 
-from rt_global_settings import load_regressor_settings
+from rt_global_settings import load_regressor_settings, add_registration_arguments, apply_registration_arguments
+from fmri_rt_preproc.normalization_timing import normalization_startup_hint
 import rs_pca_runtime as pca_rt
 
 
@@ -1792,11 +1793,9 @@ def main() -> None:
         default=45.0,
         help=(
             "Seconds of fixation-cross rest at the START of the run, before any "
-            "feedback. This is the run's rest baseline: the pipeline builds its "
-            "voxel-normalization reference from the first "
-            "skip_first_trs + voxel_norm_ref_volumes volumes, so those must be "
-            "acquired at rest, not while the subject is already regulating. "
-            "Values below that warmup are raised automatically. 0 disables."
+            "feedback. Calibration duration is controlled separately by JSON "
+            "voxel_norm_ref_volumes. A short lead warns but is never extended "
+            "automatically. 0 disables the lead."
         ),
     )
     parser.add_argument(
@@ -2002,12 +2001,14 @@ def main() -> None:
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
     )
+    add_registration_arguments(parser)
     args = parser.parse_args()
     from rt_pipeline import RTSessionConfig, REGRESSOR_SETTINGS
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
     if args.active_feedback_trs is not None:
         log.warning("--active-feedback-trs is ignored in the block design; run length "
                     "comes from --rounds (%d) x (--active-sec %g + --rest-sec %g).",
@@ -2064,27 +2065,28 @@ def main() -> None:
         pa_block=args.pa_block,
     )
 
+    from rt_pipeline import prepare_nf_run
+    prepare_nf_run(cfg)
+
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)
 
-    # The rest lead must cover the pipeline warmup, otherwise the voxel-norm
-    # reference is built from volumes acquired during regulation. Mirrors the
-    # voxel_norm_ref_volumes = baseline_trs lock in rt_nf_events_parallel.py.
+    # Warn if the requested schedule precedes calibration, without changing it.
+    # Presentation skip offsets do not discard inputs from the cumulative GLM.
     rest_lead_s = float(args.rest_lead_sec)
-    if rest_lead_s > 0:
-        tr_s = float(REGRESSOR_SETTINGS.TR)
-        warmup_s = (int(REGRESSOR_SETTINGS.skip_first_trs)
-                    + int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes)) * tr_s
-        if rest_lead_s < warmup_s:
-            log.warning(
-                "--rest-lead-sec %.1fs is shorter than the pipeline warmup "
-                "(skip_first_trs %d + voxel_norm_ref_volumes %d = %.1fs at TR=%.2f). "
-                "Raising it to %.1fs so the normalization reference is collected at rest.",
-                rest_lead_s, int(REGRESSOR_SETTINGS.skip_first_trs),
-                int(REGRESSOR_SETTINGS.voxel_norm_ref_volumes), warmup_s, tr_s, warmup_s)
-            rest_lead_s = warmup_s
-        log.info("[PHASE] Rest lead %.1fs (%d TRs) before feedback.",
-                 rest_lead_s, int(round(rest_lead_s / tr_s)))
+    startup = normalization_startup_hint(REGRESSOR_SETTINGS)
+    tr_s = float(REGRESSOR_SETTINGS.TR)
+    warmup_s = startup["first_score_volume_lower_bound"] * tr_s
+    if rest_lead_s < warmup_s:
+        log.warning("--rest-lead-sec %.1fs precedes the earliest normalization readiness estimate "
+                    "(input volume%d, about %.1fs at TR=%.2f; %s, %s, N=%d). "
+                    "GLM design/coverage/processing may delay readiness further. "
+                    "The requested lead is unchanged; set a longer lead if calibration should finish at rest.",
+                    rest_lead_s, startup["first_score_volume_lower_bound"], warmup_s, tr_s,
+                    REGRESSOR_SETTINGS.voxel_norm_mode, REGRESSOR_SETTINGS.voxel_norm_reference,
+                    REGRESSOR_SETTINGS.voxel_norm_ref_volumes)
+    log.info("[PHASE] Rest lead %.1fs (%d TRs) before feedback.",
+             rest_lead_s, int(round(rest_lead_s / tr_s)))
 
     settings_payload = vars(REGRESSOR_SETTINGS).copy()
     settings_payload.update(
@@ -2261,6 +2263,7 @@ def main() -> None:
                 "duration_min": args.duration_min,
                 "active_feedback_trs": args.active_feedback_trs,
                 "rest_lead_s": rest_lead_s,
+                "normalization_startup": startup,
                 "feedback_mapping": args.feedback_mapping,
                 "mapping_scale": args.mapping_scale,
                 "z_smooth_trs": args.z_smooth_trs,

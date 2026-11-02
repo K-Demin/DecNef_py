@@ -10,7 +10,7 @@ from pathlib import Path
 STAGES = {
     "DICOM": "DICOM — DICOM to NIfTI", "FMAP": "FMAP — unwarping (PyHySCO)",
     "MC": "MC — motion correction + FD", "QC": "DVARS — signal-change / censor checks",
-    "REG": "REG — denoising", "TRANS": "TRANS — spatial resampling",
+    "REG": "REG — denoising", "NORM": "NORM — voxel normalization", "TRANS": "TRANS — spatial resampling",
     "SMOOTH": "SMOOTH — masked smoothing", "MASK": "MASK — analysis mask",
     "SCORE": "SCORE — decoder + score output", "OUTPUT": "OUTPUT — status logs / preview",
     "OTHER": "OTHER — processing overhead",
@@ -176,7 +176,12 @@ def plot_speed(csv_path, tr=1.0, output=None):
     rows, skipped = [], 0
     required = ["processing_ms", "latency_ms", *[f"{s}_ms" for s in STAGES]]
     with csv_path.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        # Historical CSVs predate the dedicated normalization stage. An absent
+        # column is unmeasured, while a present but truncated value is invalid.
+        if "NORM_ms" not in (reader.fieldnames or []):
+            required.remove("NORM_ms")
+        for row in reader:
             try:
                 valid = (int(row["volume"]) >= 0 and row["status"] in {"ok", "failed"}
                          and all(math.isfinite(float(row[k])) and float(row[k]) >= 0

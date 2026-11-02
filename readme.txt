@@ -14,50 +14,67 @@ It runs:
 - T1 -> MNI registration via SynthMorph
 - PyHySCO distortion correction from native AP/PA means (no AP/PA motion correction)
 - Raw BOLD unwarping, then motion correction to the fixed corrected session reference
-- T1 -> corrected EPI registration via ANTs; use its inverse for EPI -> T1
-- EPI -> MNI resampling through EPI -> T1 and the SynthMorph T1 -> MNI transform
+- Direction-selectable EPI/T1 registration via ANTs, or imported offline mappings
+- EPI -> MNI resampling through EPI -> T1 and the selected T1 -> MNI transform
 - Optional composed transforms for online use
 
-All heavy transforms for realtime are precomputed offline.
+Spatial mappings are estimated during preparation, then reused for realtime resampling.
 
 Processing order, output compatibility, and migration: docs/unwarp_before_mc.md
 
-EPI-to-anatomy registration (full-brain and partial coverage)
-----------------------------------------------------------
+EPI-to-anatomy registration and offline reuse
+--------------------------------------------
 
-Preparation uses one recipe: fixed corrected EPI, moving T1, header-based
-identity initialization, then Translation and Rigid optimization. The default
-settings are "registration_initialization": "identity" and
-"registration_syn": false. center_of_mass is an explicit initialization option;
-auto is a compatibility alias for identity. Optional SyN adds nonlinear
-refinement. New full-brain preparation therefore changes the old recipe: there
-is no Affine stage, and SyN is disabled by default.
+Both registration_direction choices (epi_to_t1, t1_to_epi) now use Rigid,
+Affine and the restored historical SyN schedule. Defaults: direction=epi_to_t1,
+registration_initialization=identity, registration_syn=true. Explicit settings
+profiles still override defaults, including an existing registration_syn=false.
 
-run_preproc.py, rs_realtime_parallel.py and rs_pca_score_all_rois.py all accept
---settings-file /path/to/participant_settings.json. Without it they use built-in
-defaults; rt_settings.json is not loaded automatically. Explicit
---registration-initialization, --registration-syn or --no-registration-syn
-options override the profile; omitted options preserve it. Effective choices
-are recorded in the prepared session's config.json. Neurofeedback, PsychoPy,
-robot and BrainPong reuse these prepared maps without separate partial flags.
+epi_reference_n4=true (default) adds a separate N4-corrected EPI reference for
+registration: unwarp -> MC -> observed-sample mean -> SynthStrip mask -> N4 copy
+-> anatomical or EPI-to-EPI fit. The original mean remains the MC target;
+incoming volumes and temporal processing do not receive N4. Configure the JSON
+boolean, or override it with --epi-reference-n4 / --no-epi-reference-n4.
 
-The canonical epi2t1_Composite.h5 still maps EPI -> T1, and
-epi2t1_InverseComposite.h5 still maps T1 -> EPI. Native ANTs outputs from new
-fits are retained as t1_to_epi_*. There is no active registration_mode flag.
-Old JSON registration_mode values full_brain/partial_epi warn and are ignored;
-partial_epi_syn warns and aliases registration_syn. Conflicting aliases fail.
+The transform folder saves epi_registration_reference.nii and its .json sidecar.
+EPI bridges reuse an optional enhanced offline epi_registration_reference,
+recognize already enhanced fMRIPrep imports, or create an N4 copy of an older
+raw anchor as reference_epi_registration.nii. Original bundles remain intact.
+Canonical warped outputs and QC show the original image intensities through
+the fitted maps, so intensity correction alone is not reported as improved alignment.
+Earlier Linux reference experiments measured about 4.1 s per N4 correction;
+an unenhanced old anchor can require a second correction. There is no per-TR N4
+cost. These are isolated preparation timings, not a new full-session benchmark.
+Use fresh preparation/session directories and renew registration QC when this
+setting changes. N4 can help fitting but does not guarantee convergence.
 
-All three preparation commands check cache compatibility before staging scans
-or rewriting config.json. New fits record registration.json version 2.
-Equivalent version 1 partial-EPI caches can be reused after input/output and
-settings checks. Old full-brain or unversioned caches require a fresh preparation
-directory for the new recipe; unchanged prepared maps remain usable by existing
-realtime consumers. Rebuild the reference and derived transforms together when
-changing preparation. This is separate from truncate_t1_to_epi_fov, which only
-changes a PCA output grid. Inspect alignment and mask/decoder coverage for both
-full-brain and partial acquisitions; native anatomical registration has not been
-validated in the Windows development environment.
-Commands, settings and QC guidance: docs/partial_epi_registration.md
+prepare_offline.py imports an explicit matching fMRIPrep file set or exports a
+prepared DecNef day. Offline input is optional: run_preproc.py can compute all
+anatomy and reference mappings during a first visit. The exact input filenames,
+folder layout and commands are in docs/offline_preparation.md.
+
+prepare_session.py builds the current EPI-to-prepared-EPI bridge from the first
+reference acquisition. It saves func/session_trans and produces registration QC
+reports/overlays. Review these before the timed NF task. NF, probability NF,
+PsychoPy, robot and BrainPong use this shared gate and reuse the approved session
+alignment. RS/preparation processing does not require NF approval.
+
+Canonical epi2t1_Composite.h5 always means EPI->T1; InverseComposite means T1->EPI.
+The fixed/moving choice does not change those meanings. Imported MNI transforms
+keep their actual file format and exact template identity. Both CPU and GPU
+consumers use the selected session mappings.
+
+New registrations have manifest version 3; the short, linear-only recipe is
+not silently reused as a nonlinear registration. Old data are preserved.
+Changed coverage/normalization also requires fresh per-run output directories.
+Denoising warmup uses the processing mask, and missing observations are
+excluded from calibration. The cumulative GLM
+uses explicitly reported complete-history voxel support; see the coverage
+tradeoff and runtime implications in docs/partial_epi_registration.md.
+
+Commands/settings: docs/partial_epi_registration.md
+Offline files/fMRIPrep: docs/offline_preparation.md
+Alignment metrics/review: docs/registration_qc.md
 
 Final analysis masking and spatial smoothing
 --------------------------------------------
@@ -83,7 +100,7 @@ Example: custom mask already on the final grid:
   "analysis_mask_space": "final", "smoothing_fwhm_mm": 4.0
 Use absolute custom paths; relative paths are resolved from the process directory.
 
-Order: unwarp -> MC -> regression/normalization -> EPI/T1/MNI output ->
+Order: unwarp -> MC -> native-unit cumulative GLM -> voxel normalization -> EPI/T1/MNI output ->
        final analysis masking / masked smoothing -> scoring.
 The decoder ROI can be a smaller subset of the analysis/smoothing mask.
 
@@ -103,9 +120,10 @@ nonfinite, nonbinary custom, or incompatible masks fail before volume processing
 
 Each volume also carries geometric FOV support from its estimated MC transform
 through the same final spatial transform. This is independent of voxel intensity.
-The effective mask is the fixed analysis mask intersected with current support.
+The effective mask is the fixed analysis mask intersected with usable signal support.
 Missing current samples are zeroed before spatial interpolation and final output.
-This does not add a missing-observation policy to cumulative nuisance regression.
+The cumulative GLM uses complete-history support: once a voxel loses coverage, it
+stays excluded for the rest of that run. See the coverage policy above.
 
 Positive-FWHM mathematics uses normalized convolution:
 Gaussian(effective_mask * volume) / Gaussian(effective_mask), zero outside;
@@ -120,8 +138,9 @@ Outputs under func/<run>/:
   masked/vol_XXXXX_masked.nii       cortex/custom masking with 0 mm
   corresponding *_orig.nii         optional original-score comparison stream
 Each active folder includes mask.nii (the fixed analysis mask). Per-volume support
-is saved separately in coverage/vol_XXXXX_epi.nii and, when applicable, *_t1.nii
-or *_mni.nii. New coverage handling requires fresh run outputs, but an unchanged
+is saved separately: coverage/ holds geometric FOV and support/ holds usable
+analysis samples, in EPI and the selected final space. New coverage handling
+requires fresh run outputs, but a compatible unchanged
 prepared registration can be reused. Final volumes
 are published atomically for PCA readers. Stream "score_input" to see final output;
 "mc" and "unwarped" continue to show the earlier corrected volumes.
@@ -328,8 +347,10 @@ and transforms needed by rt_pipeline.py. During realtime:
     - fieldmap unwarp using the selected pair's native_unwarp_v1/pyhysco_native-EstFieldMap.nii
     - RTPSpy motion correction to epi_unwarped_mean.nii[.gz]
     - FD/DVARS censor bookkeeping
-    - nuisance regression and voxel normalization on the unwarped stream
+    - cumulative nuisance GLM in native intensity units on the corrected EPI stream
+    - voxel normalization (fixed-reference z-score by default)
     - optional EPI->T1 or EPI->T1->MNI transform
+    - selected analysis mask and optional spatial smoothing
     - decoder scoring and score publication
 
 
@@ -436,11 +457,15 @@ Those keys are ignored by the loader and are safe to keep in place.
 What each settings block controls
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`, `voxel_norm_ref_volumes`):
+- Timing/model (`TR`, `analysis_space`, `mot_reg`, `max_poly_order`, `enable_motion_regression`):
   controls temporal assumptions and nuisance model complexity.
-  - `analysis_space = "mni"` (default): apply EPI→T1→MNI normalization before scoring.
-  - `analysis_space = "epi"`: skip normalization and score the cleaned MC volume in native EPI space.
-  - `voxel_norm_ref_volumes` (default `1`): shared normalization-window setting used in both modes. With regression ON, it sets RTPSpy `wait_num = voxel_norm_ref_volumes - 1`, so scaling mean is built from that many initial volumes; with regression OFF, it averages the first `voxel_norm_ref_volumes` volumes for the same voxel-wise percent-signal scaling (`Y / Y_mean * 100`).
+  - `analysis_space = "mni"` (default): apply EPI→T1→MNI spatial transforms before scoring.
+  - `analysis_space = "t1"`: apply EPI→T1 before scoring.
+  - `analysis_space = "epi"`: score in the fixed session EPI grid; voxel normalization still applies.
+- Voxel normalization (`voxel_norm_mode`, `voxel_norm_reference`, `voxel_norm_ref_volumes`):
+  - `voxel_norm_mode = "zscore"` (default), or `"mean"`.
+  - `voxel_norm_reference = "fixed"` (default), or `"running"`.
+  - `voxel_norm_ref_volumes = 30` (default): N reference samples; N must be at least 2 for zscore, or 1 for mean. With regression enabled, N also sets the GLM startup minimum. See the timing and formulas below.
 - Tissue regressors (`use_gs`, `use_wm`, `use_vent`):
   toggles global/WM/ventricle nuisance regressors.
 - Censoring (`fd_thr`, `dvars_thr_robust_z`, `censor_plus1`, etc.):
@@ -453,15 +478,129 @@ What each settings block controls
 If you use `analysis_space = "epi"` with scoring enabled, pass an EPI-space decoder via
 `--decoder-template` so decoder dimensions/space match the processed volume.
 
+Voxel normalization: units, calibration and readiness
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The cumulative GLM fits the measured corrected EPI intensities without first
+percent-scaling them. Let y_v(t) be raw MC intensity and r_v(t) the emitted GLM
+residual for voxel v. Normalization follows the GLM in the session EPI grid,
+before T1/MNI interpolation, analysis masking and smoothing:
+
+  zscore: z_v(t) = (r_v(t) - mean_reference(r_v)) / sample_SD_reference(r_v)
+  mean:   q_v(t) = 100 * r_v(t) / mean_reference(y_v)
+
+Mean mode divides by the raw BOLD reference mean, never by a near-zero residual
+mean. It expresses residuals as a percentage of reference BOLD intensity; it does
+not add 100 back. Neither mode clips the resulting values or bounds them to a
+fixed range. Sample SD uses N-1 in its denominator. Invalid or unavailable
+observations do not become measured zero-intensity calibration samples.
+
+With `fixed`, zscore collects the first N emitted regression-ready residuals,
+freezes their per-voxel mean/SD, then normalizes starting with the NEXT volume.
+Thus N=30 means GLM startup PLUS 30 ready residuals before usable normalized
+feedback. It does not mean that all startup completes in 30 TRs. GLM
+design/readiness or missing support can delay feedback further.
+`skip_first_trs` shifts the presentation timeline; those acquired volumes still
+enter processing. `--baseline-trs` controls presentation timing independently;
+it does not change the JSON normalization window. Allow the task to wait for
+normalization readiness even when the planned presentation baseline has ended.
+
+With `running`, zscore also waits for at least N ready residuals, but continues
+updating the reference. Each current volume uses statistics from prior volumes;
+it is added only afterward. The reference therefore changes over time, unlike
+the fixed mode. Running is cumulative, not a sliding window.
+
+Mean mode calibrates on the first N raw MC observations during GLM startup.
+Fixed freezes that raw mean; running updates it after each current volume, so
+the current denominator still uses prior observations. With regression disabled,
+the corrected MC data replace r_v(t) and z-score calibration starts immediately.
+
+The z-score reference is voxel-wise and temporal, not the spatial mean of each
+EPI. Subsequent interpolation and smoothing combine voxels: final decoder-grid
+voxels are not guaranteed to retain a sample SD of exactly 1. Calibration also
+does not guarantee that future volumes have the same distribution.
+
+Decoder scoring then uses the resulting features: decision = dot(weights, x) +
+intercept. The probability launcher must not apply another voxel z-score. A
+sigmoid or reference-run normalization of that scalar decision is a different
+operation. PCA's saved training mean/SD remain part of its model contract; old
+PCA models and decoder weights must be checked against the new upstream units
+and processing order, and retrained/recalibrated when those contracts differ.
+Fixed early-run z-scoring is not identical to offline whole-run standardization.
+
+For future runs intended for PCA preparation in T1, MNI or a bridged reference
+EPI grid, add `--enable-original-score` to the usual `rs_realtime_parallel.py`
+or `rs_pca_score_all_rois.py` command. It is opt-in and defaults to false.
+This preserves a same-grid original-intensity `*_orig.nii` comparison stream
+for tSNR (temporal mean / temporal SD) voxel ranking; z-scored residuals cannot
+provide meaningful tSNR. Native session-EPI PCA uses the existing `mc/` stream.
+PCA preparation reports an error if required original-intensity volumes are
+missing, rather than substituting normalized data. The additional comparison
+stream adds per-TR spatial resampling, any enabled smoothing, and output I/O;
+measure the resulting latency before using it during a study. PCA fitting still
+uses normalized, readiness-filtered data and retains its own trained mean/SD.
+
+These settings change output units and warmup. Use fresh per-run output folders;
+normalization choices and stage are recorded in provenance so cached outputs
+from a different normalization policy cannot silently mix into a run.
+`regression_status_rt.csv` distinguishes `glm_ready`, `normalization_ready` and
+`normalization_reference_count`. Its existing `reg_ready` field now means overall
+scoring readiness for compatibility with consumers; scores remain NaN until
+both stages are ready. `norm/` images are zero-filled during calibration, rather
+than exposing raw-intensity warmup as normalized data. Reference mean, sample
+SD/count images and JSON metadata are saved under `norm/` at calibration and
+shutdown (including final running statistics), not rewritten every TR.
+
+GPU interpolation (final TRANS stage)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set these in the study settings JSON to use the optional sharper interpolator:
+    "use_gpu_resampler": true,
+    "gpu_resampler_device": "cuda",
+    "gpu_resampler_interpolation": "lanczos"
+
+The default remains "linear". Lanczos requires CUDA and Triton; an explicitly
+selected Lanczos run stops during initialization if the backend is unavailable.
+This option applies EPI-to-reference-EPI, EPI-to-T1, or EPI-to-MNI transforms.
+It does not change registration fitting, PyHySCO unwarping, or heptic motion
+correction. EPI output with no spatial transform remains a passthrough.
+
+The Lanczos kernel matches ANTs LanczosWindowedSinc (radius 3, zero exterior,
+unnormalized weights). Coordinates and weights are cached; kernels are warmed
+during initialization. Legacy Linear grids are rebuilt for Lanczos to retain
+the exact source coordinates at image edges. Switching interpolation requires
+a fresh run output directory, as enforced by preprocessing_order.json.
+
+Before spatial interpolation, denoising and normalization use an automatically
+expanded processing mask: a cubic margin of three EPI voxels per axis for
+Lanczos, one for Linear, or none for native EPI output without spatial mapping.
+The original anatomical and nuisance masks remain separate. No extra JSON
+setting is required. This processing change also requires fresh run outputs.
+
+Final brain selection uses nearest-neighbor mask mapping. Missing samples are
+tracked independently of intensities with Linear availability interpolation
+and threshold 1-1e-5, for either signal kernel. Final support intersects the
+mapped anatomical mask; it no longer requires the whole Lanczos neighbourhood
+to be inside that brain mask. Signed residuals and legitimate zeros remain valid.
+
+Missing slices or unavailable temporal estimates are not restored by padding,
+and Lanczos values beside such gaps may still be affected. Inspect
+coverage_rt.csv (especially usable_decoder_voxels) and alignment QC. Missing
+decoder features remain zero; the coverage flag alone does not block scoring.
+Use the same processing/interpolation policy when calibrating a decoder baseline.
+See docs/processing_masks.md for saved masks, provenance and validation status;
+native session replay of the newly integrated processing margin is pending.
+
 Per-volume output folders (under `func/<run_id>/`)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 - `raw/`: raw incoming NIfTI volumes before RT motion correction.
 - `mc/`: unwarped, motion-corrected volumes in the fixed corrected EPI reference space; saved once and shared by PCA, streaming, and original-score consumers.
 - `unwarped/`: optional `_uw_native` intermediate volumes after unwarping, before motion correction.
-- `reg/`: nuisance-cleaned (and voxel-normalized) volumes in native EPI space; this is the source volume that is later warped when `analysis_space` is `t1` or `mni`.
+- `reg/`: cumulative-GLM output in native EPI intensity units, including the processing margin when spatial mapping follows (warmup is not yet a fitted residual).
+- `norm/`: post-GLM voxel-normalized volumes in session EPI space, with the same processing margin; this is the source later spatially mapped and restricted to final brain/analysis support.
 - `t1/` (only when `analysis_space = "t1"`):
-  - `vol_XXXXX_t1.nii`: the `reg/` volume warped to T1/decoder space (used for denoised scoring).
+  - `vol_XXXXX_t1.nii`: the `norm/` volume warped to T1/decoder space (used for denoised scoring).
   - `vol_XXXXX_t1_orig.nii`: the fully corrected `mc/` volume warped to T1/decoder space (used as the non-denoised comparison score).
 - `mni/` (only when `analysis_space = "mni"`): equivalent pair (`*_mni.nii` and `*_mni_orig.nii`) in MNI/decoder space.
 

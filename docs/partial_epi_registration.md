@@ -1,213 +1,181 @@
-# Preparing EPI-to-anatomy registration
+# Registration, offline reuse and session alignment
 
-Preparation uses one T1-to-EPI registration recipe for both full-brain and
-partial-coverage acquisitions. ANTs fixes the corrected session EPI reference
-and moves the anatomical T1. Header-based identity initialization is followed
-by Translation and Rigid optimization, with optional SyN refinement.
+Offline assets are optional. With no prior participant data, run `run_preproc.py`
+(or the RS launcher) on the current T1/AP/PA/reference BOLD. With existing data,
+import fMRIPrep or export a prepared DecNef day using `prepare_offline.py`.
+See [the exact input files and commands](offline_preparation.md).
 
-For new full-brain preparations, this changes the previous recipe: there is no
-Affine stage, and SyN is now disabled by default. Existing prepared transforms
-remain usable by realtime consumers. Registration does not reconstruct cortex
-outside the acquired field of view.
+Both routes then use a current-session EPI-to-EPI alignment. A separate resting
+state is not required for spatial preparation. Current-run denoising warmup and
+feedback calibration are separate requirements.
 
-## Settings
+## Anatomical recipe
 
-| Setting | Default | Choices and effect |
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `registration_initialization` | `"identity"` | `"identity"` uses the image headers as the starting alignment. `"center_of_mass"` explicitly aligns intensity centroids first. `"auto"` is a compatibility alias for `"identity"`. |
-| `registration_syn` | `false` | Boolean; `true` adds SyN nonlinear refinement after Translation and Rigid. |
+| registration_direction | epi_to_t1 | epi_to_t1 or t1_to_epi |
+| registration_initialization | identity | Header coordinates; center_of_mass explicit; auto aliases identity |
+| registration_syn | true | SyN after Rigid/Affine; false retains Rigid/Affine |
+| epi_reference_n4 | true | N4-correct a separate EPI reference for registration fitting |
+| offline_assets | null | Path to an imported/exported assets.json |
+| registration_qc_policy | null | Study-validated numeric thresholds; absent means visual review |
 
-Identity initialization relies on the image headers already placing EPI and T1
-reasonably near one another. It avoids shifting a partial slab to match the
-center of mass of the entire T1. If headers do not provide a suitable starting
-point, inspect the images and choose initialization explicitly. These settings
-do not establish that registration succeeded; inspect the resulting alignment.
+Both estimation directions use the same restored stages:
 
-All three preparation entry points load a profile only when given
-`--settings-file /path/to/participant_settings.json`. Without this argument they
-use built-in defaults; they do not automatically discover `rt_settings.json`.
-These fields can be included in a complete participant profile:
+| Stage | Iteration limits | Shrink factors | Smoothing (vox) |
+| --- | --- | --- | --- |
+| Rigid[0.1] | 1000x500x250x100 | 8x4x2x1 | 3x2x1x0 |
+| Affine[0.1] | 1000x500x250x100 | 8x4x2x1 | 3x2x1x0 |
+| SyN[0.1,1,0] | 100x70x50x20 | 6x4x2x1 | 3x2x1x0 |
 
-```json
-{
-  "registration_initialization": "identity",
-  "registration_syn": false
-}
-```
+Each stage uses MI, 32 bins, Regular sampling 0.2, tolerance 1e-7, window 15.
+Affine/SyN restore June/September stage schedules, with the subsequently requested
+Rigid stage first. These limits do not guarantee convergence. Reversing fixed
+and moving changes physical pyramid resolution when voxel sizes differ.
 
-Explicit CLI options override the corresponding profile values. Omitted options
-preserve the profile values. Use `--registration-initialization center_of_mass`,
-`--registration-syn`, or `--no-registration-syn` as needed. The effective
-registration settings are saved in the prepared session's `config.json`.
+Masks follow the corresponding images in either direction. Identity assumes
+reasonable header overlap; a partial slab's centroid is not a full brain's
+centroid, so choose centre-of-mass initialization deliberately.
 
-There is no active `registration_mode` setting or `--registration-mode` flag.
-For old JSON profiles, known `registration_mode` values (`"full_brain"` and
-`"partial_epi"`) are accepted with a warning and ignored. The old JSON key
-`partial_epi_syn` maps to `registration_syn` with a warning; supplying conflicting
-values for both keys is rejected. The old `--partial-epi-syn` CLI flag is replaced
-by `--registration-syn`.
-
-## Registration and transform directions
-
-For either acquisition coverage, ANTs fixes the corrected session EPI reference
-and moves `anat/T1_brain.nii` (the SynthStrip brain extracted from the
-N4-corrected T1).
-The metric is mutual information, restricted by the EPI brain mask. Translation
-uses a single resolution; Rigid uses shrink factors `2x2x1`. Optional SyN uses
-`2x1`. The schedules follow the [ANTs-linked partial-slab example](https://github.com/ntustison/PartialSlabEpiT1ImageRegistration).
-Our default initialization uses identity, rather than the example's
-center of mass, to retain a reasonable alignment already provided by the headers.
-Translation and rotation are still optimized after identity initialization.
-
-The files in `func/trans` retain their existing semantic directions:
-
-| File | Meaning and consumers |
-| --- | --- |
-| `epi2t1_Composite.h5` | EPI → T1. BOLD resampling and EPI-mask mapping. Copied from the native **inverse** transform. |
-| `epi2t1_InverseComposite.h5` | T1 → EPI. WM, ventricle, cortical and custom T1 masks. Copied from the native **forward** transform. |
-| `epi2t1_Warped.nii` | Corrected EPI reference on the T1 grid; inspect against `anat/T1_N4.nii`. |
-| `epi2t1_InverseWarped.nii` | T1 on the EPI grid; inspect against `epi_unwarped_mean.nii`. |
-
-New native ANTs outputs are retained under `t1_to_epi_*`.
-`registration.json` version 2 records their relationship to the canonical filenames.
-For MNI BOLD output, `antsApplyTransforms` receives
-`-t warp_T1_to_MNI_synth.nii -t epi2t1_Composite.h5`: EPI → T1, then T1 → MNI.
-The `-r` reference selects the output grid. Tissue masks retain nearest-neighbor
-interpolation. CPU and GPU paths use the same semantic transform chain.
-
-## Preparation commands
-
-The same settings-file loading and registration CLI overrides apply to all three
-entry points:
-
-| Command | Role |
-| --- | --- |
-| `run_preproc.py` | Prepare the session reference, transforms and masks directly. |
-| `rs_realtime_parallel.py` | Prepare if needed, then run resting-state acquisition and calibration. |
-| `rs_pca_score_all_rois.py` | Prepare if needed, then process resting-state data and score existing ROI PCA models. |
-
-Replace example identifiers, paths and scanner series numbers with the actual
-values. Direct preparation:
+All launchers accept the shared registration CLI flags and JSON profile fields.
+Explicit CLI values override profiles. A profile containing
+`"registration_syn": false` still disables SyN and must be updated if unwanted.
+`--epi-reference-n4` and `--no-epi-reference-n4` explicitly override the JSON
+`epi_reference_n4` boolean; omission preserves the profile.
 
 ```bash
-python run_preproc.py \
-  --sub 99988 --day session-10 \
-  --base-data /SSD2/DecNef_py/data \
-  --incoming-root /path/to/session_dicoms \
-  --struct-block 1 --ap-block 2 --pa-block 3 --epi-block 4 \
-  --settings-file /path/to/participant_settings.json
+python run_preproc.py --sub 001 --day 1 --base-data /data \
+  --incoming-root /scanner/export --struct-block 1 \
+  --ap-block 2 --pa-block 3 --epi-block 4 \
+  --registration-direction t1_to_epi --registration-syn
 ```
 
-Automatic preparation from the resting-state launcher:
+`epi2t1_Composite.h5` always maps EPI images into T1; InverseComposite maps T1
+into EPI. Warped is EPI on the T1 grid; InverseWarped is T1 on the EPI grid.
+Native outputs are retained without changing their headers. Canonical warped
+images and registration QC use the original image intensities through the fitted
+transforms, even when N4-enhanced images were used to estimate them.
+`registration.json` identifies the recipe and reference-enhancement settings; older short-recipe caches
+are not silently reinterpreted as the restored nonlinear fit.
+
+The reference preparation order is unwarping → motion correction → observed-sample
+mean → SynthStrip brain mask → N4 registration copy → spatial fitting. With
+`epi_reference_n4: true`, `epi_registration_reference.nii` and its `.json` sidecar
+are saved in the transform folder. The original `epi_unwarped_mean.nii` remains
+the motion-correction target. N4 does not run on each incoming volume, change the
+existing brain mask, or replace the intensities entering temporal processing.
+
+For the EPI bridge, the current-session fitting reference receives N4. An offline
+bundle's optional `epi_registration_reference` is reused as the anchor; legacy
+bundles identified as fMRIPrep imports reuse their already enhanced reference.
+An older raw prepared anchor instead receives N4 in a local copy named
+`reference_epi_registration.nii`. Input bundles are not modified. Setting
+`epi_reference_n4: false` uses the original references for fitting.
+
+Earlier isolated Linux experiments measured approximately 4.1 seconds for N4
+per reference; an older raw anchor may require a second reference correction.
+This is preparation cost, not per-TR work, and is not a new end-to-end runtime
+benchmark. N4 improved some difficult fits but did not rescue every case; assess
+the transformed original images and anatomy, not increased N4-image correlation
+alone. This tested after-MC N4 placement is not an exact recreation of fMRIPrep's
+reference workflow.
+
+Changing this setting requires fresh anatomical/session preparation and renewed
+QC. Existing transforms are not silently reused as if N4 had been enabled when
+they were fitted; keep the previous preparation intact for comparison.
+
+## Session preparation and gate
+
+Scans 11-30 of a current reference acquisition are unwarped, motion corrected,
+and averaged over acquired observations. Prefer a short reference block before
+NF when visual review is required. The NF launcher can prepare from its initial
+volumes if no session reference exists, but a required review stops startup;
+do not begin the timed task before preparation/QC is finished.
 
 ```bash
-python rs_realtime_parallel.py \
-  --sub 99988 --day session-10 --run 4 \
-  --base-data /SSD2/DecNef_py/data \
-  --incoming-root /path/to/session_dicoms \
-  --struct-block 1 --ap-block 2 --pa-block 3 \
-  --settings-file /path/to/participant_settings.json
+python prepare_session.py --sub 001 --day 1 --base-data /data \
+  --incoming-root /scanner/export --reference-run 4 \
+  --ap-block 2 --pa-block 3 --settings-file study_settings.json
 ```
 
-Resting-state scoring with existing ROI PCA models:
+For offline reuse, add `--offline-assets /data/sub-001/offline/assets.json`
+or put the same path in the settings file used by NF.
+
+The bridge fixes current EPI and moves the prepared EPI, using their masks.
+It is a separate rigid MI fit: 500x250x50 iterations, shrink 2x2x1, smoothing
+2x1x0. The inverse supplies current EPI -> prepared EPI. Very small slabs can
+have insufficient information; a current whole-brain EPI intermediate may help.
+
+Files in `day/func/session_trans/`:
+
+- `epi_unwarped_mean.nii`, `epi_mask_mean.nii`: current MC reference/grid.
+- `epi_registration_reference.nii` and `.json`: N4 fitting copy and provenance when enabled.
+- `reference_epi.nii`, `reference_epi_mask.nii`: stable prepared EPI grid.
+- `reference_epi_registration.nii`: selected enhanced bridge anchor when N4 is enabled.
+- `session_to_reference_*.h5`: EPI bridge and inverse.
+- `epi2t1_*.h5`: composed current-EPI/T1 mappings.
+- `offline_anat/`: exact anatomical images and masks.
+- `registration_qc_*.json/.png`: EPI/EPI, EPI/T1 and T1/template diagnostics.
+- `session_alignment.json`: frozen sources, settings, outputs and QC set.
+
+Review overlays/reports, then record explicit review:
 
 ```bash
-python rs_pca_score_all_rois.py \
-  --sub 99988 --day session-10 --run 4 \
-  --base-data /SSD2/DecNef_py/data \
-  --incoming-root /path/to/session_dicoms \
-  --struct-block 1 --ap-block 2 --pa-block 3 \
-  --pca-root /path/to/existing_pca_models \
-  --settings-file /path/to/participant_settings.json
+python check_registration.py --trans /data/sub-001/1/func/session_trans \
+  --approve --reviewer YourName
 ```
 
-All three commands check registration-cache compatibility before scan staging or
-costly preparation. Both automatic launchers forward the resolved choices to
-`run_preproc.py`. Neurofeedback, PsychoPy, robot and BrainPong launchers consume
-the prepared maps; they need no separate partial-coverage registration flags.
+The gate is checked before every NF run; unchanged approvals are reused.
+Later runs retain the current-session MC target. Changed slab geometry requires
+new preparation. Run-specific fieldmaps remain native to their acquisitions.
 
-## Existing prepared sessions
+In EPI analysis mode, NF output is mapped to the stable prepared EPI grid and
+saved in `epi_ref/`. EPI decoders must match that grid. T1/MNI output uses the
+composed mapping directly. This keeps native-grid MC/denoising separate from
+the decoder's coordinate system.
 
-The registration cache records the selected recipe and its inputs and outputs.
-An incompatible request is refused before scan staging, costly preparation, or
-rewriting `config.json`. The automatic launchers also check before waiting for
-reference scans; the RS launcher checks before starting its display. The check
-does not delete or overwrite an incompatible preparation.
+See [QC metrics and threshold rules](registration_qc.md). Pearson correlation is
+for EPI/EPI or T1/template; EPI/T1 uses cross-contrast metrics and overlays.
+June decoder-score reproducibility r=0.83 is not an alignment threshold.
 
-New registrations use `registration.json` version 2. A version 1 partial-EPI
-preparation can be reused when its resolved initialization, SyN choice, input
-identities and canonical output identities match. Its existing files and marker
-are retained without renaming or refitting. Version 1 full-brain registrations
-and unversioned transform caches cannot certify the new recipe and are rejected
-by preparation; use a fresh preparation/session directory for a new fit.
+## Coverage and normalization
 
-New fits are published only after both transform files and diagnostic image
-grids are checked. `registration_pending.json` marks an interrupted preparation;
-it must not be treated as a finished registration. GPU grids from older code
-are rebuilt once because they lack transform provenance. Subsequent reuse checks
-both image geometries and the contents of the transform files.
+Raw MC images can contain extracranial MRI signal. Final analysis outputs are
+explicitly zeroed outside valid brain support. Negative and exactly-zero
+denoised values inside that support remain valid observations. Intermediate
+`reg/` and `norm/` images can retain a processing margin around the anatomical
+brain mask to supply spatial-interpolation neighbours; see
+[processing_masks.md](processing_masks.md).
 
-Existing realtime consumers can still use unchanged legacy full-brain
-preparations; the new preparation checks do not refit them automatically.
-New runs record spatial transforms and enabled nuisance-mask inputs; an old run
-directory cannot be reused with a newly versioned registration. The per-volume coverage update also
-requires a fresh run output directory for runs processed before that update;
-this alone does not require rebuilding an unchanged registration.
+Warmup retains raw units and reg_ready=false within the processing mask.
+The cumulative GLM fits and emits residuals in native intensity units.
+Voxel normalization follows it in the session EPI grid, before spatial
+transforms and smoothing. The default is `voxel_norm_mode: "zscore"`,
+`voxel_norm_reference: "fixed"`, and `voxel_norm_ref_volumes: 30`: collect
+30 emitted regression-ready residuals, freeze their voxel-wise mean and sample
+SD, and normalize from the next volume. This calibration is additional to GLM
+startup. `running` uses prior observations and updates after the current volume.
+The alternative `mean` is `100 * residual / raw_MC_reference_mean`; it never
+divides by the residual mean. Mean mode calibrates raw MC observations during
+GLM startup. Both modes exclude missing observations and do not clip values.
+`reg/` contains native-unit output; `norm/` contains normalized EPI output and
+is zero-filled until normalization is ready. Scores remain NaN until GLM and
+normalization are ready; the status CSV records both flags separately.
+Spatial interpolation/smoothing can change voxel variance afterward.
 
-When changing an existing preparation to the new recipe or incompatible settings,
-use a fresh preparation/session directory. Rebuild the corrected reference,
-registration and derived masks together, then point the intended runs at that
-prepared session. Do not mix its transforms with an old reference or manually
-remove the cache record to bypass the check.
+The cumulative GLM uses a conservative complete-history policy: a voxel that
+loses acquisition coverage remains unavailable for that run. This avoids fitting
+missing values as measured zeros, but can reduce coverage at moving slab edges.
+Feature indexing and decoder weights stay fixed; unavailable entries are zero.
+`coverage_rt.csv` reports acquired/usable brain and decoder fractions.
+Without regression, calibrated voxels may reappear when coverage returns.
+Empty enabled tissue masks make that timepoint unavailable for fitting.
+DVARS uses the intersection of adjacent volumes' acquired support.
 
-This is separate from `truncate_t1_to_epi_fov`, which crops a PCA output reference
-after an EPI-to-T1 transform already exists. Cropping does not fix registration
-and does not restore missing decoder features. Check the transformed EPI against
-the acquired portion of T1, the WM/ventricle mask overlap, and decoder coverage
-before using the prepared data for feedback.
+`coverage/` is geometric FOV, `support/` is actual analysis support, and
+`support_original/` is written only when the optional original stream differs.
+Smoothing normalizes within actual support. Equal support mappings are reused;
+distinct masks add resampling work, which must be timed on the scanner.
 
-Command construction and cache handling are covered by automated tests. Native
-ANTs anatomical alignment has not been validated in this Windows development
-environment; inspect registration QC on representative full-brain and partial
-acquisitions before relying on the new recipe.
-
-## Coverage after motion correction
-
-The anatomical analysis mask describes the selected brain tissue. It is separate
-from each volume's geometric field of view. Motion can move an acquisition edge
-inside that fixed mask, especially with partial coverage.
-
-Each realtime volume now reapplies its already estimated motion to an all-ones
-support image using AFNI linear interpolation, without another registration.
-Only fully supported samples are retained (`support >= 1 - 1e-5`). Support is
-mapped through the same EPI → T1/MNI transform chain and intersected with the
-analysis mask for smoothing. The Gaussian numerator and denominator use this
-intersection, and unavailable output voxels stay zero. Valid zero and negative
-residuals are retained. When coverage includes the full analysis mask, the cached
-smoothing denominator is reused.
-
-Coverage images are saved under the run's `coverage/` directory as
-`vol_00001_epi.nii` and, for transformed output, `vol_00001_t1.nii` or
-`vol_00001_mni.nii`. They contain binary validity, not BOLD intensities. The
-`mc_fov_v1` policy is recorded in run provenance to prevent mixing old and new
-processing. Coverage work is included in the existing MC and TRANS speed timings.
-The CPU transform path performs an additional mask warp per volume; the GPU path
-uses its existing sampling grid.
-
-This support represents the corrected input array's geometric extent through MC
-and final resampling. It is not per-volume brain segmentation or detection of
-signal dropout; it does not detect PyHySCO border extrapolation or certify every
-tap of the wider heptic BOLD interpolation kernel. It also does not implement
-missing-observation fitting in the cumulative GLM: missing samples can still
-affect calibration means, nuisance estimates and earlier fitted coefficients.
-Unsupported current residuals are zeroed before final spatial interpolation.
-Decoder weights are unchanged; unavailable features are not recovered.
-
-## Online volume viewer
-
-With the existing volume streamer enabled, the first row continues to show
-`volume_stream_kind`. The second row shows the same volume's T1-stage image,
-after spatial resampling and coverage masking, before smoothing. It is explicitly
-unavailable for runs that do not produce a T1 intermediate (EPI or combined MNI
-processing); displaying QC does not add a T1 registration or resampling step.
-Each row uses its own geometry, canonical orientation and display contrast.
+Use fresh run output directories for this coverage/normalization version.
+Existing outputs are preserved; do not mix them into the new temporal history.

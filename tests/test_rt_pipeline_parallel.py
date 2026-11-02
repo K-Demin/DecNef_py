@@ -6,6 +6,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 watchdog_mod = types.ModuleType("watchdog")
 watchdog_observers = types.ModuleType("watchdog.observers")
@@ -72,9 +73,34 @@ class DummyRegressor:
     def __init__(self):
         self.calls = 0
 
-    def apply(self, mc_img, volume_idx, fd_censor=0, dvars_censor=0):
+    def apply(self, mc_img, volume_idx, fd_censor=0, dvars_censor=0, support_mask=None):
         self.calls += 1
-        return np.asanyarray(mc_img.dataobj), self.calls >= 2
+        # This fixture isolates orchestration, not cumulative-GLM warmup.
+        return np.asanyarray(mc_img.dataobj), True
+
+
+class IdentityVoxelNormalizer:
+    """Explicit identity stage for tests of unrelated processing operators."""
+
+    mode = "zscore"
+    reference = "fixed"
+    ref_volumes = 2
+    reference_count = 2
+    ready = True
+    brain_mask = None
+    mean = std = count = None
+
+    def __init__(self):
+        self.output_support = None
+
+    def transform(self, data, support_mask=None):
+        data = np.asarray(data, dtype=np.float32)
+        self.output_support = (np.ones(data.shape, dtype=bool) if support_mask is None
+                               else np.asarray(support_mask, dtype=bool).copy())
+        return np.where(self.output_support, data, 0.).astype(np.float32)
+
+    def observe(self, data, support_mask=None):
+        return None
 
 
 def _mk_handler(tmp_path: Path):
@@ -107,7 +133,7 @@ def _mk_handler(tmp_path: Path):
     h.cfg = DummyCfg(tmp_path)
     h.motion_regressor = DummyRegressor()
     h.proc_src = rt_pipeline.ProcSrc()
-    h.voxel_normalizer = rt_pipeline.RTPStyleVoxelNormalizer(ref_volumes=1)
+    h.voxel_normalizer = IdentityVoxelNormalizer()
     h.scorer = None
     h.score_event_tracker = None
     h.score_queue = queue.Queue()
@@ -204,3 +230,63 @@ def test_commit_stage_fd_dvars_and_regression_progression(tmp_path):
 
     assert called["volume_idx"] == 7
     assert called["raw_nii"] == Path("raw.nii")
+
+
+@pytest.mark.parametrize("outcome", [False, "exception", True])
+def test_legacy_retries_conversion_but_never_repeats_stateful_processing(tmp_path, monkeypatch, outcome):
+    handler = _mk_handler(tmp_path)
+    handler.current_run = 8
+    handler._next_scan_to_process = 1
+    advanced, timing, prepared, processed = [], [], [], []
+    handler._advance_expected_scan_locked = lambda: advanced.append(1)
+    handler.speed = types.SimpleNamespace(
+        process_start=lambda volume: timing.append(("start", volume)) or 12.,
+        process_end=lambda volume, started: timing.append(("end", volume, started)),
+        finish=lambda volume, success: timing.append(("finish", volume, success)),
+    )
+    monkeypatch.setattr(rt_pipeline.REGRESSOR_SETTINGS, "max_retries", 3)
+    monkeypatch.setattr(rt_pipeline.time, "sleep", lambda seconds: None)
+
+    def prepare(cfg, path, volume, speed):
+        prepared.append(volume)
+        return (None, None) if len(prepared) < 3 else (Path("raw.nii"), 123.)
+
+    def process(cfg, h, path, volume, **kwargs):
+        processed.append((volume, kwargs))
+        if outcome == "exception":
+            raise RuntimeError("Failure after normalization advanced")
+        return outcome
+
+    monkeypatch.setattr(rt_pipeline, "prepare_volume_input", prepare)
+    monkeypatch.setattr(rt_pipeline, "process_volume", process)
+    rt_pipeline.DICOMHandler._process_scan(handler, Path("1.dcm"), 1, 1)
+
+    assert prepared == [1, 1, 1]
+    assert processed == [(1, {"raw_nii": Path("raw.nii"), "volume_timestamp": 123.})]
+    assert timing == [("start", 1), ("end", 1, 12.), ("finish", 1, outcome is True)]
+    assert handler._processed_scans == {1}
+    assert 1 not in handler._inflight_scans
+    assert advanced == [1]
+
+
+def test_legacy_conversion_exhaustion_finishes_without_entering_stateful_processing(tmp_path, monkeypatch):
+    handler = _mk_handler(tmp_path)
+    handler.current_run = 8
+    handler._next_scan_to_process = 1
+    handler.speed = None
+    prepared, advanced = [], []
+    handler._advance_expected_scan_locked = lambda: advanced.append(1)
+    monkeypatch.setattr(rt_pipeline.REGRESSOR_SETTINGS, "max_retries", 2)
+    monkeypatch.setattr(rt_pipeline.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(rt_pipeline, "prepare_volume_input",
+                        lambda *args: prepared.append(1) or (None, None))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No converted input must not enter stateful processing")
+
+    monkeypatch.setattr(rt_pipeline, "process_volume", forbidden)
+    rt_pipeline.DICOMHandler._process_scan(handler, Path("1.dcm"), 1, 1)
+    assert len(prepared) == 2
+    assert handler._processed_scans == {1}
+    assert 1 not in handler._inflight_scans
+    assert advanced == [1]

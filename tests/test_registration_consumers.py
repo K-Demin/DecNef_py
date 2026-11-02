@@ -218,12 +218,12 @@ def _legacy_run(tmp_path, monkeypatch):
     return cfg, marker
 
 
-def test_unchanged_legacy_full_brain_run_preserves_original_marker(tmp_path, monkeypatch):
+def test_legacy_output_units_cannot_mix_with_post_glm_normalization(tmp_path, monkeypatch):
     cfg, marker = _legacy_run(tmp_path, monkeypatch)
     saved = marker.read_bytes()
     mtime = marker.stat().st_mtime_ns
-    rt.validate_run_provenance(cfg)
-    rt.validate_run_provenance(cfg)
+    with pytest.raises(ValueError, match="normalization"):
+        rt.validate_run_provenance(cfg)
     assert marker.read_bytes() == saved
     assert marker.stat().st_mtime_ns == mtime
     assert "spatial_transform" not in json.loads(marker.read_text())

@@ -8,6 +8,7 @@ import time
 from fmri_rt_preproc.config import SubjectDayConfig
 from fmri_rt_preproc.pipeline import FMRIRealtimePreprocessor
 from fmri_rt_preproc.native_fieldmap import find_source
+from fmri_rt_preproc.offline_assets import load_offline_assets
 from fmri_rt_preproc.utils import ensure_dir, run  # <- to call fslmerge
 from rt_global_settings import (
     add_registration_arguments, apply_registration_arguments, load_regressor_settings,
@@ -281,11 +282,16 @@ def preflight_registration(
     ap_block: int | None = None,
     pa_block: int | None = None,
     registration_initialization: str = "identity",
-    registration_syn: bool = False,
+    registration_syn: bool = True,
+    registration_direction: str = "epi_to_t1",
+    offline_assets=None,
+    registration_qc_policy=None,
+    epi_reference_n4: bool = True,
 ) -> None:
     """Reject an incompatible prepared session before staging or waiting for scans."""
     root = Path(base_data) / f"sub-{subject}" / day
     fmap_dir = _fieldmap_pair_dir(root / "fmap", ap_block, pa_block)
+    assets = load_offline_assets(offline_assets, subject) if offline_assets else None
     cfg = SubjectDayConfig.for_single_run(
         subject_id=subject, day_id=day, root=root, run_id="trans",
         epi_file=root / "func" / "trans" / "epi_4d.nii.gz",
@@ -293,6 +299,11 @@ def preflight_registration(
         fieldmap_dir=fmap_dir,
         registration_initialization=registration_initialization,
         registration_syn=registration_syn,
+        registration_direction=registration_direction,
+        offline_assets=offline_assets,
+        registration_qc_policy=registration_qc_policy,
+        epi_reference_n4=epi_reference_n4,
+        mni_template=assets["mni_template"] if assets else None,
     )
     FMRIRealtimePreprocessor(cfg).validate_registration_request()
 
@@ -382,10 +393,14 @@ def main():
     args = parser.parse_args()
     settings = load_regressor_settings(args.settings_file)
     apply_registration_arguments(settings, args)
+    assets = load_offline_assets(settings.offline_assets, args.sub) if settings.offline_assets else None
 
     preflight_registration(
         args.base_data, args.sub, args.day, args.ap_block, args.pa_block,
         settings.registration_initialization, settings.registration_syn,
+        registration_direction=settings.registration_direction, offline_assets=settings.offline_assets,
+        registration_qc_policy=settings.registration_qc_policy,
+        epi_reference_n4=settings.epi_reference_n4,
     )
 
     # data/sub-0001/3
@@ -417,7 +432,7 @@ def main():
                 "so the correct DICOM runs can be staged."
             )
 
-        if args.struct_block is None and not structural_present:
+        if args.struct_block is None and not structural_present and not assets:
             raise ValueError(
                 "When providing --incoming-root you must set --struct-block unless the anat "
                 "folder already contains a structural scan."
@@ -466,7 +481,7 @@ def main():
     # 2) Build a config for this single run
     # ------------------------------------------------------------------
     # NOTE: we don't have args.run anymore; just give a fixed run_id
-    t1_path = _find_structural(day_root.parent / "anat")
+    t1_path = assets["t1"] if assets else _find_structural(day_root.parent / "anat")
     fmap_root = day_root / "fmap"
     fmap_dir = _fieldmap_pair_dir(fmap_root, args.ap_block, args.pa_block)
     ap_path = _find_fieldmap(fmap_dir, "AP")
@@ -484,8 +499,15 @@ def main():
         fieldmap_dir=fmap_dir,
         registration_initialization=settings.registration_initialization,
         registration_syn=settings.registration_syn,
+        registration_direction=settings.registration_direction,
+        offline_assets=settings.offline_assets,
+        registration_qc_policy=settings.registration_qc_policy,
+        epi_reference_n4=settings.epi_reference_n4,
+        mni_template=assets["mni_template"] if assets else None,
     )
 
+    cfg.fieldmap_method = settings.fieldmap_method
+    cfg.epi_phase_encoding = settings.epi_phase_encoding
     pipe = FMRIRealtimePreprocessor(cfg)
     pipe.validate_registration_request()
 

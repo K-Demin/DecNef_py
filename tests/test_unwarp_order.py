@@ -175,6 +175,9 @@ def test_new_reference_is_made_from_unwarped_bold(tmp_path, monkeypatch):
             np.testing.assert_array_equal(img.get_fdata(), data[..., vol_idx])
             img._dataobj = np.roll(np.asarray(img.dataobj), 1, axis=0)
 
+        def resample_support(self, support, vol_idx):
+            return support.copy()
+
     monkeypatch.setattr("fmri_rt_preproc.pipeline.RtpVolreg", Volreg)
     pipe._motion_correct_and_mean(source, mean)
     assert refs == [str(source) + "[0]"]

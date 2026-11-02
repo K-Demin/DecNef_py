@@ -33,9 +33,9 @@ USE_ZSCORE = True
 SEED = 0
 
 # Choose which data to use for PCA (NOT for tSNR):
-#   "auto" : current behavior (prefer reg/, else mc/, else anything)
+#   "auto" : prefer final normalized/denoised stream (legacy: reg/, then mc/)
 #   "mc"   : force motion-corrected only (avoid regressed/denoised)
-#   "reg"  : force regressed/denoised only (prefer reg/)
+#   "reg"  : normalized EPI stream (norm/ or bridged epi_ref/; legacy: reg/)
 #   "t1"   : force T1-space realtime outputs
 PCA_INPUT_MODE = "reg"   # one of: "auto", "mc", "reg", "t1"
 SEPARATE_OUTPUTS_BY_MODE = True  # True => write outputs under .../PCA/<run>/pca_<mode>/
@@ -72,6 +72,7 @@ import argparse
 from dataclasses import dataclass
 from importlib import util
 from pathlib import Path
+from fmri_rt_preproc.processing_mask import upstream_processing_spec
 from typing import Iterable, List, Optional, Sequence, Tuple
 import time
 
@@ -235,6 +236,68 @@ def compute_tsnr_streaming(nifti_path: Path, n_skip: int = 0):
     return tsnr_map, img.affine, img.header, T, n
 
 
+def _modern_series_4d(run_dir: Path, folder: str, suffix: str, info: dict) -> Path:
+    """Merge only actual TR images, preserving scanner indices for readiness/QC."""
+    pattern = re.compile(rf"^vol_(\d+)_{re.escape(suffix)}\.nii(?:\.gz)?$")
+    indexed = []
+    for path in (run_dir / folder).glob("vol_*.nii*"):
+        match = pattern.fullmatch(path.name)
+        if match:
+            indexed.append((int(match.group(1)), path))
+    indexed.sort()
+    if not indexed:
+        raise FileNotFoundError(f"No {folder}/vol_*_{suffix}.nii[.gz] volumes found in {run_dir}.")
+    indices = [index for index, _ in indexed]
+    if indices != list(range(1, len(indices) + 1)):
+        raise ValueError(f"PCA requires a complete ordered series starting at volume 1: {folder}/{suffix}. "
+                         "Missing/duplicate TRs cannot be aligned safely with readiness, motion and FD rows.")
+    volumes = [path for _, path in indexed]
+    out_dir = run_dir / FSLMERGE_OUTDIR_NAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged = out_dir / f"{PREFER_MERGED_BASENAME}_{suffix}.nii.gz"
+    sidecar = merged.with_name(merged.name + ".sources.json")
+    identity = {
+        "normalization": info["normalization"],
+        "sources": [{"path": str(path.resolve()), "size": path.stat().st_size,
+                     "mtime_ns": path.stat().st_mtime_ns} for path in volumes],
+    }
+    try:
+        current = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        current = None
+    if FORCE_REBUILD_4D or not merged.exists() or current != identity:
+        if not AUTO_FSLMERGE_4D or not _run_fslmerge(volumes, merged):
+            raise RuntimeError(f"Failed to merge modern PCA {suffix} series; enable AUTO_FSLMERGE_4D and install FSL.")
+        sidecar.write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    if len(nib.load(str(merged)).shape) != 4 or nib.load(str(merged)).shape[3] != len(indices):
+        raise ValueError(f"Merged PCA series has an unexpected TR count: {merged}")
+    return merged
+
+
+def _discover_modern_rs_inputs(run_dir: Path, pca_mode: str, info: dict) -> Tuple[Path, Path]:
+    space = info.get("regression", {}).get("analysis_space", "mni")
+    mapped = space == "epi" and info.get("epi_reference_mapped", False)
+    kind = ("epi_ref" if mapped else "norm") if pca_mode in {"auto", "reg"} else pca_mode
+    pca_rs = _modern_series_4d(run_dir, kind, kind, info)
+    if kind in {"norm", "mc"} or (kind in {"smooth", "masked"} and space == "epi" and not mapped):
+        original_folder = original_suffix = "mc"
+    else:
+        original_folder = ("epi_ref" if mapped else space) if kind in {"smooth", "masked"} else kind
+        original_suffix = original_folder + "_orig"
+    try:
+        tsnr_rs = _modern_series_4d(run_dir, original_folder, original_suffix, info)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "Modern PCA preparation needs original-intensity data in the same grid for tSNR voxel ranking; "
+            "normalized residuals cannot supply tSNR. Keep mc/ for native EPI, or use "
+            f"--enable-original-score when processing this run to create {original_folder}/*_{original_suffix}.nii."
+        ) from exc
+    pca_img, tsnr_img = nib.load(str(pca_rs)), nib.load(str(tsnr_rs))
+    if pca_img.shape != tsnr_img.shape or not np.allclose(pca_img.affine, tsnr_img.affine, atol=1e-3):
+        raise ValueError("PCA and original-intensity tSNR series must have matching grids and TR counts.")
+    return pca_rs, tsnr_rs
+
+
 def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Path]:
     """
     Deterministic:
@@ -258,6 +321,8 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
             pca_mode = output_kind
         if pca_mode in {"smooth", "masked"} and pca_mode != output_kind:
             raise ValueError(f"PCA {pca_mode} input is disabled for this run.")
+        if "normalization" in info:
+            return _discover_modern_rs_inputs(run_dir, pca_mode, info)
 
     if pca_mode in {"smooth", "masked"}:
         # Exact suffix excludes mask.nii, *_smooth_orig.nii, and partial files.
@@ -606,6 +671,7 @@ def _load_regression_keep_mask(
     t_expected: int,
     *,
     drop_first_ready: bool = True,
+    require_normalization: bool = False,
 ) -> tuple[Optional[np.ndarray], dict]:
     status_path = run_dir / "regression_status_rt.csv"
     meta = {
@@ -622,7 +688,10 @@ def _load_regression_keep_mask(
     try:
         with status_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
-            if not reader.fieldnames or "volume_idx" not in reader.fieldnames or "reg_ready" not in reader.fieldnames:
+            required = {"volume_idx", "reg_ready"}
+            if require_normalization:
+                required.update({"glm_ready", "normalization_ready"})
+            if not required.issubset(reader.fieldnames or []):
                 meta["status"] = "missing_columns"
                 meta["columns"] = reader.fieldnames or []
                 return None, meta
@@ -630,6 +699,8 @@ def _load_regression_keep_mask(
                 try:
                     volume_idx = int(row["volume_idx"])
                     reg_ready = bool(int(row["reg_ready"]))
+                    if require_normalization:
+                        reg_ready = reg_ready and bool(int(row["glm_ready"])) and bool(int(row["normalization_ready"]))
                 except (TypeError, ValueError):
                     continue
                 rows_seen += 1
@@ -674,7 +745,8 @@ def _requires_regression_ready_filter(pca_input_mode: str, pca_rs_path: Optional
         return False
     name = pca_rs_path.name.lower()
     parent = pca_rs_path.parent.name.lower()
-    return parent in {"reg", "t1", "smooth", "masked"} or any(tag in name for tag in ("_reg", "_t1", "_smooth", "_masked"))
+    return parent in {"reg", "norm", "epi_ref", "t1", "smooth", "masked"} or any(
+        tag in name for tag in ("_reg", "_norm", "_epi_ref", "_t1", "_smooth", "_masked"))
 
 
 def _initial_keep_mask(
@@ -683,8 +755,18 @@ def _initial_keep_mask(
     pca_input_mode: str,
     pca_rs_path: Optional[Path] = None,
 ) -> tuple[np.ndarray, dict]:
-    if _requires_regression_ready_filter(pca_input_mode, pca_rs_path):
-        keep, meta = _load_regression_keep_mask(run_dir, t_expected, drop_first_ready=True)
+    metadata = run_dir / "session_metadata.json"
+    info = json.loads(metadata.read_text(encoding="utf-8")) if metadata.exists() else {}
+    normalized = _requires_regression_ready_filter(pca_input_mode, pca_rs_path)
+    upstream = upstream_processing_spec(info, "normalized" if normalized else "raw_mc")
+    if normalized:
+        modern = "normalization" in info
+        keep, meta = _load_regression_keep_mask(
+            run_dir, t_expected, drop_first_ready=not modern, require_normalization=modern)
+        if modern:
+            meta["normalization"] = info["normalization"]
+            meta["readiness_semantics"] = "glm_and_normalization_ready"
+        meta["upstream_processing"] = upstream
         if keep is not None:
             print(
                 "[REGREADY] Keeping "
@@ -704,6 +786,7 @@ def _initial_keep_mask(
         keep[: min(N_SKIP_START, t_expected)] = False
     meta = {
         "source": "N_SKIP_START",
+        "upstream_processing": upstream,
         "n_skip_start": int(N_SKIP_START),
         "kept_count": int(np.sum(keep)),
         "excluded_count": int(t_expected - np.sum(keep)),
@@ -1247,6 +1330,8 @@ def process_dataset(
             "use_zscore": USE_ZSCORE,
             "min_neighbors": MIN_NEIGHBORS,
             "pca_input_mode": PCA_INPUT_MODE,
+            "upstream_normalization": initial_keep_meta.get("normalization"),
+            "upstream_processing": initial_keep_meta.get("upstream_processing"),
             "pca_svd_solver": PCA_SVD_SOLVER,
             "compress_decoder_bundle": COMPRESS_DECODER_BUNDLE,
             "save_component_maps": SAVE_COMPONENT_MAPS,

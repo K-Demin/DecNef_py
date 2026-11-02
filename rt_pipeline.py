@@ -25,7 +25,14 @@ from fmri_rt_preproc.native_fieldmap import (
 
 from motion_fd import fd_from_rtpspy_delta
 from fmri_rt_preproc.volume_smooth import prepare_smoother, smooth_file
-from fmri_rt_preproc.analysis_mask import final_output_kind, mask_provenance
+from fmri_rt_preproc.analysis_mask import (
+    final_output_kind, mask_provenance, session_epi_bridge, epi_output_reference,
+    prepare_analysis_mask,
+)
+from fmri_rt_preproc.processing_mask import (
+    make_processing_mask, processing_margin_vox,
+    PROCESSING_MASK_POLICY, PROCESSING_MASK_POLICY_VERSION,
+)
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -58,8 +65,86 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
-COVERAGE_POLICY = "mc_fov_v1"
+COVERAGE_POLICY = "separate_brain_processing_observed_support_v3"
+
+from fmri_rt_preproc.offline_assets import t1_to_mni_transform
+from fmri_rt_preproc.voxel_normalization import VoxelNormalizer
 SUPPORT_THRESHOLD = 1.0 - 1e-5
+
+
+def normalization_spec():
+    return {"version": 1, "stage": "after_glm_before_spatial_resampling",
+            "space": "epi", "glm_input_units": "native",
+            "mode": getattr(REGRESSOR_SETTINGS, "voxel_norm_mode", "zscore"),
+            "reference": getattr(REGRESSOR_SETTINGS, "voxel_norm_reference", "fixed"),
+            "ref_volumes": int(getattr(REGRESSOR_SETTINGS, "voxel_norm_ref_volumes", 30)),
+            "current_volume_in_reference": False, "sample_sd_ddof": 1,
+            "mean_denominator": "raw_motion_corrected_bold", "clipping": None}
+
+
+def processing_mask_spec(cfg):
+    """Record the source mask and deterministic interpolation margin."""
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    spatial = space in {"t1", "mni"} or session_epi_bridge(cfg) is not None
+    interpolation = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower()
+    path = getattr(cfg, "rt_unwarped_analysis_ref_mask", None)
+    return {"policy": PROCESSING_MASK_POLICY, "version": PROCESSING_MASK_POLICY_VERSION,
+            "margin_vox": processing_margin_vox(interpolation, spatial),
+            "interpolation": interpolation, "spatial_resampling": spatial,
+            "brain_mask": source_identity(path) if path is not None and path.exists() else None,
+            "final_brain_mask_interpolation": "NearestNeighbor",
+            "availability_interpolation": "Linear"}
+
+
+def prepare_processing_masks(cfg):
+    """Keep anatomical selection separate from the temporal processing region.
+
+    The target brain mask is a nearest-neighbour mapping of the source brain.
+    Cubic padding includes every in-bounds Lanczos/Linear contributor around
+    its source centres. Per-volume acquisition and fit eligibility are applied
+    later; padding does not declare a missing sample valid.
+    """
+    path = cfg.rt_unwarped_analysis_ref_mask
+    if not path.exists():
+        log.warning("[MASK] Brain mask missing at %s; using available acquisition support.", path)
+        return None, None, None, None
+    source = nib.load(str(path))
+    require_same_grid(source, nib.load(str(cfg.rt_unwarped_analysis_ref_epi)))
+    spec = processing_mask_spec(cfg)
+    values = np.asarray(source.dataobj)
+    processing = make_processing_mask(values, spec["interpolation"], spec["spatial_resampling"])
+    brain = values.astype(bool)
+    folder = cfg.rt_work_dir / "processing_mask"
+    folder.mkdir(parents=True, exist_ok=True)
+    process_path = folder / "processing_epi.nii"
+    nib.save(nib.Nifti1Image(processing.astype(np.uint8), source.affine), process_path)
+    nib.save(nib.Nifti1Image(brain.astype(np.uint8), source.affine), folder / "brain_epi.nii")
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    final_brain, final_affine = prepare_analysis_mask(
+        cfg, "whole_brain", space, resolve_analysis_reference(cfg, space), folder, run)
+    nib.save(nib.Nifti1Image(final_brain.astype(np.uint8), final_affine), folder / "brain_final.nii")
+    spec.update(brain_voxels=int(brain.sum()), processing_voxels=int(processing.sum()))
+    (folder / "policy.json").write_text(json.dumps(spec, indent=2) + "\n")
+    log.info("[MASK] brain=%d; processing=%d; margin=%d vox/axis (%s)",
+             brain.sum(), processing.sum(), spec["margin_vox"], spec["interpolation"])
+    return brain, processing, final_brain, process_path
+
+
+def save_normalization_reference(cfg, normalizer, affine, volume_idx):
+    """Persist calibration/final sufficient statistics, never every-TR images."""
+    if normalizer.mean is None:
+        return
+    folder = cfg.rt_work_dir / "norm"
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, values in (("mean", normalizer.mean), ("std", normalizer.std),
+                         ("count", normalizer.count)):
+        if values is not None:
+            nib.save(nib.Nifti1Image(np.asarray(values, dtype=np.float32), affine),
+                     str(folder / f"reference_{name}.nii"))
+    payload = {**normalization_spec(), "reference_count": normalizer.reference_count,
+               "statistics_saved_after_volume": int(volume_idx), "ready": normalizer.ready,
+               "sample_source": "raw_mc" if normalizer.mode == "mean" else "regression_ready_output"}
+    (folder / "reference.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 
 @dataclass
@@ -267,38 +352,60 @@ class ProcSrc:
 
 class RTPStyleVoxelNormalizer:
     """
-    Lightweight voxel-wise intensity scaling that matches RTPSpy's Y_mean scaling.
+    Historical scaling helper retained for compatibility with old callers.
 
-    When motion regression is disabled we still output volumes in percent-signal
-    style units by dividing each voxel by a fixed reference mean and multiplying
-    by 100 (with RTPSpy's clipping/zero-mask behavior).
+    The live pipeline uses VoxelNormalizer after GLM instead. This legacy helper
+    includes the current sample and clips values at 200, as the old path did.
     """
 
     def __init__(self, ref_volumes: int = 1, brain_mask: Optional[np.ndarray] = None):
         self.ref_volumes = max(1, int(ref_volumes))
         self._sum: Optional[np.ndarray] = None
+        self._observations: Optional[np.ndarray] = None
         self._count = 0
         self._y_mean: Optional[np.ndarray] = None
         self._y_mean_mask: Optional[np.ndarray] = None
         self._brain_mask = brain_mask.astype(bool, copy=False) if brain_mask is not None else None
+        self.output_support: Optional[np.ndarray] = None
 
-    def apply(self, vol_data: np.ndarray) -> np.ndarray:
+    def apply(self, vol_data: np.ndarray, support_mask=None) -> np.ndarray:
         data = np.asarray(vol_data, dtype=np.float32)
+        if support_mask is None:
+            observed = np.ones(data.shape, dtype=bool)
+        else:
+            observed = np.asarray(support_mask)
+            if observed.shape != data.shape or observed.dtype.kind != "b":
+                raise ValueError("Normalization support must be boolean and match the volume grid.")
+            observed = observed.copy()
+        if self._brain_mask is not None:
+            if self._brain_mask.shape != data.shape:
+                raise ValueError("Normalization brain mask and volume grids differ.")
+            observed &= self._brain_mask
+        if not np.isfinite(data[observed]).all():
+            raise ValueError("Nonfinite acquired values inside the normalization mask.")
 
         if self._count < self.ref_volumes:
             if self._sum is None:
                 self._sum = np.zeros_like(data, dtype=np.float64)
-            self._sum += data
+                self._observations = np.zeros(data.shape, dtype=np.int32)
+            self._sum[observed] += data[observed]
+            self._observations[observed] += 1
             self._count += 1
-            self._y_mean = (self._sum / float(self._count)).astype(np.float32)
+            # An unavailable acquisition is not a measured zero. Freeze each
+            # reference mean after this window using only its observed samples.
+            self._y_mean = np.divide(self._sum, self._observations,
+                                     out=np.zeros_like(self._sum),
+                                     where=self._observations > 0).astype(np.float32)
             self._y_mean_mask = np.abs(self._y_mean) > 1e-6
             if self._brain_mask is not None:
                 self._y_mean_mask &= self._brain_mask
             if self._count >= self.ref_volumes:
                 self._sum = None
+                self._observations = None
 
         out = np.zeros_like(data, dtype=np.float32)
-        mask = self._y_mean_mask
+        mask = self._y_mean_mask & observed
+        self.output_support = mask
         out[mask] = data[mask] / self._y_mean[mask] * 100.0
         out[out > 200.0] = 200.0
         return out
@@ -336,6 +443,7 @@ class MotionRegressor:
             spike_reg_num=200,
             phys_reg=phys_reg,
             rtp_physio=rtp_physio,
+            scale_before_glm=False,
         )
         self._regress = RtpRegress(**kwargs)
 
@@ -357,10 +465,14 @@ class MotionRegressor:
         volume_idx: int,
         fd_censor: int = 0,
         dvars_censor: int = 0,
+        support_mask=None,
     ) -> tuple[np.ndarray, bool]:
         """
         Returns (cleaned_vol, regressed_bool). Always returns a tuple.
         """
+
+        self._regress.last_proc_ready = False
+        self._regress.output_support = np.zeros(mc_img.shape[:3], dtype=bool)
 
         # Ensure regressor init/ready state
         if not self._ready:
@@ -368,32 +480,40 @@ class MotionRegressor:
                 self._ready = bool(self._regress.ready_proc())
             except Exception as exc:
                 log.error(f"[REG] Failed to prepare regressor: {exc}")
-                return np.asanyarray(mc_img.dataobj), False
+                return np.zeros(mc_img.shape[:3], dtype=np.float32), False
 
         if not self._ready:
-            return np.asanyarray(mc_img.dataobj), False
+            return np.zeros(mc_img.shape[:3], dtype=np.float32), False
 
         # Do regression
         try:
-            prev_vol = getattr(self._regress, "_vol_num", 0)
-
             # RTPSpy modifies mc_img in-place
             self._regress.do_proc(
                 mc_img,
                 vol_idx=volume_idx - 1,
                 fd_censor=fd_censor,
                 dvars_censor=dvars_censor,
+                support_mask=support_mask,
             )
 
-            cur_vol = getattr(self._regress, "_vol_num", prev_vol + 1)
-            regressed = cur_vol > getattr(self._regress, "wait_num", 0)
+            regressed = bool(getattr(self._regress, "last_proc_ready", False))
 
             cleaned = np.asarray(mc_img.dataobj, dtype=np.float32)
             return cleaned, regressed
 
         except Exception as exc:
             log.error(f"[REG] Motion regression failed at vol {volume_idx:05d}: {exc}")
-            return np.asanyarray(mc_img.dataobj), False
+            self._regress.output_support.fill(False)
+            return np.zeros(mc_img.shape[:3], dtype=np.float32), False
+
+    @property
+    def output_support(self):
+        """Brain voxels with observations throughout this run's fitted history."""
+        return self._regress.output_support
+
+    @property
+    def brain_mask(self):
+        return self._regress.maskV
 
     def get_regressors(self, volume_idx: int) -> tuple[Optional[list[str]], Optional[np.ndarray]]:
         des_mtx = getattr(self._regress, "desMtx", None)
@@ -438,6 +558,9 @@ class RTSessionConfig:
     enable_scoring: bool = True
     enable_original_score: bool = False
     test_speed: bool = False
+    # RS/preparation runs establish the anatomical reference. NF runs always
+    # use a separately fitted, QC-gated first-run session EPI bridge.
+    preparation_only: bool = False
 
     # NEW
     ap_block: Optional[int] = None
@@ -467,7 +590,9 @@ class RTSessionConfig:
 
     @property
     def trans_dir(self) -> Path:
-        # precomputed transforms live here (from offline pipeline)
+        session = self.day_root / "func" / "session_trans"
+        if not self.preparation_only and (session / "session_alignment.json").exists():
+            return session
         return self.day_root / "func" / "trans"
 
     @property
@@ -583,25 +708,49 @@ def resolve_decoder_template(cfg: RTSessionConfig) -> Path:
     )
 
 
+def resolve_analysis_reference(cfg, space):
+    if space != "epi":
+        return resolve_decoder_template(cfg)
+    reference = epi_output_reference(cfg)
+    decoder = getattr(cfg, "decoder_template", None)
+    if decoder is not None:
+        try:
+            require_same_grid(nib.load(str(decoder)), nib.load(str(reference)))
+        except ValueError as exc:
+            raise ValueError("EPI decoder/template must match the stable EPI output grid; "
+                             "use a decoder prepared on reference_epi.nii.") from exc
+    return reference
+
+
 def maybe_init_gpu_resampler(cfg: RTSessionConfig):
+    interpolation = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower()
+    if interpolation not in {"linear", "lanczos"}:
+        raise ValueError("gpu_resampler_interpolation must be 'linear' or 'lanczos'.")
     if not bool(getattr(REGRESSOR_SETTINGS, "use_gpu_resampler", False)):
+        if interpolation == "lanczos":
+            raise ValueError("Lanczos requires use_gpu_resampler=true.")
         return None
 
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
-    if analysis_space not in {"t1", "mni"}:
+    bridge = session_epi_bridge(cfg) if analysis_space == "epi" else None
+    if analysis_space not in {"t1", "mni"} and bridge is None:
         log.info("[GPU] Disabled: analysis_space=%s does not require warp.", analysis_space)
         return None
 
     from gpu_ants_like_resampler import GpuAntsLikeResampler, precompute_sampling_grid
 
-    if analysis_space == "t1":
+    if bridge is not None:
+        fixed_ref = resolve_analysis_reference(cfg, "epi")
+        transforms = [bridge]
+        out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_reference"
+    elif analysis_space == "t1":
         fixed_ref = resolve_decoder_template(cfg)
         transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
         out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_t1"
     else:
         fixed_ref = resolve_decoder_template(cfg)
         transforms = [
-            cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii",
+            t1_to_mni_transform(cfg),
             cfg.trans_dir / "epi2t1_Composite.h5",
         ]
         out_dir = cfg.trans_dir / "gpu_grids" / "epi_to_mni"
@@ -609,6 +758,8 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
     moving_ref = cfg.rt_unwarped_analysis_ref_epi
     missing = [p for p in [fixed_ref, *transforms, moving_ref] if not p.exists()]
     if missing:
+        if interpolation == "lanczos":
+            raise FileNotFoundError(f"Cannot initialize Lanczos resampling; missing inputs: {missing}")
         log.warning("[GPU] Disabled: missing inputs for GPU resampler: %s", missing)
         return None
 
@@ -619,11 +770,14 @@ def maybe_init_gpu_resampler(cfg: RTSessionConfig):
         fixed_ref=fixed_ref,
         transforms=transforms,
         out_dir=out_dir,
+        interpolation=interpolation,
     )
 
     device = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_device", "cuda"))
-    resampler = GpuAntsLikeResampler(grid_path=grid_path, device=device, mode="bilinear")
-    log.info("[GPU] Resampler ready (%s, device=%s).", grid_path, resampler.device)
+    resampler = GpuAntsLikeResampler(grid_path=grid_path, device=device, mode="bilinear",
+                                    interpolation=interpolation)
+    log.info("[GPU] Resampler ready (%s, device=%s, interpolation=%s).",
+             grid_path, resampler.device, interpolation)
     return resampler
 
 
@@ -706,13 +860,40 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
         log.warning("[SCORE] Reference scores.csv not found at %s", scores_path)
         return None
 
+    metadata_path = run_dir / "session_metadata.json"
+    metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    if metadata.get("normalization") != normalization_spec():
+        raise ValueError(
+            f"Reference scores in {run_dir} use different or unrecorded voxel normalization. "
+            "Collect/reprocess the reference run with the current JSON normalization settings."
+        )
+    # RS and NF can use different source masks/grids and different amounts of
+    # padding (for example native RS EPI versus a bridged NF EPI). Compare the
+    # processing method, not those acquisition-specific identities. A changed
+    # method can change decoder-score statistics even with identical voxel units.
+    expected_processing = {
+        "policy": PROCESSING_MASK_POLICY,
+        "version": PROCESSING_MASK_POLICY_VERSION,
+        "interpolation": str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower(),
+    }
+    recorded_processing = metadata.get("processing_mask")
+    if (metadata.get("coverage_policy") != COVERAGE_POLICY
+            or not isinstance(recorded_processing, dict)
+            or any(recorded_processing.get(key) != value
+                   for key, value in expected_processing.items())):
+        raise ValueError(
+            f"Reference scores in {run_dir} use a different or unrecorded spatial masking/interpolation policy. "
+            "Collect or reprocess a fresh RS reference with the current preprocessing settings; "
+            "the existing reference scores cannot be reused."
+        )
+
     reg_ready_map = None
     reg_status_path = run_dir / "regression_status_rt.csv"
     if reg_status_path.exists():
         reg_ready_map = {}
         with open(reg_status_path, newline="") as f:
             reader = csv.DictReader(f)
-            if "volume_idx" in reader.fieldnames and "reg_ready" in reader.fieldnames:
+            if "volume_idx" in (reader.fieldnames or []) and "reg_ready" in (reader.fieldnames or []):
                 for row in reader:
                     try:
                         vol = int(row["volume_idx"])
@@ -724,8 +905,6 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                 reg_ready_map = None
 
     scores = []
-    scores_all = []
-    reg_ready_scores = []
     with open(scores_path, newline="") as f:
         reader = csv.DictReader(f)
         has_score_reg_ready = bool(reader.fieldnames and "reg_ready" in reader.fieldnames)
@@ -735,9 +914,8 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                 raw = float(row["score_raw"])
             except (TypeError, ValueError, KeyError):
                 continue
-            if np.isnan(raw):
+            if not np.isfinite(raw):
                 continue
-            scores_all.append(raw)
             score_reg_ready = None
             if has_score_reg_ready:
                 try:
@@ -746,26 +924,19 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                     score_reg_ready = None
             ready = reg_ready_map.get(vol, False) if reg_ready_map is not None else score_reg_ready
             if ready is None:
-                ready = True
+                ready = False
             if ready:
                 scores.append(raw)
-            if ready:
-                reg_ready_scores.append((vol, raw))
 
     used_reg_ready = (reg_ready_map is not None) or has_score_reg_ready
     skipped_first_reg_ready = False
-    if reg_ready_scores:
-        # Drop the first regressed sample from RS reference normalization.
-        # RTP regression output can still show a transient at the first reg_ready TR.
-        scores = [raw for _, raw in reg_ready_scores[1:]]
-        skipped_first_reg_ready = True
+    # Normalization now gates the first valid score after its calibration; the
+    # old first-GLM-fit unit mismatch no longer requires dropping that score.
     if used_reg_ready and not scores:
         log.warning(
-            "[SCORE] No reg_ready scores found in %s; falling back to all scores.",
+            "[SCORE] No normalization-ready reference scores found in %s.",
             scores_path,
         )
-        scores = scores_all
-        used_reg_ready = False
 
     if len(scores) < 2:
         log.warning("[SCORE] Not enough reference scores in %s to compute z-score.", scores_path)
@@ -899,6 +1070,10 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "enable_original_score": cfg.enable_original_score,
             "preprocessing_order": PIPELINE_ORDER,
             "coverage_policy": COVERAGE_POLICY,
+            "processing_mask": processing_mask_spec(cfg),
+            "normalization": normalization_spec(),
+            "epi_reference_mapped": (str(REGRESSOR_SETTINGS.analysis_space).lower() == "epi"
+                                     and session_epi_bridge(cfg) is not None),
             "smoothing_fwhm_mm": float(getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0)),
             "analysis_mask": getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
             "analysis_mask_file": getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
@@ -922,6 +1097,8 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
                 "dvars_mask_source": REGRESSOR_SETTINGS.dvars_mask_source,
                 "analysis_space": REGRESSOR_SETTINGS.analysis_space,
                 "voxel_norm_ref_volumes": REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+                "voxel_norm_mode": getattr(REGRESSOR_SETTINGS, "voxel_norm_mode", "zscore"),
+                "voxel_norm_reference": getattr(REGRESSOR_SETTINGS, "voxel_norm_reference", "fixed"),
                 "rt_max_scan_length": REGRESSOR_SETTINGS.rt_max_scan_length,
                 "pipeline_engine": REGRESSOR_SETTINGS.pipeline_engine,
                 "commit_wait_timeout_s": REGRESSOR_SETTINGS.commit_wait_timeout_s,
@@ -1043,11 +1220,12 @@ class DICOMHandler(FileSystemEventHandler):
             )
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
         self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
+        (self.anatomical_brain_mask, self.processing_mask, self.final_brain_mask,
+         self.processing_mask_path) = prepare_processing_masks(cfg)
         self.smoother = prepare_smoother(
             cfg, getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0),
             str(REGRESSOR_SETTINGS.analysis_space).lower(),
-            cfg.rt_unwarped_analysis_ref_epi if REGRESSOR_SETTINGS.analysis_space == "epi"
-            else resolve_decoder_template(cfg), run,
+            resolve_analysis_reference(cfg, str(REGRESSOR_SETTINGS.analysis_space).lower()), run,
             mask_type=getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain"),
             custom_file=getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
             custom_space=getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"),
@@ -1203,7 +1381,7 @@ class DICOMHandler(FileSystemEventHandler):
                     )
 
         if REGRESSOR_SETTINGS.enable_motion_regression:
-            reg_mask = cfg.rt_unwarped_analysis_ref_mask if cfg.rt_unwarped_analysis_ref_mask.exists() else None
+            reg_mask = self.processing_mask_path
             if reg_mask is None:
                 log.warning("[REG] Regression mask missing at %s; using non-zero voxels from first volume.", cfg.rt_unwarped_analysis_ref_mask)
             self.motion_regressor = MotionRegressor(
@@ -1226,15 +1404,10 @@ class DICOMHandler(FileSystemEventHandler):
             log.info("[REG] Motion regression disabled by config.")
             self.motion_regressor = None
 
-        norm_mask = None
-        if cfg.rt_unwarped_analysis_ref_mask.exists():
-            norm_mask = np.asanyarray(nib.load(str(cfg.rt_unwarped_analysis_ref_mask)).dataobj) > 0.5
-        else:
-            log.warning(
-                "[REG] Voxel normalization mask missing at %s; using Y-mean nonzero mask only.",
-                cfg.rt_unwarped_analysis_ref_mask,
-            )
-        self.voxel_normalizer = RTPStyleVoxelNormalizer(
+        norm_mask = self.processing_mask
+        self.voxel_normalizer = VoxelNormalizer(
+            mode=REGRESSOR_SETTINGS.voxel_norm_mode,
+            reference=REGRESSOR_SETTINGS.voxel_norm_reference,
             ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
             brain_mask=norm_mask,
         )
@@ -1265,6 +1438,10 @@ class DICOMHandler(FileSystemEventHandler):
             self.scorer = None
 
     def stop(self):
+        if hasattr(self, "normalization_last_volume"):
+            save_normalization_reference(self.cfg, self.voxel_normalizer,
+                                         nib.load(str(self.cfg.rt_motion_ref_epi)).affine,
+                                         self.normalization_last_volume)
         if self.biopac_receiver is not None:
             if self._biopac_run_started:
                 self.biopac_receiver.send_run_end()
@@ -1461,32 +1638,27 @@ class DICOMHandler(FileSystemEventHandler):
                 while self._next_scan_to_process is not None and scan != self._next_scan_to_process:
                     self._order_cv.wait(timeout=0.1)
             log.info(f"[WATCHDOG] Processing volume idx {volume_idx} (run={self.current_run}, scan={scan})")
-            for attempt in range(1, REGRESSOR_SETTINGS.max_retries + 1):
-                started = self.speed.process_start(volume_idx) if self.speed else None
-                try:
-                    ok = process_volume(
-                        self.cfg,
-                        self,
-                        path,
-                        volume_idx,
-                        raw_nii=prepared_raw,
-                        volume_timestamp=volume_timestamp,
-                    )
-                finally:
-                    if self.speed is not None:
-                        self.speed.process_end(volume_idx, started)
-                if ok:
-                    break
-                log.warning(
-                    "[WATCHDOG] Retry scan %s post-prep (attempt %s/%s)",
-                    scan,
-                    attempt,
-                    REGRESSOR_SETTINGS.max_retries,
+            # Stateful stages have already advanced even if a later operation
+            # fails. Replaying here would count this sample twice in the GLM
+            # and normalization reference, and violate prior-sample scoring.
+            started = self.speed.process_start(volume_idx) if self.speed else None
+            try:
+                ok = process_volume(
+                    self.cfg,
+                    self,
+                    path,
+                    volume_idx,
+                    raw_nii=prepared_raw,
+                    volume_timestamp=volume_timestamp,
                 )
-                time.sleep(0.2)
+            except Exception:
+                log.exception("[WATCHDOG] Stateful processing failed for scan %s; not retrying this sample.", scan)
+            finally:
+                if self.speed is not None:
+                    self.speed.process_end(volume_idx, started)
 
         if not ok:
-            log.error("[WATCHDOG] Giving up on scan %s after %s attempts.", scan, REGRESSOR_SETTINGS.max_retries)
+            log.error("[WATCHDOG] Scan %s failed; advancing without repeating stateful processing.", scan)
         if self.speed is not None:
             self.speed.finish(volume_idx, ok)
         with self._lock:
@@ -1558,27 +1730,38 @@ class DICOMHandler(FileSystemEventHandler):
 
 # ---------- Core processing hook (DICOM -> NIfTI -> MC -> FMAP) ----------
 
-def final_volume_support(cfg, handler, support, epi_affine, volume_idx, space):
-    """Carry this volume's MC field of view through the same final transform.
+def final_volume_support(cfg, handler, support, epi_affine, volume_idx, space,
+                         folder_name="coverage", mapped_support=None):
+    """Carry this volume's acquisition or analysis support through the transform.
 
-    Linear support must be essentially one: a retained output voxel must not
-    interpolate unavailable EPI samples. This is independent of BOLD intensity.
+    Availability uses Linear interpolation for both signal kernels. The fixed
+    anatomical mask is mapped independently with nearest-neighbour. Never
+    shrink brain selection by requiring the entire Lanczos stencil inside it.
     """
-    folder = cfg.rt_work_dir / "coverage"
+    folder = cfg.rt_work_dir / folder_name
     folder.mkdir(parents=True, exist_ok=True)
     epi_path = folder / f"vol_{volume_idx:05d}_epi.nii"
     nib.save(nib.Nifti1Image(support.astype(np.uint8), epi_affine), epi_path)
-    if space == "epi":
-        return support
-    final_path = folder / f"vol_{volume_idx:05d}_{space}.nii"
-    reference = resolve_decoder_template(cfg)
+    bridge = session_epi_bridge(cfg) if space == "epi" else None
+    brain = getattr(handler, "final_brain_mask", None) if folder_name != "coverage" else None
+    if space == "epi" and bridge is None:
+        valid = support.copy() if brain is None else support & brain
+        nib.save(nib.Nifti1Image(valid.astype(np.uint8), epi_affine), epi_path)
+        return valid
+    final_kind = "epi_ref" if bridge is not None else space
+    final_path = folder / f"vol_{volume_idx:05d}_{final_kind}.nii"
+    reference = resolve_analysis_reference(cfg, space)
     ref = nib.load(str(reference))
-    if handler.gpu_resampler is not None:
-        mapped = handler.gpu_resampler.resample_array(support.astype(np.float32))
+    if mapped_support is not None:
+        # Identical EPI support has the same final support; retain separate
+        # auditable files without repeating an ANTs/GPU resampling operation.
+        mapped = mapped_support
+    elif handler.gpu_resampler is not None:
+        mapped = handler.gpu_resampler.resample_support(support.astype(np.float32))
     else:
-        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        transforms = [bridge] if bridge is not None else [cfg.trans_dir / "epi2t1_Composite.h5"]
         if space == "mni":
-            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+            transforms.insert(0, t1_to_mni_transform(cfg))
         cmd = ["antsApplyTransforms", "-d", "3", "-i", str(epi_path),
                "-r", str(reference), "-o", str(final_path), "-n", "Linear", "--float", "1"]
         for transform in transforms:
@@ -1590,8 +1773,63 @@ def final_volume_support(cfg, handler, support, epi_affine, volume_idx, space):
     if mapped.shape != ref.shape[:3] or not np.isfinite(mapped).all():
         raise ValueError("Invalid per-volume coverage on the final image grid.")
     valid = mapped >= SUPPORT_THRESHOLD
+    if brain is not None:
+        if brain.shape != valid.shape:
+            raise ValueError("Anatomical brain mask and final support grids differ.")
+        valid &= brain
     nib.save(nib.Nifti1Image(valid.astype(np.uint8), ref.affine), final_path)
     return valid
+
+
+def record_volume_support(cfg, handler, volume_idx, brain_mask, mc_support,
+                          cleaned_support, final_support):
+    """Report support without shortening/reordering a trained decoder's features.
+
+    GLM support is conservative: once a brain voxel lacks an observation it is
+    unavailable for the remaining run. A no-regression reference mean instead
+    uses observed samples, and a calibrated voxel can recover on a later TR.
+    """
+    brain_count = int(np.count_nonzero(brain_mask))
+    acquired = int(np.count_nonzero(brain_mask & mc_support))
+    usable = int(np.count_nonzero(brain_mask & cleaned_support))
+    final_valid = final_support
+    smoother = getattr(handler, "smoother", None)
+    if smoother is not None:
+        final_valid = final_valid & smoother.mask
+    decoder_mask = getattr(getattr(handler, "scorer", None), "mask", None)
+    decoder_count = usable_decoder = None
+    fraction = None
+    if decoder_mask is not None:
+        decoder_mask = np.asarray(decoder_mask, dtype=bool)
+        if decoder_mask.shape != final_valid.shape:
+            raise ValueError("Decoder mask and final support grids differ.")
+        decoder_count = int(np.count_nonzero(decoder_mask))
+        usable_decoder = int(np.count_nonzero(decoder_mask & final_valid))
+        fraction = usable_decoder / decoder_count if decoder_count else 0.0
+    row = dict(volume_idx=volume_idx, brain_voxels=brain_count,
+               acquired_brain_voxels=acquired, usable_brain_voxels=usable,
+               usable_brain_fraction=usable / brain_count if brain_count else 0.0,
+               decoder_voxels=decoder_count, usable_decoder_voxels=usable_decoder,
+               decoder_coverage_fraction=fraction)
+    handler.current_support_qc = row
+    handler.decoder_support_complete = (usable_decoder == decoder_count
+                                        if decoder_count is not None else None)
+    path = cfg.rt_work_dir / "coverage_rt.csv"
+    exists = path.exists()
+    with path.open("a", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(row))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+    counts = (acquired, usable, usable_decoder)
+    if counts != getattr(handler, "_last_support_counts", None):
+        log.info("[SUPPORT] vol=%05d acquired brain=%d/%d; usable brain=%d/%d; decoder=%s/%s",
+                 volume_idx, acquired, brain_count, usable, brain_count,
+                 usable_decoder, decoder_count)
+        if decoder_count is not None and usable_decoder < decoder_count:
+            log.warning("[SUPPORT] Decoder coverage %.2f%%; unavailable features are zero-filled, "
+                        "not removed or reweighted. See coverage_rt.csv and support/.", 100. * fraction)
+        handler._last_support_counts = counts
 
 
 def zero_outside_support(path, support):
@@ -1721,7 +1959,9 @@ def process_volume(
       1) DICOM -> raw NIfTI (single volume)
       2) Fieldmap unwarp of raw volume
       3) Motion correction of unwarped volume -> mc NIfTI
-      4) Space selection: EPI passthrough, EPI->T1, or EPI->T1->MNI
+      4) Native-unit denoising -> reg NIfTI; voxel normalization -> norm NIfTI
+      5) Spatial mapping, coverage masking and optional masked smoothing
+      6) Decode only when both GLM and normalization are ready
     """
     speed = getattr(handler, "speed", None)
     if raw_nii is None:
@@ -1848,13 +2088,17 @@ def process_volume(
     # --- DVARS censor: raw DVARS robust_z > thr plus +1 TR ---
     if REGRESSOR_SETTINGS.enable_dvars_censor_reg and handler.dvars_mask is not None:
         if handler.prev_mc_for_dvars is not None:
-            dvars_val = compute_dvars(handler.prev_mc_for_dvars, mc_data, handler.dvars_mask)
+            dvars_val = compute_dvars(
+                handler.prev_mc_for_dvars, mc_data, handler.dvars_mask,
+                previous_support=getattr(handler, "prev_mc_support_for_dvars", None),
+                current_support=mc_support)
 
             # robust z against prior DVARS history (exclude current)
             z = robust_z(dvars_val, handler.dvars_hist)
 
             # update history after computing z
-            handler.dvars_hist.append(dvars_val)
+            if np.isfinite(dvars_val):
+                handler.dvars_hist.append(dvars_val)
 
             # save to a file
             append_dvars(
@@ -1886,6 +2130,7 @@ def process_volume(
 
     # update prev for next DVARS
     handler.prev_mc_for_dvars = mc_data.copy()
+    handler.prev_mc_support_for_dvars = mc_support.copy()
     if speed is not None:
         speed.stage(volume_idx, "QC", time.perf_counter() - qc_t0)
 
@@ -1899,24 +2144,83 @@ def process_volume(
             volume_idx,
             fd_censor=fd_censor,
             dvars_censor=dvars_censor,
+            support_mask=mc_support,
         )
+        processor = handler.motion_regressor
         cleaned = np.array(cleaned, copy=True)
-        cleaned[~mc_support] = 0
+        cleaned_support = getattr(processor, "output_support", None)
+        cleaned_support = mc_support if cleaned_support is None else cleaned_support
+        cleaned[~cleaned_support] = 0
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
         log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
     else:
-        cleaned = handler.voxel_normalizer.apply(np.asanyarray(mc_unwarped_img.dataobj))
-        cleaned = np.array(cleaned, copy=True)
-        cleaned[~mc_support] = 0
+        processor = handler.voxel_normalizer
+        # No GLM: normalization still uses the same dedicated following stage.
+        cleaned = np.array(mc_data, copy=True)
+        cleaned_support = mc_support.copy()
+        norm_brain = getattr(processor, "brain_mask", None)
+        if norm_brain is not None:
+            cleaned_support &= norm_brain
+        cleaned[~cleaned_support] = 0
         reg_ready = True
         reg_dir = cfg.rt_reg_dir
         reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
         nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
         mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "skipped (voxel-normalized)", start_t=reg_t0, speed=speed)
+        log_step("REG", volume_idx, "skipped", start_t=reg_t0, speed=speed)
+
+    processing_mask = getattr(processor, "brain_mask", getattr(processor, "_brain_mask", None))
+    if processing_mask is None:
+        processing_mask = np.ones(mc_support.shape, dtype=bool)
+    brain_mask = getattr(handler, "anatomical_brain_mask", None)
+    if brain_mask is None:
+        brain_mask = processing_mask
+    if brain_mask.shape != mc_support.shape or cleaned_support.shape != mc_support.shape:
+        raise ValueError("Denoising support and motion-corrected volume grids differ.")
+    current_brain_support = brain_mask & mc_support
+    current_processing_support = processing_mask & mc_support
+
+    # ---------- 2e) Voxel normalization after native-unit cGLM ----------
+    norm_t0 = time.perf_counter()
+    glm_ready = bool(reg_ready)
+    normalizer = handler.voxel_normalizer
+    reference_count = normalizer.reference_count
+    if glm_ready:
+        normalized = normalizer.transform(cleaned, cleaned_support)
+        cleaned_support = normalizer.output_support.copy()
+    else:
+        normalized = np.zeros(cleaned.shape, dtype=np.float32)
+        cleaned_support = np.zeros(cleaned.shape, dtype=bool)
+    normalization_ready = bool(normalizer.ready)
+    reg_ready = bool(glm_ready and normalization_ready and (cleaned_support & brain_mask).any())
+    # Always score against PRIOR samples. Residual warmup is not calibration.
+    was_calibrated = normalizer.ready
+    if normalizer.mode == "mean":
+        if current_brain_support.any():
+            normalizer.observe(mc_data, current_processing_support)
+    elif glm_ready:
+        # Preserve the GLM's valid support separately from normalization's
+        # not-yet-calibrated output support.
+        fit_support = getattr(processor, "output_support", None) if handler.motion_regressor is not None else current_processing_support
+        fit_support = current_processing_support if fit_support is None else fit_support
+        if (fit_support & brain_mask).any():
+            normalizer.observe(cleaned, fit_support)
+    norm_dir = cfg.rt_work_dir / "norm"
+    norm_dir.mkdir(parents=True, exist_ok=True)
+    norm_nii = norm_dir / f"vol_{volume_idx:05d}_norm.nii"
+    norm_tmp = norm_nii.with_name("." + norm_nii.name)
+    nib.save(nib.Nifti1Image(normalized, mc_unwarped_img.affine), str(norm_tmp))
+    norm_tmp.replace(norm_nii)
+    mc_for_warp = norm_nii
+    if not was_calibrated and normalizer.ready:
+        save_normalization_reference(cfg, normalizer, ref_img.affine, volume_idx)
+    handler.normalization_last_volume = volume_idx
+    log_step("NORM", volume_idx,
+             f"{normalizer.mode}/{normalizer.reference}; prior_samples={reference_count}; ready={int(reg_ready)}",
+             start_t=norm_t0, speed=speed)
 
     if speed is not None:
         speed.readiness(volume_idx, reg_ready)
@@ -1940,6 +2244,9 @@ def process_volume(
         dvars_censor,
         reg_ready,
         biopac_missing,
+        glm_ready=glm_ready,
+        normalization_ready=normalization_ready,
+        normalization_reference_count=reference_count,
     )
     if REGRESSOR_SETTINGS.biopac_timelag and handler.biopac_receiver is not None:
         trigger_ts = handler.biopac_receiver.get_trigger_timestamp(volume_idx)
@@ -1971,7 +2278,31 @@ def process_volume(
         score_input_orig_nii = mc_unwarped_nii
 
     if analysis_space == "epi":
-        log_step("TRANS", volume_idx, "skipped (EPI space)", start_t=t0, speed=speed)
+        bridge = session_epi_bridge(cfg)
+        if bridge is None:
+            log_step("TRANS", volume_idx, "skipped (preparation EPI grid)", start_t=t0, speed=speed)
+        else:
+            reference = resolve_analysis_reference(cfg, "epi")
+            epi_dir = cfg.rt_work_dir / "epi_ref"
+            epi_dir.mkdir(parents=True, exist_ok=True)
+
+            def map_to_reference(source, suffix=""):
+                destination = epi_dir / f"vol_{volume_idx:05d}_epi_ref{suffix}.nii"
+                temporary = destination.with_name("." + destination.name)
+                pending_spatial_outputs.append((temporary, destination))
+                if handler.gpu_resampler is not None:
+                    handler.gpu_resampler.resample_nifti_to_nifti(source, temporary)
+                else:
+                    run(["antsApplyTransforms", "-d", "3", "-i", str(source),
+                         "-r", str(reference), "-o", str(temporary), "-t", str(bridge),
+                         "-n", "Linear", "--float", "1"])
+                require_same_grid(nib.load(str(temporary)), nib.load(str(reference)))
+                return temporary
+
+            score_input_nii = map_to_reference(mc_for_warp)
+            if cfg.enable_original_score:
+                score_input_orig_nii = map_to_reference(mc_unwarped_nii, "_orig")
+            log_step("TRANS", volume_idx, "session EPI→reference EPI", start_t=t0, speed=speed)
     elif analysis_space == "t1":
         t1_dir = cfg.rt_work_dir / "t1"
         t1_dir.mkdir(parents=True, exist_ok=True)
@@ -2035,7 +2366,7 @@ def process_volume(
         mni_nii = mni_final.with_name("." + mni_final.name)
         pending_spatial_outputs.append((mni_nii, mni_final))
 
-        warp_t1_mni = cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii"
+        warp_t1_mni = t1_to_mni_transform(cfg)
         epi2t1 = cfg.trans_dir / "epi2t1_Composite.h5"
         decoder_template = resolve_decoder_template(cfg)
 
@@ -2095,11 +2426,35 @@ def process_volume(
 
     # Coverage is transformed separately from the signal, before smoothing.
     coverage_t0 = time.perf_counter()
-    final_support = final_volume_support(cfg, handler, mc_support, ref_img.affine,
-                                        volume_idx, analysis_space)
+    final_coverage = final_volume_support(cfg, handler, mc_support, ref_img.affine,
+                                         volume_idx, analysis_space)
+    final_support = final_volume_support(cfg, handler, cleaned_support, ref_img.affine,
+                                        volume_idx, analysis_space, folder_name="support",
+                                        mapped_support=(final_coverage if np.array_equal(
+                                            cleaned_support, mc_support) else None))
+    final_orig_support = final_support
+    # Original intensities already retain all acquired neighbours. Apply the
+    # anatomical boundary on the target grid, without eroding it in EPI space.
+    original_support = (mc_support if getattr(handler, "final_brain_mask", None) is not None
+                        else current_brain_support)
+    if score_input_orig_nii is not None and not np.array_equal(original_support, cleaned_support):
+        final_orig_support = final_volume_support(cfg, handler, original_support, ref_img.affine,
+                                                 volume_idx, analysis_space, folder_name="support_original",
+                                                 mapped_support=(final_coverage if np.array_equal(
+                                                     original_support, mc_support) else None))
     zero_outside_support(score_input_nii, final_support)
-    if score_input_orig_nii is not None and score_input_orig_nii != mc_nii:
-        zero_outside_support(score_input_orig_nii, final_support)
+    if score_input_orig_nii == mc_nii and not final_orig_support.all():
+        # Preserve the acquired MC product; the optional original score still
+        # uses a brain-masked image, independently of denoising eligibility.
+        original_dir = cfg.rt_work_dir / "original"
+        original_dir.mkdir(parents=True, exist_ok=True)
+        score_input_orig_nii = original_dir / f"vol_{volume_idx:05d}_epi_orig.nii"
+        nib.save(nib.Nifti1Image(np.where(final_orig_support, mc_data, 0), ref_img.affine),
+                 str(score_input_orig_nii))
+    elif score_input_orig_nii is not None:
+        zero_outside_support(score_input_orig_nii, final_orig_support)
+    record_volume_support(cfg, handler, volume_idx, brain_mask, mc_support,
+                          cleaned_support, final_support)
     # PCA polls public stage filenames. Publish only the completed, supported
     # image so an unsmoothed consumer cannot read an intermediate interpolation.
     for temporary, destination in pending_spatial_outputs:
@@ -2122,7 +2477,7 @@ def process_volume(
                                       support_mask=final_support)
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
-                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_support)
+                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_orig_support)
         log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
 
     output_t0 = time.perf_counter()
@@ -2132,6 +2487,7 @@ def process_volume(
         "mc": mc_nii,
         "unwarped": mc_nii,  # compatibility alias for fully corrected BOLD
         "reg": reg_nii,
+        "norm": norm_nii,
         "score_input": score_input_nii,
     }
     handler.volume_streamer.publish(volume_idx, stream_paths.get(stream_kind), t1_stage_nii)
@@ -2143,6 +2499,9 @@ def process_volume(
                     {
                         "volume_idx": volume_idx,
                         "watchdog_timestamp": volume_timestamp,
+                        "reg_ready": reg_ready,
+                        "glm_ready": glm_ready,
+                        "normalization_ready": normalization_ready,
                     }
                 )
             except Exception as exc:
@@ -2172,8 +2531,8 @@ def process_volume(
             if handler.scorer.baseline_count == handler.scorer.n_baseline:
                 handler.scorer.finalize_baseline()
 
-        # Always compute raw; z will be NaN until baseline_ready
-        raw_score = handler.scorer.score_from_array(score_data)
+        # Calibration zeros are unavailable features, not a neutral score.
+        raw_score = handler.scorer.score_from_array(score_data) if reg_ready else float("nan")
         event_type = handler.score_event_tracker.for_volume(volume_idx)
         analysis_timestamp = time.time()
         timestamp = append_score(
@@ -2208,6 +2567,8 @@ def process_volume(
                     "score_raw": raw_score,
                     "score_original": original_score,
                     "reg_ready": reg_ready,
+                    "glm_ready": glm_ready,
+                    "normalization_ready": normalization_ready,
                     "event_type": event_type,
                 }
                 if z_score is not None:
@@ -2262,20 +2623,28 @@ def validate_run_provenance(cfg):
     if legacy_schema and trans_dir is not None and (trans_dir / "registration.json").exists():
         raise ValueError("Legacy run provenance cannot certify the new registration. Use a fresh run output directory.")
     payload = {"order": PIPELINE_ORDER, "coverage_policy": COVERAGE_POLICY,
+               "normalization": normalization_spec(),
+               "processing_mask": processing_mask_spec(cfg),
                "calibration": load_calibration(cfg.fmap_dir),
                "field": source_identity(_preferred_pyhysco_fieldmap(cfg.fmap_dir)),
                "reference": source_identity(cfg.rt_motion_ref_epi),
                "epi_phase_encoding": str(REGRESSOR_SETTINGS.epi_phase_encoding).upper()}
     space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    interpolation = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower()
+    payload["spatial_interpolation"] = interpolation
+    payload["spatial_support"] = "nearest_brain_linear_availability_v2"
     if not legacy_schema:
         payload["analysis_space"] = space
-    if not legacy_schema and space in {"t1", "mni"}:
+    bridge = session_epi_bridge(cfg) if space == "epi" else None
+    if not legacy_schema and (space in {"t1", "mni"} or bridge is not None):
         from gpu_ants_like_resampler import sampling_grid_identity
-        transforms = [cfg.trans_dir / "epi2t1_Composite.h5"]
+        transforms = [bridge] if bridge is not None else [cfg.trans_dir / "epi2t1_Composite.h5"]
         if space == "mni":
-            transforms.insert(0, cfg.subject_root / "anat" / "warp_T1_to_MNI_synth.nii")
+            transforms.insert(0, t1_to_mni_transform(cfg))
         payload["spatial_transform"] = sampling_grid_identity(
-            cfg.rt_unwarped_analysis_ref_epi, resolve_decoder_template(cfg), transforms)
+            cfg.rt_unwarped_analysis_ref_epi, resolve_analysis_reference(cfg, space), transforms)
+        if bridge is not None:
+            payload["epi_reference_mapped"] = True
     if not legacy_schema and bool(getattr(REGRESSOR_SETTINGS, "enable_motion_regression", False)):
         # These EPI-space masks can change when a registration is rebuilt even
         # when the final analysis stays in EPI space.
@@ -2290,25 +2659,34 @@ def validate_run_provenance(cfg):
         raise ValueError("smoothing_fwhm_mm must be finite and >= 0.")
     mask_type = getattr(REGRESSOR_SETTINGS, "analysis_mask", "whole_brain")
     if final_output_kind(fwhm, mask_type) is not None:
-        reference = cfg.rt_unwarped_analysis_ref_epi if space == "epi" else resolve_decoder_template(cfg)
+        reference = resolve_analysis_reference(cfg, space)
         payload["final_masking"] = {"fwhm_mm": fwhm, "space": space,
             **mask_provenance(cfg, mask_type, space, reference,
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
                 getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"))}
     if saved is not None:
         if saved != payload:
-            raise ValueError("Run preprocessing/calibration/reference or spatial transform changed. Use a fresh run output directory.")
+            raise ValueError("Run preprocessing, normalization, calibration/reference or spatial transform changed. Use a fresh run output directory.")
         if legacy_schema:
             log.info("[REGISTRATION] Reusing legacy run provenance with its original checks; "
                      "registration fingerprints remain unrecorded.")
         return  # Preserve legacy markers; never certify new fields retroactively.
     elif any((folder / name).exists() and any((folder / name).glob("*.nii*"))
-             for name in ("mc", "unwarped", "reg", "t1", "mni", "smooth", "masked")):
+             for name in ("mc", "unwarped", "reg", "norm", "epi_ref", "t1", "mni", "smooth", "masked")):
         raise ValueError("Legacy processed run detected. Use a fresh output directory for unwarp -> MC replay.")
     marker.write_text(json.dumps(payload, indent=2))
 
 
 # ---------- Main ----------
+
+def prepare_nf_run(cfg, settings=None):
+    """Shared parent-process preparation/QC gate, before any feedback UI starts."""
+    if settings is not None:
+        REGRESSOR_SETTINGS.update(vars(settings))
+    ensure_fieldmap_only(cfg)
+    from fmri_rt_preproc.session_alignment import ensure_nf_session
+    ensure_nf_session(cfg, REGRESSOR_SETTINGS)
+
 
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
@@ -2324,6 +2702,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     decoder_template = resolve_decoder_template(cfg)
 
     ensure_fieldmap_only(cfg)
+    from fmri_rt_preproc.session_alignment import ensure_nf_session
+    ensure_nf_session(cfg, REGRESSOR_SETTINGS)
     validate_run_provenance(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
@@ -2375,10 +2755,19 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         event_handler.stop()
     observer.join()
 
-def compute_dvars(prev_vol: np.ndarray, cur_vol: np.ndarray, mask: np.ndarray) -> float:
-    diff = (cur_vol - prev_vol)
-    if mask is not None:
-        diff = diff[mask]
+def compute_dvars(prev_vol: np.ndarray, cur_vol: np.ndarray, mask: np.ndarray,
+                  previous_support=None, current_support=None) -> float:
+    """RMS temporal difference over voxels acquired in both adjacent volumes."""
+    valid = np.ones(cur_vol.shape, dtype=bool) if mask is None else np.asarray(mask, dtype=bool).copy()
+    for support in (previous_support, current_support):
+        if support is not None:
+            support = np.asarray(support)
+            if support.shape != valid.shape or support.dtype.kind != "b":
+                raise ValueError("DVARS support must be boolean and match the volume grid.")
+            valid &= support
+    if not valid.any():
+        return float("nan")
+    diff = cur_vol[valid] - prev_vol[valid]
     diff = diff.astype(np.float32)
     return float(np.sqrt(np.mean(diff * diff)))
 
@@ -2422,6 +2811,7 @@ def append_regression_status(
     dvars_censor: int,
     reg_ready: bool,
     biopac_missing: bool,
+    *, glm_ready=None, normalization_ready=None, normalization_reference_count=None,
 ):
     qc_path.parent.mkdir(parents=True, exist_ok=True)
     exists = qc_path.exists()
@@ -2438,9 +2828,13 @@ def append_regression_status(
                     "dvars_censor",
                     "reg_ready",
                     "biopac_missing",
+                    "glm_ready", "normalization_ready", "normalization_reference_count",
                 ]
             )
-        w.writerow([volume_idx, fd, dvars, dvars_z, fd_censor, dvars_censor, int(reg_ready), int(biopac_missing)])
+        w.writerow([volume_idx, fd, dvars, dvars_z, fd_censor, dvars_censor, int(reg_ready), int(biopac_missing),
+                    int(glm_ready) if glm_ready is not None else "",
+                    int(normalization_ready) if normalization_ready is not None else "",
+                    normalization_reference_count if normalization_reference_count is not None else ""])
 
 
 def append_biopac_timelag(
@@ -2659,11 +3053,16 @@ def main():
         default=None,
         help="Optional JSON file with global runtime settings (TR, censor thresholds, BIOPAC defaults, etc.).",
     )
+    from rt_global_settings import add_registration_arguments, apply_registration_arguments
+    add_registration_arguments(parser)
+    parser.add_argument("--preparation-only", action="store_true",
+                        help="Process a preparation/RS run without the NF session gate.")
     args = parser.parse_args()
 
     if args.settings_file:
         loaded = load_regressor_settings(args.settings_file)
         REGRESSOR_SETTINGS.update(vars(loaded))
+    apply_registration_arguments(REGRESSOR_SETTINGS, args)
 
     REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
     REGRESSOR_SETTINGS.biopac_host = args.biopac_host
@@ -2691,6 +3090,7 @@ def main():
         REGRESSOR_SETTINGS.volume_stream_every_n = max(1, int(args.volume_stream_every_n))
 
     cfg = RTSessionConfig(
+        preparation_only=args.preparation_only,
         subject=args.sub,
         day=args.day,
         run=args.run,
