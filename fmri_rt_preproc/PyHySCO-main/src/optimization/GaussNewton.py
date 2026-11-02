@@ -44,6 +44,7 @@ class GaussNewton(EPIOptimize):
     def __init__(self, corr_obj, max_iter=10, tolG=1e-4, linear_solver=None, line_search=None, verbose=False, path=''):
         super().__init__(corr_obj, max_iter=max_iter, verbose=verbose, path=path)
         self.tolG = tolG
+        self._default_linear_solver = linear_solver is None
         if linear_solver is None:
             self.linear_solver = PCG(max_iter=10, tol=0.1, verbose=False)
         else:
@@ -70,10 +71,24 @@ class GaussNewton(EPIOptimize):
             optimal field map
         """
         start = time.time()
+        # DecNef local fix (2026-11): an infeasible initial field cannot enter
+        # the barrier optimizer. In particular, do not evaluate derivatives
+        # at a folded field or silently publish it after a failed line search.
+        initial_derivative = self.corr_obj.D.mat_mul(B0)
+        if not (torch.isfinite(B0).all() and torch.isfinite(initial_derivative).all()
+                and (torch.abs(initial_derivative) < 1).all()):
+            raise ValueError("PyHySCO initialization must have finite, positive Jacobians in both PE directions.")
         self.B0 = B0
         self.Bc = torch.clone(B0)
+        self.converged = False
+        self.convergence_reason = 'maximum_iterations'
+        self.barrier_limited = False
+        if self._default_linear_solver:
+            self.linear_solver.max_iter = 10
 
         Jc, dJ, H, M = self.corr_obj.eval(self.B0, yref=yref, do_derivative=True, calc_hessian=True)
+        if not (torch.isfinite(Jc).all() and torch.isfinite(dJ).all()):
+            raise FloatingPointError("PyHySCO initial objective and gradient must be finite.")
 
         Jstop = abs(Jc)
         tolJ = 1e-3
@@ -85,35 +100,68 @@ class GaussNewton(EPIOptimize):
              'grad norm': "Grad Norm"})
         self.log.log_iteration({'iteration': 0, 'loss': Jc.item()})
         fevals = 1
+        # An already-stationary initialization needs no linear solve; a zero
+        # right-hand side would otherwise reach PCG's 0/0 and fail line search.
+        if torch.norm(dJ) <= self.tolG * (1 + Jstop):
+            self.converged = True
+            self.convergence_reason = 'gradient_tolerance'
+            self.log.log_message("reached norm gradient tolerance at initialization")
+            self.log.log_message(f"termination: {self.convergence_reason}; barrier backtracking: {self.barrier_limited}")
+            self.log.log_message(f"total function evaluations: {fevals}")
+            elapsed = time.time() - start
+            self.log.log_message("total runtime:\t%d min %2.4f sec\n" % (int(elapsed / 60), elapsed % 60))
+            return self.Bc
         for i in range(1, self.max_iter + 1):
+            # Local fix: the barrier's large curvature can exhaust the usual
+            # ten PCG iterations. After constraint backtracking, allow a bounded
+            # fifty iterations at the same residual tolerance. Explicitly
+            # supplied solvers and fits that never hit the barrier are unchanged.
+            if self.barrier_limited and self._default_linear_solver:
+                self.linear_solver.max_iter = 50
             dy, resOpt, iterOpt, it, resvec = self.linear_solver.eval(H, -1.0 * dJ, M, x=torch.zeros_like(dJ))
             
             # Armijo line-search
             t, yt, LSiter, LS = self.line_search.eval(self.corr_obj,self.Bc, dy, Jc, dJ, yref=yref)
+            self.barrier_limited |= getattr(self.line_search, 'rejected_nonfinite', False)
             if t == 0:  # line search failed
+                self.convergence_reason = 'line_search_failed'
                 self.log.log_message("line search failed: stopping at iteration %i" % i)
                 break
 
             # save old values and update
-            stop_fmap_change = i>1 and (torch.norm(self.Bc - yt)) <= tolY * (1 + torch.norm(B0))
+            # DecNef local fix (2026-11): backtracking to stay inside the
+            # barrier can make the accepted step tiny far from convergence.
+            # Even a full Newton step can become tiny near the barrier. After
+            # rejecting an infeasible trial, require the existing gradient
+            # criterion; otherwise preserve the historical stopping rules.
+            stop_fmap_change = not self.barrier_limited and i>1 and (torch.norm(self.Bc - yt)) <= tolY * (1 + torch.norm(B0))
             self.Bc = yt
             Jc, dJ, H, M = self.corr_obj.eval(self.Bc, yref=yref, do_derivative=True, calc_hessian=True)
+            if not (torch.isfinite(Jc).all() and torch.isfinite(dJ).all()):
+                raise FloatingPointError("PyHySCO accepted objective and gradient must be finite.")
             
             self.log.log_iteration({'iteration': i, 'loss': Jc.item(), 'CG iters': it, 'CG rel residual': resOpt/resvec[0].item(), 'LS iters': LSiter, 'stepsize': t, 'dist val': self.corr_obj.Dc.item(), 'reg val': self.corr_obj.Sc.item(), 'grad norm': torch.norm(dJ).item()})
             fevals = fevals + 1 + LSiter
             stop_grad = torch.norm(dJ) <= self.tolG
-            stop_func_change = i > 1 and (torch.abs(Jc - self.log.history[-2]['loss'])) <= tolJ * (1 + Jstop)
+            stop_func_change = not self.barrier_limited and i > 1 and (torch.abs(Jc - self.log.history[-2]['loss'])) <= tolJ * (1 + Jstop)
             stop_grad_relative = torch.norm(dJ) <= self.tolG * (1 + Jstop)
             if stop_grad or stop_grad_relative:
+                self.converged = True
+                self.convergence_reason = 'gradient_tolerance'
                 self.log.log_message("reached norm gradient tolerance")
                 break
             if stop_func_change:
+                self.converged = True
+                self.convergence_reason = 'function_change_tolerance'
                 self.log.log_message("reached function value change tolerance")
                 break
             if stop_fmap_change:
+                self.converged = True
+                self.convergence_reason = 'field_change_tolerance'
                 self.log.log_message("reached field map change tolerance")
                 break
 
+        self.log.log_message(f"termination: {self.convergence_reason}; barrier backtracking: {self.barrier_limited}")
         self.log.log_message(f"total function evaluations: {fevals}")
         stop = time.time()
         minutes = int((stop - start) / 60)
@@ -244,10 +292,14 @@ class Armijo:
         Yt = Yc
         LSiter = 0
         t = self.t
+        self.rejected_nonfinite = False
         for LSiter in range(self.maxIter):
             Yt = Yc + t * dY
             Jt = obj.eval(Yt, yref=yref, do_derivative=False)
-            LS = (Jt < Jc + t * self.reduction * descent)
+            self.rejected_nonfinite |= not bool(torch.isfinite(Jt))
+            # Infinite barrier cost means the trial is outside the valid
+            # domain. It must backtrack rather than become an accepted field.
+            LS = torch.isfinite(Jt) and (Jt < Jc + t * self.reduction * descent)
             if LS:
                 break
             t = t / 2

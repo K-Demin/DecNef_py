@@ -1,5 +1,6 @@
 """Calibration-local fields for raw BOLD unwarping (no AP/PA registration)."""
 import json
+from functools import lru_cache
 from pathlib import Path
 
 import nibabel as nib
@@ -7,6 +8,11 @@ import numpy as np
 
 PIPELINE_ORDER = "unwarp_then_mc_v1"
 NATIVE_DIR = "native_unwarp_v1"
+ESTIMATOR_RECIPE = "pyhysco_gn_positive_jacobians_v2"
+_FRESH_CALIBRATION = (
+    "Use a fresh preparation directory to re-estimate the AP/PA calibration "
+    "and rebuild its dependent EPI references and transforms; existing files were not overwritten."
+)
 
 
 def source_identity(path):
@@ -44,6 +50,7 @@ def calibration_spec(ap, pa):
     # Existing PA protocol used dimension 2. Metadata overrides this legacy default.
     axis = "ijk".index(known[0][0]) + 1 if known else 2
     return {"order": PIPELINE_ORDER, "motion_correction": "none",
+            "estimator_recipe": ESTIMATOR_RECIPE,
             "ap": source_identity(ap), "pa": source_identity(pa),
             "phase_encoding_axis": axis, "ap_pe": pe[0], "pa_pe": pe[1],
             "readout_time": next((v for v in readouts if v is not None), None)}
@@ -69,12 +76,56 @@ def native_paths(pair_dir):
     return folder, folder / "pyhysco_native-EstFieldMap.nii", folder / "calibration.json"
 
 
+def _file_key(path):
+    identity = source_identity(path)
+    return identity["path"], identity["size"], identity["mtime_ns"]
+
+
+@lru_cache(maxsize=32)
+def _validate_field_cached(field_key, ap_key, pa_key, phase_encoding_axis):
+    """Validate once per file identity, including both PE polarities.
+
+    The field header is intentionally not physical image geometry. PyHySCO
+    saves an array on a staggered grid; its spacing comes from the AP/PA images.
+    Float64 checks the saved field mathematically. The runtime applier also
+    checks its actual float32 derivative when its sampling grid is constructed.
+    """
+    ap, pa = nib.load(ap_key[0]), nib.load(pa_key[0])
+    require_same_grid(pa, ap)
+    axis = int(phase_encoding_axis) - 1
+    if len(ap.shape) != 3 or axis not in (0, 1, 2):
+        raise ValueError("Native calibration requires a 3D prototype and a valid PE axis.")
+    field = np.asarray(nib.load(field_key[0]).dataobj, dtype=np.float64)
+    shape = list(ap.shape)
+    shape[axis] += 1
+    if field.shape != tuple(shape):
+        raise ValueError("Native PyHySCO field has the wrong staggered shape. " + _FRESH_CALIBRATION)
+    spacing = float(np.linalg.norm(ap.affine[:3, axis]))
+    if not np.isfinite(spacing) or spacing <= 0 or not np.isfinite(field).all():
+        raise ValueError("Native PyHySCO field or its PE spacing is nonfinite/invalid. " + _FRESH_CALIBRATION)
+    derivative = np.diff(field, axis=axis) / spacing
+    if not np.isfinite(derivative).all() or np.any(np.abs(derivative) >= 1):
+        raise ValueError(
+            "Native PyHySCO field has nonfinite or nonpositive AP/PA Jacobians "
+            "(both 1+Db and 1-Db must be strictly positive). " + _FRESH_CALIBRATION)
+    return {"min_ap_jacobian": float(np.min(1 + derivative)),
+            "min_pa_jacobian": float(np.min(1 - derivative))}
+
+
+def validate_native_field(pair_dir, phase_encoding_axis):
+    """Cached whole-field validity check; no brain mask or erosion is involved."""
+    folder, field, _ = native_paths(pair_dir)
+    return _validate_field_cached(_file_key(field), _file_key(folder / "AP_mean.nii"),
+                                  _file_key(folder / "PA_mean.nii"), int(phase_encoding_axis))
+
+
 def load_calibration(pair_dir):
     folder, field, manifest = native_paths(pair_dir)
     spec = json.loads(manifest.read_text())
     expected = calibration_spec(find_source(pair_dir, "AP"), find_source(pair_dir, "PA"))
     if spec != expected or not all(p.exists() for p in (field, folder / "AP_mean.nii", folder / "PA_mean.nii")):
-        raise ValueError("Native calibration is stale or incomplete; rebuild the selected pair.")
+        raise ValueError("Native calibration estimator recipe/inputs are stale or incomplete. " + _FRESH_CALIBRATION)
+    validate_native_field(pair_dir, spec["phase_encoding_axis"])
     return spec
 
 

@@ -17,6 +17,7 @@ import shlex
 from fmri_rt_preproc.native_fieldmap import (
     PIPELINE_ORDER, native_paths, calibration_spec, load_calibration,
     save_native_mean, require_same_grid, validate_bold, source_identity,
+    validate_native_field, ESTIMATOR_RECIPE,
 )
 
 from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap
@@ -257,11 +258,15 @@ class FMRIRealtimePreprocessor:
             log.warning("AP/PA metadata missing: using legacy voxel phase-encoding axis 2.")
         folder, field, manifest = native_paths(self.fmap_dir)
         folder.mkdir(parents=True, exist_ok=True)
-        if manifest.exists() and all(p.exists() for p in (field, folder / "AP_mean.nii", folder / "PA_mean.nii")):
-            if json.loads(manifest.read_text()) == spec:
-                return
         if manifest.exists():
-            manifest.unlink()  # An interrupted build must never appear complete.
+            saved = load_calibration(self.fmap_dir)
+            if saved != spec:
+                raise ValueError("Native calibration inputs changed. Use a fresh preparation directory "
+                                 "and rebuild dependent references/transforms; existing files were not overwritten.")
+            return
+        if any(folder.iterdir()):
+            raise ValueError("Unpublished or incomplete native calibration exists. Use a fresh preparation "
+                             "directory and rebuild dependent references/transforms; existing files were not overwritten.")
         require_same_grid(nib.load(str(ap)), nib.load(str(pa)))
         ap_mean, pa_mean = folder / "AP_mean.nii", folder / "PA_mean.nii"
         save_native_mean(ap, ap_mean)
@@ -269,7 +274,10 @@ class FMRIRealtimePreprocessor:
         self._run_ap_pa_pyhysco(ap_mean, pa_mean, output_stem="pyhysco_native")
         if not field.exists():
             raise FileNotFoundError(f"PyHySCO did not produce {field}")
-        manifest.write_text(json.dumps(spec, indent=2))
+        validate_native_field(self.fmap_dir, spec["phase_encoding_axis"])
+        temporary = manifest.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(spec, indent=2))
+        temporary.replace(manifest)
 
     def _is_current_output(self, out_path: Path, inputs: list[Path]) -> bool:
         if not out_path.exists():
@@ -299,15 +307,11 @@ class FMRIRealtimePreprocessor:
 
     def _run_ap_pa_pyhysco(self, ap_mean: Path, pa_mean: Path, output_stem: str = "pyhysco"):
         pyhysco_field = ap_mean.parent / f"{output_stem}-EstFieldMap.nii"
-        if self._is_current_output(pyhysco_field, [ap_mean, pa_mean]):
-            print("✓ PyHySCO fieldmap already exists — skipping")
-            return
-
         pyhysco_prefix = ap_mean.parent / output_stem
         generated_field = ap_mean.parent / f"{output_stem}-EstFieldMap.nii.gz"
-        for stale in (pyhysco_field, generated_field):
-            if stale.exists():
-                stale.unlink()
+        if pyhysco_field.exists() or generated_field.exists():
+            raise ValueError("A PyHySCO field already exists. Use a fresh preparation directory "
+                             "rather than overwrite calibration used by existing references/transforms.")
         pyhysco_src = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
         cmd = [
             "bash", "-lc",
@@ -602,6 +606,7 @@ class FMRIRealtimePreprocessor:
         if not isinstance(reference_n4, bool):
             raise ValueError("epi_reference_n4 must be a boolean.")
         return {"recipe": ANATOMICAL_RECIPE, "initialization": initialization, "syn": syn,
+                "fieldmap_estimator_recipe": ESTIMATOR_RECIPE,
                 "direction": getattr(cfg, "registration_direction", "epi_to_t1"),
                 "epi_reference_n4": reference_n4,
                 "epi_reference_n4_recipe": EPI_REFERENCE_N4_RECIPE if reference_n4 else None,
@@ -764,6 +769,7 @@ class FMRIRealtimePreprocessor:
         from .offline_assets import file_identity
         (self.trans_dir / "preparation_assets.json").write_text(json.dumps({
             "version": 1, "mni_template": file_identity(self.cfg.mni_template),
+            "fieldmap_estimator_recipe": ESTIMATOR_RECIPE,
             "offline_manifest": file_identity(assets["manifest"])
             if assets and assets.get("manifest") else None,
         }, indent=2) + "\n")

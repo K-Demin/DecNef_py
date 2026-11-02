@@ -193,6 +193,14 @@ class EPIOptimize:
         corr1(, corr2) : torch.Tensor
             corrected image(s)
         """
+        # DecNef local fix (2026-11): convergence alone does not establish
+        # field validity. Check before writing any field or corrected images.
+        if self.Bc is None:
+            raise ValueError("Run PyHySCO optimization before saving a field.")
+        derivative = self.corr_obj.D.mat_mul(self.Bc)
+        if not (torch.isfinite(self.Bc).all() and torch.isfinite(derivative).all()
+                and (torch.abs(derivative) < 1).all()):
+            raise ValueError("Refusing to save a PyHySCO field with nonfinite or nonpositive Jacobians.")
         self.Bc = self.Bc.detach()
         self.B0 = self.B0.detach()
 
@@ -200,8 +208,12 @@ class EPIOptimize:
                   self.path + '-EstFieldMap.nii.gz')
 
         if method == 'jac':
-            corr1 = self.corr_obj.corr1.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
-            corr2 = self.corr_obj.corr2.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+            # A rejected line-search trial may be the last objective cache.
+            # Always generate the published images from the accepted field.
+            corr1 = self.corr_obj.mp_transform(self.corr_obj.dataObj.I1, self.Bc)[0]
+            corr2 = self.corr_obj.mp_transform(self.corr_obj.dataObj.I2, -self.Bc)[0]
+            corr1 = corr1.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
+            corr2 = corr2.reshape(list(self.corr_obj.dataObj.m)).permute(self.corr_obj.dataObj.p)
             save_data(corr1, self.path + '-im1Corrected.nii.gz')
             save_data(corr2, self.path + '-im2Corrected.nii.gz')
             return corr1, corr2
