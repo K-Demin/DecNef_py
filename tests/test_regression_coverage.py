@@ -43,7 +43,8 @@ def _classes():
 MotionRegressor, Normalizer, RtpRegress = _classes()
 
 
-def _wrapper(tmp_path, mask, *, n=12, motion="mot6", wm=None, scale_before_glm=True):
+def _wrapper(tmp_path, mask, *, n=12, motion="mot6", wm=None, scale_before_glm=True,
+             normalization_mode=None, normalization_reference="fixed"):
     mask_path = tmp_path / "brain.nii"
     nib.save(nib.Nifti1Image(mask.astype(np.uint8), np.eye(4)), mask_path)
     wm_path = None
@@ -53,7 +54,8 @@ def _wrapper(tmp_path, mask, *, n=12, motion="mot6", wm=None, scale_before_glm=T
     wrapper = MotionRegressor(SimpleNamespace(_motion=np.zeros((40, 6), np.float32)),
                               reg_mask=mask_path, wm_mask=wm_path, mot_reg=motion,
                               max_poly_order=1, TR=1., max_scan_length=40,
-                              norm_ref_volumes=n)
+                              norm_ref_volumes=n, normalization_mode=normalization_mode,
+                              normalization_reference=normalization_reference)
     wrapper._regress.mask_src_proc = SimpleNamespace(proc_data=None)
     # These existing coverage cases deliberately exercise legacy GLM scaling.
     # The runtime wrapper may independently choose native units by default.

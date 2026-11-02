@@ -14,9 +14,11 @@ def reference_run(tmp_path):
         "normalization": rt.normalization_spec(),
         "coverage_policy": rt.COVERAGE_POLICY,
         "processing_mask": {
-            "policy": rt.PROCESSING_MASK_POLICY,
-            "version": rt.PROCESSING_MASK_POLICY_VERSION,
+            "policy": rt.FINAL_PROCESSING_MASK_POLICY,
+            "version": rt.FINAL_PROCESSING_MASK_POLICY_VERSION,
             "interpolation": getattr(rt.REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear"),
+            "processing_order": list(rt.FINAL_PROCESSING_ORDER),
+            "nuisance_source": rt.FINAL_NUISANCE_SOURCE,
         },
     }
     (run / "session_metadata.json").write_text(json.dumps(metadata))
@@ -46,6 +48,21 @@ def test_use_first_ready_score_and_exclude_calibration_and_nonfinite(tmp_path):
     assert not result["skipped_first_reg_ready"]
 
 
+def test_reject_reference_from_removed_second_calibration_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", SimpleNamespace(
+        voxel_norm_mode="zscore", voxel_norm_reference="fixed", voxel_norm_ref_volumes=30,
+        enable_motion_regression=True, analysis_space="epi"))
+    run, cfg = reference_run(tmp_path)
+    path = run / "session_metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["normalization"].pop("zscore_startup")
+    metadata["normalization"]["version"] = 1
+    path.write_text(json.dumps(metadata))
+    (run / "scores.csv").write_text("volume_idx,score_raw,reg_ready\n60,3,1\n61,5,1\n")
+    with pytest.raises(ValueError, match="voxel normalization"):
+        rt.load_reference_score_stats(cfg, "1")
+
+
 @pytest.mark.parametrize("rows", ["1,1000,0\n2,2000,0\n", "1,1000,\n2,2000,\n"])
 def test_never_fallback_to_calibration_or_unknown_readiness(tmp_path, rows):
     run, cfg = reference_run(tmp_path)
@@ -57,6 +74,8 @@ def test_never_fallback_to_calibration_or_unknown_readiness(tmp_path, rows):
     "missing_coverage", "old_coverage", "missing_processing", "invalid_processing",
     "missing_policy", "old_policy", "missing_version", "old_version",
     "missing_interpolation", "different_interpolation",
+    "missing_processing_order", "different_processing_order",
+    "missing_nuisance_source", "different_nuisance_source",
 ])
 def test_reject_reference_with_old_or_unrecorded_spatial_processing(tmp_path, change):
     run, cfg = reference_run(tmp_path)
@@ -77,6 +96,10 @@ def test_reject_reference_with_old_or_unrecorded_spatial_processing(tmp_path, ch
         processing["policy"] = "strict_brain_stencil"
     elif change == "old_version":
         processing["version"] -= 1
+    elif change == "different_processing_order":
+        processing["processing_order"] = ["denoising", "normalization", "spatial_transform", "smoothing"]
+    elif change == "different_nuisance_source":
+        processing["nuisance_source"] = "smoothed_final_grid"
     else:
         processing["interpolation"] = (
             "lanczos" if processing["interpolation"] == "linear" else "linear")

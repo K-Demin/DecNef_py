@@ -192,14 +192,31 @@ def export_prepared(args):
         images["epi_registration_reference"] = candidate
     epi, t1 = _image(images["epi_reference"]), _image(images["t1"])
     require_same_grid(epi, _image(images["epi_mask"], binary=True))
-    require_same_grid(t1, _image(images["t1_mask"], binary=True))
+    prepared_t1_mask = _image(images["t1_mask"])
+    require_same_grid(t1, prepared_t1_mask)
+    mask_values = np.asarray(prepared_t1_mask.dataobj)
+    if np.any((mask_values < 0) | (mask_values > 1)):
+        raise ValueError("Prepared T1_combined_mask must contain values between 0 and 1.")
+    # Native preparation uses FLIRT to resample a binary anatomical mask and
+    # can leave fractional edge values. Preserve this exporter's existing >0
+    # brain/tissue selection in an explicitly binary bundle copy. This does
+    # not alter the prepared mask or the already estimated transforms.
+    brain = mask_values > 0
+    if not brain.any():
+        raise ValueError("Prepared T1_combined_mask is empty.")
+    mask_preparation = {
+        "source": "prepared_T1_combined_mask",
+        "binarization": "value > 0",
+        "fractional_voxels": int(np.count_nonzero((mask_values > 0) & (mask_values < 1))),
+        "included_voxels": int(np.count_nonzero(brain)),
+    }
     _image(images["mni_template"])
     transforms = {"epi_to_t1": _file(trans / "epi2t1_Composite.h5"),
                   "t1_to_epi": _file(trans / "epi2t1_InverseComposite.h5"),
                   "t1_to_mni": _file(t1_to_mni_transform(SimpleNamespace(trans_dir=trans, subject_root=day.parent)))}
     with tempfile.TemporaryDirectory(prefix="decnef-offline-") as scratch:
         scratch = Path(scratch)
-        brain = np.asarray(_image(images["t1_mask"], binary=True).dataobj) > 0
+        images["t1_mask"] = _save_mask(brain, t1, scratch / "t1_mask.nii")
         for key in ("wm_mask", "vent_mask"):
             images[key] = _save_mask((_on_t1(_image(sources[key], binary=True), t1, 0) > 0) & brain,
                                      t1, scratch / (key + ".nii"))
@@ -218,6 +235,7 @@ def export_prepared(args):
             images["cortical_gm_mask"] = _save_mask(values & brain, t1, scratch / "cortical_gm_mask.nii")
         provenance = {"source": "decnef_prepared_day", "prepared_day": str(day),
                       "inputs": {key: file_identity(path) for key, path in {**sources, **transforms}.items()},
+                      "t1_mask_preparation": mask_preparation,
                       "alignment_validation": "not_performed_by_export"}
         if reference_preparation is not None:
             provenance["epi_registration_reference"] = {

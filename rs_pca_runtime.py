@@ -1074,13 +1074,43 @@ def condition_for_index(
     )
 
 
+def final_normalized_series(metadata: dict, volume_kind: str) -> tuple[str, str] | None:
+    """Resolve final-stream aliases only for the spatial-before-temporal order."""
+    if metadata.get("temporal_processing_order") != "spatial_smooth_glm_norm_v1":
+        return None
+    if volume_kind in {"mc", "unwarped"}:
+        return None
+    space = metadata.get("regression", {}).get("analysis_space", "mni")
+    mapped_epi = space == "epi" and metadata.get("epi_reference_mapped", False)
+    if volume_kind in {"t1", "mni", "epi_ref"}:
+        selected = "epi_ref" if mapped_epi else space
+        if volume_kind != selected:
+            raise ValueError(f"PCA {volume_kind} input does not match the run's final {space} grid.")
+    elif volume_kind not in {"auto", "reg", "norm", "smooth", "masked"}:
+        raise ValueError(f"Unknown PCA volume kind: {volume_kind}")
+    if volume_kind in {"smooth", "masked"}:
+        spatial_kind = final_output_kind(metadata.get("smoothing_fwhm_mm", 0),
+                                         metadata.get("analysis_mask", "whole_brain"))
+        if volume_kind != spatial_kind:
+            raise ValueError(f"PCA {volume_kind} input requested, but this stage is disabled for this run.")
+    declared = metadata.get("final_output")
+    if (not isinstance(declared, dict) or declared.get("folder") != "norm"
+            or declared.get("suffix") != "norm" or declared.get("space") != space):
+        raise ValueError("Spatial-before-temporal PCA requires final_output to identify norm in the analysis grid.")
+    return "norm", "norm"
+
+
 def volume_path_for_kind(run_dir: Path, volume_idx: int, volume_kind: str) -> Path:
     # Follow the final smoothing stage for the selected final denoised stream.
     # Metadata is written before processing begins, so polling never grabs an
     # unsmoothed file while its smoothed counterpart is still being produced.
     metadata = run_dir / "session_metadata.json"
-    if volume_kind in {"reg", "mc", "unwarped", "t1", "mni", "smooth", "masked"} and metadata.exists():
+    if volume_kind in {"reg", "mc", "unwarped", "t1", "mni", "epi_ref", "norm", "smooth", "masked"} and metadata.exists():
         info = json.loads(metadata.read_text(encoding="utf-8"))
+        final_series = final_normalized_series(info, volume_kind)
+        if final_series is not None:
+            folder, suffix = final_series
+            return run_dir / folder / f"vol_{volume_idx:05d}_{suffix}.nii"
         output_kind = final_output_kind(info.get("smoothing_fwhm_mm", 0), info.get("analysis_mask", "whole_brain"))
         if volume_kind in {"smooth", "masked"} and volume_kind != output_kind:
             raise ValueError(f"PCA {volume_kind} input requested, but this stage is disabled for this run.")

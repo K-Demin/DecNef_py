@@ -58,8 +58,8 @@ class RegressorSettings:
     use_wm: bool = True
     use_vent: bool = True
 
-    # Normalize after native-unit GLM, before spatial transforms/smoothing.
-    # zscore calibrates on N emitted ready residuals; mean uses N raw MC volumes.
+    # Spatial transforms -> smoothing -> original-intensity GLM -> normalization.
+    # zscore starts from the first fit's residual history; mean uses pre-GLM data.
     # N also sets the GLM startup minimum. Running references use prior data only.
     voxel_norm_mode: str = "zscore"  # zscore (sample SD), mean (100 * residual / raw mean)
     voxel_norm_reference: str = "fixed"  # fixed first N, or running prior observations
@@ -102,6 +102,7 @@ class RegressorSettings:
     epi_phase_encoding: str = "PA"  # "AP" or "PA"
     use_preloaded_pyhysco: bool = True
     save_intermediate_unwarped: bool = True  # pre-MC unwarped intermediate only
+    save_decoder_contributions: bool = True  # ready linear-decoder voxel terms, bias excluded
     enable_volume_streamer: bool = False
     volume_stream_kind: str = "unwarped"  # "unwarped" aliases fully corrected "mc"
     volume_stream_every_n: int = 1
@@ -117,6 +118,8 @@ class RegressorSettings:
 
     def update(self, overrides: dict[str, Any]) -> None:
         overrides = normalize_registration_config(overrides)
+        if not isinstance(overrides.get("save_decoder_contributions", self.save_decoder_contributions), bool):
+            raise ValueError("save_decoder_contributions must be a boolean.")
         registration_values = {key: overrides.get(key, getattr(self, key)) for key in REGISTRATION_KEYS}
         registration_values["registration_initialization"], registration_values["registration_syn"] = validate_registration_settings(
             registration_values["registration_initialization"], registration_values["registration_syn"]

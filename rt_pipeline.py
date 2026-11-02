@@ -31,7 +31,8 @@ from fmri_rt_preproc.analysis_mask import (
 )
 from fmri_rt_preproc.processing_mask import (
     make_processing_mask, processing_margin_vox,
-    PROCESSING_MASK_POLICY, PROCESSING_MASK_POLICY_VERSION,
+    FINAL_PROCESSING_MASK_POLICY, FINAL_PROCESSING_MASK_POLICY_VERSION,
+    FINAL_NUISANCE_SOURCE, FINAL_PROCESSING_ORDER,
 )
 
 from watchdog.observers import Observer
@@ -66,6 +67,7 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
 COVERAGE_POLICY = "separate_brain_processing_observed_support_v3"
+TEMPORAL_PROCESSING_ORDER = "spatial_smooth_glm_norm_v1"
 
 from fmri_rt_preproc.offline_assets import t1_to_mni_transform
 from fmri_rt_preproc.voxel_normalization import VoxelNormalizer
@@ -73,61 +75,84 @@ SUPPORT_THRESHOLD = 1.0 - 1e-5
 
 
 def normalization_spec():
-    return {"version": 1, "stage": "after_glm_before_spatial_resampling",
-            "space": "epi", "glm_input_units": "native",
+    spec = {"version": 3, "stage": "after_spatial_smoothing_glm",
+            "space": str(REGRESSOR_SETTINGS.analysis_space).lower(), "glm_input_units": "original_intensity",
             "mode": getattr(REGRESSOR_SETTINGS, "voxel_norm_mode", "zscore"),
             "reference": getattr(REGRESSOR_SETTINGS, "voxel_norm_reference", "fixed"),
             "ref_volumes": int(getattr(REGRESSOR_SETTINGS, "voxel_norm_ref_volumes", 30)),
             "current_volume_in_reference": False, "sample_sd_ddof": 1,
-            "mean_denominator": "raw_motion_corrected_bold", "clipping": None}
+            "mean_denominator": "pre_glm_transformed_smoothed_bold", "clipping": None}
+    if spec["mode"] == "zscore" and getattr(REGRESSOR_SETTINGS, "enable_motion_regression", True):
+        # References calibrated from the old second window are not equivalent.
+        spec.update(zscore_startup="first_glm_fit_residual_history")
+    return spec
 
 
 def processing_mask_spec(cfg):
-    """Record the source mask and deterministic interpolation margin."""
+    """Record final-grid temporal selection and the unchanged native nuisance source."""
     space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     spatial = space in {"t1", "mni"} or session_epi_bridge(cfg) is not None
     interpolation = str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower()
     path = getattr(cfg, "rt_unwarped_analysis_ref_mask", None)
-    return {"policy": PROCESSING_MASK_POLICY, "version": PROCESSING_MASK_POLICY_VERSION,
-            "margin_vox": processing_margin_vox(interpolation, spatial),
+    return {"policy": FINAL_PROCESSING_MASK_POLICY, "version": FINAL_PROCESSING_MASK_POLICY_VERSION,
+            "margin_vox": 0, "space": space,
+            "nuisance_source": FINAL_NUISANCE_SOURCE,
+            "processing_order": list(FINAL_PROCESSING_ORDER),
+            "nuisance_margin_vox": processing_margin_vox(interpolation, spatial),
             "interpolation": interpolation, "spatial_resampling": spatial,
             "brain_mask": source_identity(path) if path is not None and path.exists() else None,
             "final_brain_mask_interpolation": "NearestNeighbor",
             "availability_interpolation": "Linear"}
 
 
-def prepare_processing_masks(cfg):
-    """Keep anatomical selection separate from the temporal processing region.
-
-    The target brain mask is a nearest-neighbour mapping of the source brain.
-    Cubic padding includes every in-bounds Lanczos/Linear contributor around
-    its source centres. Per-volume acquisition and fit eligibility are applied
-    later; padding does not declare a missing sample valid.
-    """
+def prepare_processing_masks(cfg, analysis_mask=None):
+    """Keep native QC anatomy separate from final-grid temporal selection."""
     path = cfg.rt_unwarped_analysis_ref_mask
     if not path.exists():
         log.warning("[MASK] Brain mask missing at %s; using available acquisition support.", path)
-        return None, None, None, None
+        return None, analysis_mask, None, None
     source = nib.load(str(path))
     require_same_grid(source, nib.load(str(cfg.rt_unwarped_analysis_ref_epi)))
-    spec = processing_mask_spec(cfg)
-    values = np.asarray(source.dataobj)
-    processing = make_processing_mask(values, spec["interpolation"], spec["spatial_resampling"])
-    brain = values.astype(bool)
+    brain = np.asarray(source.dataobj).astype(bool)
     folder = cfg.rt_work_dir / "processing_mask"
     folder.mkdir(parents=True, exist_ok=True)
-    process_path = folder / "processing_epi.nii"
-    nib.save(nib.Nifti1Image(processing.astype(np.uint8), source.affine), process_path)
     nib.save(nib.Nifti1Image(brain.astype(np.uint8), source.affine), folder / "brain_epi.nii")
     space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     final_brain, final_affine = prepare_analysis_mask(
         cfg, "whole_brain", space, resolve_analysis_reference(cfg, space), folder, run)
+    processing = final_brain.copy()
+    if analysis_mask is not None:
+        if analysis_mask.shape != processing.shape:
+            raise ValueError("Analysis mask and final brain mask grids differ.")
+        processing &= analysis_mask
+    process_path = folder / "processing_final.nii"
+    nib.save(nib.Nifti1Image(processing.astype(np.uint8), final_affine), process_path)
     nib.save(nib.Nifti1Image(final_brain.astype(np.uint8), final_affine), folder / "brain_final.nii")
-    spec.update(brain_voxels=int(brain.sum()), processing_voxels=int(processing.sum()))
+    spec = processing_mask_spec(cfg)
+    spec.update(brain_voxels=int(final_brain.sum()), processing_voxels=int(processing.sum()))
     (folder / "policy.json").write_text(json.dumps(spec, indent=2) + "\n")
-    log.info("[MASK] brain=%d; processing=%d; margin=%d vox/axis (%s)",
-             brain.sum(), processing.sum(), spec["margin_vox"], spec["interpolation"])
+    log.info("[MASK] final %s grid: brain=%d; temporal processing=%d voxels",
+             space, final_brain.sum(), processing.sum())
     return brain, processing, final_brain, process_path
+
+
+def native_nuisance_means(handler, data, support):
+    """Sample the existing native, unsmoothed nuisance ROIs independently of responses."""
+    masks = getattr(handler, "native_nuisance_masks", None)
+    if masks is None:
+        return None
+    if getattr(handler, "_infer_native_nuisance_mask", False):
+        # Preserve RTPSpy's first-volume nonzero mask fallback on its original
+        # source grid, independently of the new final-grid response mask.
+        first_mask = data != 0
+        for label in masks:
+            masks[label] &= first_mask
+        handler._infer_native_nuisance_mask = False
+    means = {}
+    for label, mask in masks.items():
+        values = data[mask & support]
+        means[label] = float(values.mean()) if values.size and np.isfinite(values).all() else float("nan")
+    return means
 
 
 def save_normalization_reference(cfg, normalizer, affine, volume_idx):
@@ -143,7 +168,7 @@ def save_normalization_reference(cfg, normalizer, affine, volume_idx):
                      str(folder / f"reference_{name}.nii"))
     payload = {**normalization_spec(), "reference_count": normalizer.reference_count,
                "statistics_saved_after_volume": int(volume_idx), "ready": normalizer.ready,
-               "sample_source": "raw_mc" if normalizer.mode == "mean" else "regression_ready_output"}
+               "sample_source": "pre_glm_transformed_smoothed_bold" if normalizer.mode == "mean" else "regression_ready_output"}
     (folder / "reference.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 
@@ -427,6 +452,8 @@ class MotionRegressor:
         enable_dvars_censor_reg: bool = False,
         phys_reg: str = "None",
         rtp_physio: Optional[object] = None,
+        normalization_mode: Optional[str] = None,
+        normalization_reference: str = "fixed",
     ):
         wait_num = max(0, int(norm_ref_volumes) - 1)
         kwargs = dict(
@@ -444,6 +471,8 @@ class MotionRegressor:
             phys_reg=phys_reg,
             rtp_physio=rtp_physio,
             scale_before_glm=False,
+            startup_ref_volumes=(int(norm_ref_volumes) if normalization_mode == "zscore" else None),
+            startup_ref_reference=normalization_reference,
         )
         self._regress = RtpRegress(**kwargs)
 
@@ -466,6 +495,7 @@ class MotionRegressor:
         fd_censor: int = 0,
         dvars_censor: int = 0,
         support_mask=None,
+        nuisance_means=None,
     ) -> tuple[np.ndarray, bool]:
         """
         Returns (cleaned_vol, regressed_bool). Always returns a tuple.
@@ -494,6 +524,7 @@ class MotionRegressor:
                 fd_censor=fd_censor,
                 dvars_censor=dvars_censor,
                 support_mask=support_mask,
+                nuisance_means=nuisance_means,
             )
 
             regressed = bool(getattr(self._regress, "last_proc_ready", False))
@@ -514,6 +545,12 @@ class MotionRegressor:
     @property
     def brain_mask(self):
         return self._regress.maskV
+
+    def take_startup_reference(self):
+        """Consume the first fit's residual moments without replaying volumes."""
+        moments = self._regress.startup_residual_moments
+        self._regress.startup_residual_moments = None
+        return moments
 
     def get_regressors(self, volume_idx: int) -> tuple[Optional[list[str]], Optional[np.ndarray]]:
         des_mtx = getattr(self._regress, "desMtx", None)
@@ -872,8 +909,10 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
     # processing method, not those acquisition-specific identities. A changed
     # method can change decoder-score statistics even with identical voxel units.
     expected_processing = {
-        "policy": PROCESSING_MASK_POLICY,
-        "version": PROCESSING_MASK_POLICY_VERSION,
+        "policy": FINAL_PROCESSING_MASK_POLICY,
+        "version": FINAL_PROCESSING_MASK_POLICY_VERSION,
+        "nuisance_source": FINAL_NUISANCE_SOURCE,
+        "processing_order": list(FINAL_PROCESSING_ORDER),
         "interpolation": str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower(),
     }
     recorded_processing = metadata.get("processing_mask")
@@ -1069,6 +1108,16 @@ def write_session_metadata(cfg: RTSessionConfig, decoder_template: Path) -> None
             "reference_score_stats": cfg.reference_score_stats,
             "enable_original_score": cfg.enable_original_score,
             "preprocessing_order": PIPELINE_ORDER,
+            "temporal_processing_order": TEMPORAL_PROCESSING_ORDER,
+            "final_output": {"folder": "norm", "suffix": "norm",
+                             "space": str(REGRESSOR_SETTINGS.analysis_space).lower()},
+            "decoder_contributions": {
+                "enabled": bool(cfg.enable_scoring and getattr(REGRESSOR_SETTINGS, "save_decoder_contributions", False)),
+                "folder": "decoder_contributions", "input_folder": "norm",
+                "score": "score_raw", "bias_included": False,
+                "ready_finite_scores_only": True,
+            },
+            "coverage_space": str(REGRESSOR_SETTINGS.analysis_space).lower(),
             "coverage_policy": COVERAGE_POLICY,
             "processing_mask": processing_mask_spec(cfg),
             "normalization": normalization_spec(),
@@ -1220,8 +1269,6 @@ class DICOMHandler(FileSystemEventHandler):
             )
         self.gpu_resampler = maybe_init_gpu_resampler(cfg)
         self.pyhysco_applier = maybe_init_pyhysco_applier(cfg)
-        (self.anatomical_brain_mask, self.processing_mask, self.final_brain_mask,
-         self.processing_mask_path) = prepare_processing_masks(cfg)
         self.smoother = prepare_smoother(
             cfg, getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0),
             str(REGRESSOR_SETTINGS.analysis_space).lower(),
@@ -1230,6 +1277,9 @@ class DICOMHandler(FileSystemEventHandler):
             custom_file=getattr(REGRESSOR_SETTINGS, "analysis_mask_file", None),
             custom_space=getattr(REGRESSOR_SETTINGS, "analysis_mask_space", "final"),
         )
+        (self.anatomical_brain_mask, self.processing_mask, self.final_brain_mask,
+         self.processing_mask_path) = prepare_processing_masks(
+             cfg, self.smoother.mask if self.smoother is not None else None)
         self._pyhysco_unwarped_save_notice_emitted = False
         self.volume_streamer = VolumeStreamerHandle(
             VolumeStreamerConfig(
@@ -1321,6 +1371,22 @@ class DICOMHandler(FileSystemEventHandler):
         vent = resolve_mask("Vent", cfg.rt_vent_mask, REGRESSOR_SETTINGS.use_vent)
 
         used = {k: v for k, v in {"GS": gs, "WM": wm, "Vent": vent}.items() if v is not None}
+        self.native_nuisance_masks = {}
+        self._infer_native_nuisance_mask = self.anatomical_brain_mask is None
+        if REGRESSOR_SETTINGS.enable_motion_regression:
+            native_reference = nib.load(str(cfg.rt_motion_ref_epi))
+            native_processing = self.anatomical_brain_mask
+            if native_processing is not None:
+                mask_spec = processing_mask_spec(cfg)
+                native_processing = make_processing_mask(
+                    native_processing, mask_spec["interpolation"], mask_spec["spatial_resampling"])
+            for label, path in used.items():
+                image = nib.load(str(path))
+                require_same_grid(image, native_reference)
+                mask = np.asarray(image.dataobj).astype(bool)
+                if native_processing is not None:
+                    mask &= native_processing
+                self.native_nuisance_masks[label] = mask
         if used:
             log.info("[REG] Using nuisance masks:\n" + "\n".join([f"  {k}={v}" for k, v in used.items()]))
         else:
@@ -1395,6 +1461,8 @@ class DICOMHandler(FileSystemEventHandler):
                 TR=REGRESSOR_SETTINGS.TR,
                 max_scan_length=REGRESSOR_SETTINGS.rt_max_scan_length,
                 norm_ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
+                normalization_mode=REGRESSOR_SETTINGS.voxel_norm_mode,
+                normalization_reference=REGRESSOR_SETTINGS.voxel_norm_reference,
                 enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
                 enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
                 phys_reg=phys_reg,
@@ -1440,7 +1508,8 @@ class DICOMHandler(FileSystemEventHandler):
     def stop(self):
         if hasattr(self, "normalization_last_volume"):
             save_normalization_reference(self.cfg, self.voxel_normalizer,
-                                         nib.load(str(self.cfg.rt_motion_ref_epi)).affine,
+                                         nib.load(str(resolve_analysis_reference(
+                                             self.cfg, str(REGRESSOR_SETTINGS.analysis_space).lower()))).affine,
                                          self.normalization_last_volume)
         if self.biopac_receiver is not None:
             if self._biopac_run_started:
@@ -2134,142 +2203,10 @@ def process_volume(
     if speed is not None:
         speed.stage(volume_idx, "QC", time.perf_counter() - qc_t0)
 
-    # ---------- 2d) Motion regression (RTPS_py) ----------
-    reg_t0 = time.perf_counter()
-    mc_for_warp = mc_unwarped_nii
-    if handler.motion_regressor is not None:
-        handler.proc_src.proc_data = np.asanyarray(mc_unwarped_img.dataobj)
-        cleaned, reg_ready = handler.motion_regressor.apply(
-            mc_unwarped_img,
-            volume_idx,
-            fd_censor=fd_censor,
-            dvars_censor=dvars_censor,
-            support_mask=mc_support,
-        )
-        processor = handler.motion_regressor
-        cleaned = np.array(cleaned, copy=True)
-        cleaned_support = getattr(processor, "output_support", None)
-        cleaned_support = mc_support if cleaned_support is None else cleaned_support
-        cleaned[~cleaned_support] = 0
-        reg_dir = cfg.rt_reg_dir
-        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
-        mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
-    else:
-        processor = handler.voxel_normalizer
-        # No GLM: normalization still uses the same dedicated following stage.
-        cleaned = np.array(mc_data, copy=True)
-        cleaned_support = mc_support.copy()
-        norm_brain = getattr(processor, "brain_mask", None)
-        if norm_brain is not None:
-            cleaned_support &= norm_brain
-        cleaned[~cleaned_support] = 0
-        reg_ready = True
-        reg_dir = cfg.rt_reg_dir
-        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
-        nib.save(nib.Nifti1Image(cleaned, mc_unwarped_img.affine), str(reg_nii))
-        mc_for_warp = reg_nii
-        log_step("REG", volume_idx, "skipped", start_t=reg_t0, speed=speed)
-
-    processing_mask = getattr(processor, "brain_mask", getattr(processor, "_brain_mask", None))
-    if processing_mask is None:
-        processing_mask = np.ones(mc_support.shape, dtype=bool)
-    brain_mask = getattr(handler, "anatomical_brain_mask", None)
-    if brain_mask is None:
-        brain_mask = processing_mask
-    if brain_mask.shape != mc_support.shape or cleaned_support.shape != mc_support.shape:
-        raise ValueError("Denoising support and motion-corrected volume grids differ.")
-    current_brain_support = brain_mask & mc_support
-    current_processing_support = processing_mask & mc_support
-
-    # ---------- 2e) Voxel normalization after native-unit cGLM ----------
-    norm_t0 = time.perf_counter()
-    glm_ready = bool(reg_ready)
-    normalizer = handler.voxel_normalizer
-    reference_count = normalizer.reference_count
-    if glm_ready:
-        normalized = normalizer.transform(cleaned, cleaned_support)
-        cleaned_support = normalizer.output_support.copy()
-    else:
-        normalized = np.zeros(cleaned.shape, dtype=np.float32)
-        cleaned_support = np.zeros(cleaned.shape, dtype=bool)
-    normalization_ready = bool(normalizer.ready)
-    reg_ready = bool(glm_ready and normalization_ready and (cleaned_support & brain_mask).any())
-    # Always score against PRIOR samples. Residual warmup is not calibration.
-    was_calibrated = normalizer.ready
-    if normalizer.mode == "mean":
-        if current_brain_support.any():
-            normalizer.observe(mc_data, current_processing_support)
-    elif glm_ready:
-        # Preserve the GLM's valid support separately from normalization's
-        # not-yet-calibrated output support.
-        fit_support = getattr(processor, "output_support", None) if handler.motion_regressor is not None else current_processing_support
-        fit_support = current_processing_support if fit_support is None else fit_support
-        if (fit_support & brain_mask).any():
-            normalizer.observe(cleaned, fit_support)
-    norm_dir = cfg.rt_work_dir / "norm"
-    norm_dir.mkdir(parents=True, exist_ok=True)
-    norm_nii = norm_dir / f"vol_{volume_idx:05d}_norm.nii"
-    norm_tmp = norm_nii.with_name("." + norm_nii.name)
-    nib.save(nib.Nifti1Image(normalized, mc_unwarped_img.affine), str(norm_tmp))
-    norm_tmp.replace(norm_nii)
-    mc_for_warp = norm_nii
-    if not was_calibrated and normalizer.ready:
-        save_normalization_reference(cfg, normalizer, ref_img.affine, volume_idx)
-    handler.normalization_last_volume = volume_idx
-    log_step("NORM", volume_idx,
-             f"{normalizer.mode}/{normalizer.reference}; prior_samples={reference_count}; ready={int(reg_ready)}",
-             start_t=norm_t0, speed=speed)
-
-    if speed is not None:
-        speed.readiness(volume_idx, reg_ready)
-    output_t0 = time.perf_counter()
-
-    if handler.motion_regressor is not None:
-        reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
-        if reg_names and reg_row is not None:
-            append_regressors(handler.cfg.rt_work_dir / "regressors_rt.csv", volume_idx, reg_names, reg_row)
-
-    biopac_missing = False
-    if handler.biopac_receiver is not None:
-        biopac_missing = handler.biopac_receiver.was_missing(volume_idx)
-    append_regression_status(
-        handler.cfg.rt_work_dir / "regression_status_rt.csv",
-        volume_idx,
-        fd_to_save,
-        handler.last_dvars_val,
-        handler.last_dvars_z,
-        fd_censor,
-        dvars_censor,
-        reg_ready,
-        biopac_missing,
-        glm_ready=glm_ready,
-        normalization_ready=normalization_ready,
-        normalization_reference_count=reference_count,
-    )
-    if REGRESSOR_SETTINGS.biopac_timelag and handler.biopac_receiver is not None:
-        trigger_ts = handler.biopac_receiver.get_trigger_timestamp(volume_idx)
-        if trigger_ts is not None:
-            timelag = volume_timestamp - trigger_ts
-            handler._biopac_timelag_sum += timelag
-            handler._biopac_timelag_count += 1
-            avg_timelag = handler._biopac_timelag_sum / handler._biopac_timelag_count
-            append_biopac_timelag(
-                handler._biopac_timelag_path,
-                volume_idx,
-                trigger_ts,
-                volume_timestamp,
-                timelag,
-                avg_timelag,
-            )
-
-    if speed is not None:
-        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
-
     # ---------- 3) Space handling (EPI passthrough, EPI→T1, or EPI→T1→MNI) ----------
     t0 = time.perf_counter()
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    mc_for_warp = mc_unwarped_nii
     t1_stage_nii = None
     pending_spatial_outputs = []
     score_input_nii = mc_for_warp
@@ -2424,28 +2361,20 @@ def process_volume(
         )
         return False
 
-    # Coverage is transformed separately from the signal, before smoothing.
+    # Carry acquisition coverage to the response grid once, before smoothing.
     coverage_t0 = time.perf_counter()
     final_coverage = final_volume_support(cfg, handler, mc_support, ref_img.affine,
                                          volume_idx, analysis_space)
-    final_support = final_volume_support(cfg, handler, cleaned_support, ref_img.affine,
-                                        volume_idx, analysis_space, folder_name="support",
-                                        mapped_support=(final_coverage if np.array_equal(
-                                            cleaned_support, mc_support) else None))
-    final_orig_support = final_support
-    # Original intensities already retain all acquired neighbours. Apply the
-    # anatomical boundary on the target grid, without eroding it in EPI space.
-    original_support = (mc_support if getattr(handler, "final_brain_mask", None) is not None
-                        else current_brain_support)
-    if score_input_orig_nii is not None and not np.array_equal(original_support, cleaned_support):
-        final_orig_support = final_volume_support(cfg, handler, original_support, ref_img.affine,
-                                                 volume_idx, analysis_space, folder_name="support_original",
-                                                 mapped_support=(final_coverage if np.array_equal(
-                                                     original_support, mc_support) else None))
-    zero_outside_support(score_input_nii, final_support)
-    if score_input_orig_nii == mc_nii and not final_orig_support.all():
-        # Preserve the acquired MC product; the optional original score still
-        # uses a brain-masked image, independently of denoising eligibility.
+    spatial_output_support = final_coverage.copy()
+    brain_mask = getattr(handler, "final_brain_mask", None)
+    if brain_mask is None:
+        brain_mask = np.ones(final_coverage.shape, dtype=bool)
+    spatial_output_support &= brain_mask
+    # The native MC product stays untouched even for an EPI-space passthrough.
+    if score_input_nii != mc_unwarped_nii:
+        zero_outside_support(score_input_nii, spatial_output_support)
+    final_orig_support = spatial_output_support
+    if score_input_orig_nii == mc_unwarped_nii:
         original_dir = cfg.rt_work_dir / "original"
         original_dir.mkdir(parents=True, exist_ok=True)
         score_input_orig_nii = original_dir / f"vol_{volume_idx:05d}_epi_orig.nii"
@@ -2453,10 +2382,6 @@ def process_volume(
                  str(score_input_orig_nii))
     elif score_input_orig_nii is not None:
         zero_outside_support(score_input_orig_nii, final_orig_support)
-    record_volume_support(cfg, handler, volume_idx, brain_mask, mc_support,
-                          cleaned_support, final_support)
-    # PCA polls public stage filenames. Publish only the completed, supported
-    # image so an unsmoothed consumer cannot read an intermediate interpolation.
     for temporary, destination in pending_spatial_outputs:
         temporary.replace(destination)
         if score_input_nii == temporary:
@@ -2466,7 +2391,7 @@ def process_volume(
     if speed is not None:
         speed.stage(volume_idx, "TRANS", time.perf_counter() - coverage_t0)
 
-    # Final image operation, after spatial transforms and before all scoring.
+    # Spatial smoothing/selection precedes temporal denoising and normalization.
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
         smooth_t0 = time.perf_counter()
@@ -2474,11 +2399,177 @@ def process_volume(
         folder = cfg.rt_work_dir / kind
         score_input_nii = smooth_file(smoother, score_input_nii,
                                       folder / f"vol_{volume_idx:05d}_{kind}.nii",
-                                      support_mask=final_support)
+                                      support_mask=spatial_output_support)
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
                 folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_orig_support)
         log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
+
+    temporal_image = nib.load(str(score_input_nii))
+    temporal_data = np.asarray(temporal_image.dataobj, dtype=np.float32).copy()
+    processing_mask = getattr(handler, "processing_mask", None)
+    if processing_mask is None:
+        processing_mask = brain_mask.copy()
+    if smoother is not None:
+        processing_mask = processing_mask & smoother.mask
+    if processing_mask.shape != temporal_data.shape or final_coverage.shape != temporal_data.shape:
+        raise ValueError("Temporal mask, acquisition support and final volume grids differ.")
+    temporal_support = spatial_output_support & processing_mask
+    temporal_data[~temporal_support] = 0
+    # RTPSpy updates its image in-place; keep saved spatial/smoothed data intact.
+    temporal_image = nib.Nifti1Image(temporal_data.copy(), temporal_image.affine)
+    temporal_image.set_filename(str(score_input_nii))
+    nuisance_means = (native_nuisance_means(handler, mc_data, mc_support)
+                      if handler.motion_regressor is not None else None)
+
+    # ---------- Temporal denoising on the final analysis grid ----------
+    reg_t0 = time.perf_counter()
+    if handler.motion_regressor is not None:
+        handler.proc_src.proc_data = np.asanyarray(mc_unwarped_img.dataobj)
+        cleaned, reg_ready = handler.motion_regressor.apply(
+            temporal_image,
+            volume_idx,
+            fd_censor=fd_censor,
+            dvars_censor=dvars_censor,
+            support_mask=temporal_support,
+            nuisance_means=nuisance_means,
+        )
+        processor = handler.motion_regressor
+        cleaned = np.array(cleaned, copy=True)
+        cleaned_support = getattr(processor, "output_support", None)
+        cleaned_support = temporal_support if cleaned_support is None else cleaned_support
+        cleaned[~cleaned_support] = 0
+        reg_dir = cfg.rt_reg_dir
+        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, temporal_image.affine), str(reg_nii))
+        log_step("REG", volume_idx, "denoising", start_t=reg_t0, speed=speed)
+    else:
+        processor = handler.voxel_normalizer
+        # No GLM: normalization still uses the same dedicated following stage.
+        cleaned = np.array(temporal_data, copy=True)
+        cleaned_support = temporal_support.copy()
+        norm_brain = getattr(processor, "brain_mask", None)
+        if norm_brain is not None:
+            cleaned_support &= norm_brain
+        cleaned[~cleaned_support] = 0
+        reg_ready = True
+        reg_dir = cfg.rt_reg_dir
+        reg_nii = reg_dir / f"vol_{volume_idx:05d}_reg.nii"
+        nib.save(nib.Nifti1Image(cleaned, temporal_image.affine), str(reg_nii))
+        log_step("REG", volume_idx, "skipped", start_t=reg_t0, speed=speed)
+
+    if cleaned_support.shape != temporal_support.shape:
+        raise ValueError("Denoising support and final analysis volume grids differ.")
+    current_brain_support = brain_mask & final_coverage
+    current_processing_support = temporal_support
+
+    # ---------- Voxel normalization after final-grid cGLM ----------
+    norm_t0 = time.perf_counter()
+    glm_ready = bool(reg_ready)
+    normalizer = handler.voxel_normalizer
+    reference_count = normalizer.reference_count
+    if glm_ready:
+        normalized = normalizer.transform(cleaned, cleaned_support)
+        cleaned_support = normalizer.output_support.copy()
+    else:
+        normalized = np.zeros(cleaned.shape, dtype=np.float32)
+        cleaned_support = np.zeros(cleaned.shape, dtype=bool)
+    normalization_ready = bool(normalizer.ready)
+    reg_ready = bool(glm_ready and normalization_ready and (cleaned_support & brain_mask).any())
+    # Score against PRIOR samples. Reuse the first GLM fit's residual history
+    # for startup instead of waiting for a second window of emitted residuals.
+    was_calibrated = normalizer.ready
+    if normalizer.mode == "mean":
+        if current_brain_support.any():
+            normalizer.observe(temporal_data, current_processing_support)
+    elif glm_ready:
+        # Preserve the GLM's valid support separately from normalization's
+        # not-yet-calibrated output support.
+        fit_support = getattr(processor, "output_support", None) if handler.motion_regressor is not None else current_processing_support
+        fit_support = current_processing_support if fit_support is None else fit_support
+        startup = (handler.motion_regressor.take_startup_reference()
+                   if handler.motion_regressor is not None else None)
+        if startup is not None:
+            normalizer.initialize_from_moments(**startup)
+            # The current residual is already represented in the first fit's
+            # history (or outside the fixed first-N window). Do not add it twice.
+        elif (handler.motion_regressor is None or normalizer.reference_count > 0) and (fit_support & brain_mask).any():
+            # A fit can precede N valid design rows; wait for its startup
+            # history snapshot instead of mixing partial emitted residuals in.
+            normalizer.observe(cleaned, fit_support)
+    norm_dir = cfg.rt_work_dir / "norm"
+    norm_dir.mkdir(parents=True, exist_ok=True)
+    norm_nii = norm_dir / f"vol_{volume_idx:05d}_norm.nii"
+    norm_tmp = norm_nii.with_name("." + norm_nii.name)
+    nib.save(nib.Nifti1Image(normalized, temporal_image.affine), str(norm_tmp))
+    norm_tmp.replace(norm_nii)
+    score_input_nii = norm_nii
+    if not was_calibrated and normalizer.ready:
+        save_normalization_reference(cfg, normalizer, temporal_image.affine, volume_idx)
+    handler.normalization_last_volume = volume_idx
+    log_step("NORM", volume_idx,
+             f"{normalizer.mode}/{normalizer.reference}; prior_samples={reference_count}; ready={int(reg_ready)}",
+             start_t=norm_t0, speed=speed)
+
+    if speed is not None:
+        speed.readiness(volume_idx, reg_ready)
+    output_t0 = time.perf_counter()
+
+    if handler.motion_regressor is not None:
+        reg_names, reg_row = handler.motion_regressor.get_regressors(volume_idx)
+        if reg_names and reg_row is not None:
+            append_regressors(handler.cfg.rt_work_dir / "regressors_rt.csv", volume_idx, reg_names, reg_row)
+
+    biopac_missing = False
+    if handler.biopac_receiver is not None:
+        biopac_missing = handler.biopac_receiver.was_missing(volume_idx)
+    append_regression_status(
+        handler.cfg.rt_work_dir / "regression_status_rt.csv",
+        volume_idx,
+        fd_to_save,
+        handler.last_dvars_val,
+        handler.last_dvars_z,
+        fd_censor,
+        dvars_censor,
+        reg_ready,
+        biopac_missing,
+        glm_ready=glm_ready,
+        normalization_ready=normalization_ready,
+        normalization_reference_count=reference_count,
+    )
+    if REGRESSOR_SETTINGS.biopac_timelag and handler.biopac_receiver is not None:
+        trigger_ts = handler.biopac_receiver.get_trigger_timestamp(volume_idx)
+        if trigger_ts is not None:
+            timelag = volume_timestamp - trigger_ts
+            handler._biopac_timelag_sum += timelag
+            handler._biopac_timelag_count += 1
+            avg_timelag = handler._biopac_timelag_sum / handler._biopac_timelag_count
+            append_biopac_timelag(
+                handler._biopac_timelag_path,
+                volume_idx,
+                trigger_ts,
+                volume_timestamp,
+                timelag,
+                avg_timelag,
+            )
+
+    if speed is not None:
+        speed.stage(volume_idx, "OUTPUT", time.perf_counter() - output_t0)
+
+    # GLM/normalization support already occupies the final grid: do not warp it again.
+    final_support = cleaned_support & processing_mask
+    support_dir = cfg.rt_work_dir / "support"
+    support_dir.mkdir(parents=True, exist_ok=True)
+    final_kind = "epi_ref" if analysis_space == "epi" and session_epi_bridge(cfg) is not None else analysis_space
+    nib.save(nib.Nifti1Image(final_support.astype(np.uint8), temporal_image.affine),
+             support_dir / f"vol_{volume_idx:05d}_{final_kind}.nii")
+    if score_input_orig_nii is not None and not np.array_equal(final_orig_support, final_support):
+        original_support_dir = cfg.rt_work_dir / "support_original"
+        original_support_dir.mkdir(parents=True, exist_ok=True)
+        nib.save(nib.Nifti1Image(final_orig_support.astype(np.uint8), temporal_image.affine),
+                 original_support_dir / f"vol_{volume_idx:05d}_{final_kind}.nii")
+    record_volume_support(cfg, handler, volume_idx, brain_mask, final_coverage,
+                          cleaned_support, final_support)
 
     output_t0 = time.perf_counter()
     stream_kind = str(getattr(REGRESSOR_SETTINGS, "volume_stream_kind", "unwarped")).lower()
@@ -2533,6 +2624,20 @@ def process_volume(
 
         # Calibration zeros are unavailable features, not a neutral score.
         raw_score = handler.scorer.score_from_array(score_data) if reg_ready else float("nan")
+        if reg_ready and np.isfinite(raw_score) and getattr(REGRESSOR_SETTINGS, "save_decoder_contributions", False):
+            contributions_dir = cfg.rt_work_dir / "decoder_contributions"
+            contributions_dir.mkdir(parents=True, exist_ok=True)
+            contributions = handler.scorer.contributions_from_array(score_data)
+            contributions_img = nib.Nifti1Image(contributions, score_img.affine, score_img.header.copy())
+            contributions_img.set_data_dtype(np.float32)
+            nib.save(contributions_img, contributions_dir / f"vol_{volume_idx:05d}_decoder_contributions.nii")
+            contribution_metadata = contributions_dir / "decoder.json"
+            if not contribution_metadata.exists():
+                contribution_metadata.write_text(json.dumps({
+                    "bias": float(handler.scorer.bias), "score": "score_raw",
+                    "relation": "sum(voxel_contributions) + bias; subject to floating-point rounding",
+                    "input_folder": "norm", "bias_included_in_image": False,
+                }, indent=2) + "\n", encoding="utf-8")
         event_type = handler.score_event_tracker.for_volume(volume_idx)
         analysis_timestamp = time.time()
         timestamp = append_score(
@@ -2623,6 +2728,7 @@ def validate_run_provenance(cfg):
     if legacy_schema and trans_dir is not None and (trans_dir / "registration.json").exists():
         raise ValueError("Legacy run provenance cannot certify the new registration. Use a fresh run output directory.")
     payload = {"order": PIPELINE_ORDER, "coverage_policy": COVERAGE_POLICY,
+               "temporal_processing_order": TEMPORAL_PROCESSING_ORDER,
                "normalization": normalization_spec(),
                "processing_mask": processing_mask_spec(cfg),
                "calibration": load_calibration(cfg.fmap_dir),
@@ -2927,34 +3033,35 @@ def main():
     parser.add_argument(
         "--biopac-enable",
         action="store_true",
+        default=None,
         help="Enable BIOPAC RetroTS regressors via TCP.",
     )
     parser.add_argument(
         "--biopac-host",
-        default=REGRESSOR_SETTINGS.biopac_host,
+        default=None,
         help="Host to bind BIOPAC receiver.",
     )
     parser.add_argument(
         "--biopac-port",
         type=int,
-        default=REGRESSOR_SETTINGS.biopac_port,
+        default=None,
         help="Port to bind BIOPAC receiver.",
     )
     parser.add_argument(
         "--biopac-timeout",
         type=float,
-        default=REGRESSOR_SETTINGS.biopac_timeout,
+        default=None,
         help="Seconds to wait for physio regressors before zero-fill.",
     )
     parser.add_argument(
         "--biopac-phys-reg",
-        default=REGRESSOR_SETTINGS.biopac_phys_reg,
+        default=None,
         choices=["RICOR8", "RVT5", "RVT+RICOR13"],
         help="Physio regressor family to expect from BIOPAC stream.",
     )
     parser.add_argument(
         "--biopac-mode",
-        default=REGRESSOR_SETTINGS.biopac_mode,
+        default=None,
         choices=["tcp", "file"],
         help="BIOPAC input mode: tcp (listen on socket) or file (tail CSV).",
     )
@@ -2966,67 +3073,67 @@ def main():
     parser.add_argument(
         "--biopac-poll",
         type=float,
-        default=REGRESSOR_SETTINGS.biopac_poll_interval,
+        default=None,
         help="Polling interval (seconds) for file-backed BIOPAC buffer.",
     )
     parser.add_argument(
         "--biopac-handshake",
         action="store_true",
-        default=REGRESSOR_SETTINGS.biopac_handshake,
+        default=None,
         help="Send a handshake with TR to the BIOPAC streamer.",
     )
     parser.add_argument(
         "--biopac-start-online",
         action="store_true",
-        default=REGRESSOR_SETTINGS.biopac_start_online_only,
+        default=None,
         help="Defer BIOPAC receiver start until after offline DICOM processing.",
     )
     parser.add_argument(
         "--biopac-timelag",
         action="store_true",
-        default=REGRESSOR_SETTINGS.biopac_timelag,
+        default=None,
         help="Log per-volume trigger-to-volume timelag and running average.",
     )
     parser.add_argument(
         "--analysis-space",
         choices=["epi", "t1", "mni"],
-        default=REGRESSOR_SETTINGS.analysis_space,
+        default=None,
         help="Space for scoring/output volumes: epi (native EPI), t1 (apply EPI->T1), or mni (apply EPI->T1->MNI).",
     )
     parser.add_argument(
         "--voxel-norm-ref-volumes",
         type=int,
-        default=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
-        help="When motion regression is disabled, number of initial volumes used to estimate voxel-wise reference mean.",
+        default=None,
+        help="Normalization reference length and minimum GLM startup count; overrides the settings file only when supplied.",
     )
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=REGRESSOR_SETTINGS.max_workers,
+        default=None,
         help="Maximum parallel processing workers for DICOM handling.",
     )
     parser.add_argument(
         "--rt-max-scan-length",
         type=int,
-        default=REGRESSOR_SETTINGS.rt_max_scan_length,
+        default=None,
         help="Maximum TR count preallocated by RTPSpy regression.",
     )
     parser.add_argument(
         "--pipeline-engine",
         choices=["parallel_ordered", "legacy"],
-        default=REGRESSOR_SETTINGS.pipeline_engine,
+        default=None,
         help="Pipeline execution engine.",
     )
     parser.add_argument(
         "--commit-wait-timeout-s",
         type=float,
-        default=REGRESSOR_SETTINGS.commit_wait_timeout_s,
+        default=None,
         help="Seconds to wait before force-advancing ordered commit for stalled scans.",
     )
     parser.add_argument(
         "--max-retries",
         type=int,
-        default=REGRESSOR_SETTINGS.max_retries,
+        default=None,
         help="Maximum retries per DICOM if processing fails.",
     )
     parser.add_argument(
@@ -3064,30 +3171,35 @@ def main():
         REGRESSOR_SETTINGS.update(vars(loaded))
     apply_registration_arguments(REGRESSOR_SETTINGS, args)
 
-    REGRESSOR_SETTINGS.enable_biopac_physio = args.biopac_enable
-    REGRESSOR_SETTINGS.biopac_host = args.biopac_host
-    REGRESSOR_SETTINGS.biopac_port = args.biopac_port
-    REGRESSOR_SETTINGS.biopac_timeout = args.biopac_timeout
-    REGRESSOR_SETTINGS.biopac_phys_reg = args.biopac_phys_reg
-    REGRESSOR_SETTINGS.biopac_handshake = args.biopac_handshake
-    REGRESSOR_SETTINGS.biopac_start_online_only = args.biopac_start_online
-    REGRESSOR_SETTINGS.biopac_mode = args.biopac_mode
-    REGRESSOR_SETTINGS.biopac_file = Path(args.biopac_file) if args.biopac_file else None
-    REGRESSOR_SETTINGS.biopac_poll_interval = args.biopac_poll
-    REGRESSOR_SETTINGS.biopac_timelag = args.biopac_timelag
-    REGRESSOR_SETTINGS.analysis_space = args.analysis_space
-    REGRESSOR_SETTINGS.voxel_norm_ref_volumes = max(1, int(args.voxel_norm_ref_volumes))
-    REGRESSOR_SETTINGS.max_workers = args.max_workers
-    REGRESSOR_SETTINGS.rt_max_scan_length = max(1, int(args.rt_max_scan_length))
-    REGRESSOR_SETTINGS.pipeline_engine = args.pipeline_engine
-    REGRESSOR_SETTINGS.commit_wait_timeout_s = max(0.1, float(args.commit_wait_timeout_s))
-    REGRESSOR_SETTINGS.max_retries = args.max_retries
-    if args.volume_streamer is not None:
-        REGRESSOR_SETTINGS.enable_volume_streamer = args.volume_streamer
-    if args.volume_stream_kind is not None:
-        REGRESSOR_SETTINGS.volume_stream_kind = args.volume_stream_kind
-    if args.volume_stream_every_n is not None:
-        REGRESSOR_SETTINGS.volume_stream_every_n = max(1, int(args.volume_stream_every_n))
+    # Omitted flags must not replace values just loaded from the JSON profile.
+    # Preserve the standalone CLI's historical BIOPAC-off default without a profile.
+    if args.biopac_enable is None and not args.settings_file:
+        args.biopac_enable = False
+    overrides = {
+        "enable_biopac_physio": args.biopac_enable,
+        "biopac_host": args.biopac_host,
+        "biopac_port": args.biopac_port,
+        "biopac_timeout": args.biopac_timeout,
+        "biopac_phys_reg": args.biopac_phys_reg,
+        "biopac_handshake": args.biopac_handshake,
+        "biopac_start_online_only": args.biopac_start_online,
+        "biopac_mode": args.biopac_mode,
+        "biopac_file": args.biopac_file,
+        "biopac_poll_interval": args.biopac_poll,
+        "biopac_timelag": args.biopac_timelag,
+        "analysis_space": args.analysis_space,
+        "voxel_norm_ref_volumes": args.voxel_norm_ref_volumes,
+        "max_workers": args.max_workers,
+        "rt_max_scan_length": args.rt_max_scan_length,
+        "pipeline_engine": args.pipeline_engine,
+        "commit_wait_timeout_s": (max(0.1, args.commit_wait_timeout_s)
+                                  if args.commit_wait_timeout_s is not None else None),
+        "max_retries": args.max_retries,
+        "enable_volume_streamer": args.volume_streamer,
+        "volume_stream_kind": args.volume_stream_kind,
+        "volume_stream_every_n": args.volume_stream_every_n,
+    }
+    REGRESSOR_SETTINGS.update({key: value for key, value in overrides.items() if value is not None})
 
     cfg = RTSessionConfig(
         preparation_only=args.preparation_only,

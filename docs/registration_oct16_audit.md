@@ -44,9 +44,11 @@ not only the repository's current profile.
   effective settings from its saved command and provenance.
 
 The subsequent normalization change is separate from the October 16 registration
-audit: the runtime now defaults to fixed-reference post-GLM voxel z-scoring in
-EPI space, before spatial transforms/smoothing, with no second probability-scorer
-voxel z-score. Its calibration starts after GLM readiness. Match this policy
+audit: the runtime now applies spatial transforms and optional smoothing before
+cGLM and fixed-reference voxel z-scoring on the final analysis grid, with no
+second probability-scorer voxel z-score. The first successful GLM fit seeds
+calibration from its stored startup residual history; scoring can start on the
+next volume without a second calibration window. Match this policy
 explicitly when replaying historical runs; do not attribute its effects to the
 registration recipe.
 

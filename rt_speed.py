@@ -10,8 +10,9 @@ from pathlib import Path
 STAGES = {
     "DICOM": "DICOM — DICOM to NIfTI", "FMAP": "FMAP — unwarping (PyHySCO)",
     "MC": "MC — motion correction + FD", "QC": "DVARS — signal-change / censor checks",
-    "REG": "REG — denoising", "NORM": "NORM — voxel normalization", "TRANS": "TRANS — spatial resampling",
+    "TRANS": "TRANS — spatial resampling",
     "SMOOTH": "SMOOTH — masked smoothing", "MASK": "MASK — analysis mask",
+    "REG": "REG — denoising", "NORM": "NORM — voxel normalization",
     "SCORE": "SCORE — decoder + score output", "OUTPUT": "OUTPUT — status logs / preview",
     "OTHER": "OTHER — processing overhead",
 }

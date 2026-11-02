@@ -1,9 +1,9 @@
-"""Prepare an interpolation margin without changing the anatomical brain mask.
+"""Processing-mask provenance and the historical source-grid margin helper.
 
-The returned mask selects voxels to denoise and normalize. It is neither an
-anatomical segmentation nor an acquisition-coverage map. Callers must preserve
-their separate per-volume observation/processing support and final analysis
-mask. Construct this mask once on the motion-corrected source grid.
+Current response processing uses the final analysis grid after spatial mapping
+and smoothing. Native unsmoothed nuisance sampling remains separate. The cubic
+margin helper retains its original behavior for callers requiring native-grid
+support; it does not define the current response GLM/normalization mask.
 """
 from __future__ import annotations
 
@@ -13,6 +13,12 @@ from scipy.ndimage import maximum_filter
 
 PROCESSING_MASK_POLICY = "source_grid_cubic_halo"
 PROCESSING_MASK_POLICY_VERSION = 1
+FINAL_PROCESSING_MASK_POLICY = "final_analysis_grid"
+FINAL_PROCESSING_MASK_POLICY_VERSION = 1
+FINAL_NUISANCE_SOURCE = "native_unsmoothed_mc"
+FINAL_PROCESSING_ORDER = (
+    "spatial_transform", "smoothing", "denoising", "normalization",
+)
 
 
 def canonical_upstream_processing(spec: dict) -> dict:
@@ -36,10 +42,20 @@ def canonical_upstream_processing(spec: dict) -> dict:
             or isinstance(version, bool) or version < 1
             or interpolation not in {"linear", "lanczos"}):
         raise ValueError("Upstream processing lacks a valid mask policy/version/interpolation.")
+    canonical_mask = {"policy": policy, "version": version, "interpolation": interpolation}
+    if policy == FINAL_PROCESSING_MASK_POLICY:
+        order = mask.get("processing_order")
+        if (version != FINAL_PROCESSING_MASK_POLICY_VERSION
+                or not isinstance(order, (tuple, list))
+                or tuple(order) != FINAL_PROCESSING_ORDER
+                or mask.get("nuisance_source") != FINAL_NUISANCE_SOURCE):
+            raise ValueError("Final-grid upstream processing lacks its supported order/nuisance-source policy.")
+        canonical_mask.update(processing_order=list(FINAL_PROCESSING_ORDER),
+                              nuisance_source=FINAL_NUISANCE_SOURCE)
     return {"version": 1, "input_stage": stage,
             "normalization": dict(normalization) if normalization is not None else None,
             "coverage_policy": coverage,
-            "processing_mask": {"policy": policy, "version": version, "interpolation": interpolation}}
+            "processing_mask": canonical_mask}
 
 
 def upstream_processing_spec(metadata: dict, input_stage: str = "normalized") -> dict | None:

@@ -27,7 +27,7 @@ def test_direction_consistent_for_metrics_masks_initialization_and_output_grids(
     fixed_mask, moving_mask = (paths["t1_mask"], paths["epi_mask"]) if direction == "epi_to_t1" else (paths["epi_mask"], paths["t1_mask"])
     assert (plan.fixed, plan.moving) == (fixed, moving)
     assert values(plan.args, "--initial-moving-transform") == [f"[{fixed},{moving},1]"]
-    assert values(plan.args, "--metric") == [f"MI[{fixed},{moving},1,32,Regular,0.2]"] * 3
+    assert values(plan.args, "--metric") == [f"MI[{fixed},{moving},1,32,None,1]"] * 3
     assert values(plan.args, "--masks") == [f"[{fixed_mask},{moving_mask}]"] * 3
     fwd, inv, warped, inverse_warped = plan.native_outputs
     assert plan.output_references == {warped: fixed, inverse_warped: moving}
@@ -48,7 +48,9 @@ def test_historical_affine_and_full_syn_preserved_in_both_directions(paths, dire
     assert values(plan.args, "--shrink-factors") == ["8x4x2x1", "8x4x2x1", "6x4x2x1"]
     assert values(plan.args, "--smoothing-sigmas") == ["3x2x1x0vox"] * 3
     assert plan.provenance["recipe"] == ANATOMICAL_RECIPE
+    assert ANATOMICAL_RECIPE == "rigid_affine_syn_dense_v1"
     for index, stage in enumerate(plan.provenance["stages"]):
+        assert stage["sampling"] == "None,1"
         assert stage["transform"] == values(plan.args, "--transform")[index]
         assert stage["convergence"] == values(plan.args, "--convergence")[index]
         assert stage["shrink_factors"] == values(plan.args, "--shrink-factors")[index]
@@ -56,12 +58,14 @@ def test_historical_affine_and_full_syn_preserved_in_both_directions(paths, dire
 
 
 @pytest.mark.parametrize("initialization", ["identity", "auto", "IDENTITY"])
-def test_identity_and_compatibility_alias_with_syn_disabled(paths, initialization):
-    plan = build_epi_t1_registration(**paths, initialization=initialization, syn=False)
+@pytest.mark.parametrize("direction", ["epi_to_t1", "t1_to_epi"])
+def test_identity_and_compatibility_alias_with_syn_disabled(paths, initialization, direction):
+    plan = build_epi_t1_registration(**paths, initialization=initialization, direction=direction, syn=False)
     assert values(plan.args, "--initial-moving-transform") == ["Identity"]
     assert plan.provenance["initialization"] == "identity"
     assert values(plan.args, "--transform") == ["Rigid[0.1]", "Affine[0.1]"]
-    assert plan.fixed == paths["t1"]  # Explicitly preserve default EPI-to-T1 fit.
+    assert all(metric.endswith(",1,32,None,1]") for metric in values(plan.args, "--metric"))
+    assert plan.fixed == (paths["t1"] if direction == "epi_to_t1" else paths["epi"])
 
 
 @pytest.mark.parametrize("direction,expected", [("epi_to_t1", "[NULL,{epi_mask}]"),
@@ -92,3 +96,5 @@ def test_bridge_fixes_session_slab_and_exposes_inverse_as_session_to_reference(p
     assert plan.output_references[plan.semantic_outputs["session_to_reference_Warped.nii"]] == paths["t1"]
     assert plan.output_references[plan.semantic_outputs["session_to_reference_InverseWarped.nii"]] == paths["epi"]
     assert plan.provenance["recipe"] == BRIDGE_RECIPE
+    assert values(plan.args, "--metric") == [f"MI[{paths['epi']},{paths['t1']},1,32,Regular,0.2]"]
+    assert plan.provenance["stages"][0]["sampling"] == "Regular,0.2"

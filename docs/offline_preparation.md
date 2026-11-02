@@ -11,9 +11,10 @@ coordinate system or original reference image.
 
 At the scanner, a short current-session reference is aligned to the offline EPI
 reference. Online volumes are unwarped with their current acquisition's fieldmap,
-motion-corrected to the session reference, denoised, and mapped through the session
-EPI→offline EPI→T1→MNI chain as required by the selected analysis space. The
-session's nuisance masks are mapped onto its own EPI grid. The anatomical
+motion-corrected to the session reference, and mapped through the session
+EPI→offline EPI→T1→MNI chain as required by the selected analysis space. Optional
+smoothing, denoising and normalization then run on that final grid. The session's
+nuisance signals still use unsmoothed MC volumes and masks on its own EPI grid. The anatomical
 registration is therefore reusable without requiring identical slab prescriptions.
 
 ## Option 1: import fMRIPrep outputs
@@ -136,6 +137,12 @@ the subject's `anat` folder. WM/ventricle masks are resampled onto the T1 grid;
 a cortical mask is included when an existing mask or FastSurfer parcellation
 is available. Explicit template arguments also support preparations created
 with `--no-save-config`. Interrupted registrations cannot be exported.
+Native preparation can leave fractional edge values in `T1_combined_mask`
+after resampling. Export validates that this prepared mask is finite, nonempty,
+and within `[0, 1]`, then writes a binary `value > 0` copy into the bundle.
+This preserves the exporter's positive-value brain/tissue selection; provenance
+records the rule and voxel counts. The original mask and estimated transforms
+are unchanged. Explicit fMRIPrep imports still require binary masks.
 If preparation produced an N4 registration-reference copy, export includes it
 as `epi_registration_reference` with the original reference retained separately.
 Older native preparations without that copy remain usable: when N4 is enabled,
@@ -232,11 +239,22 @@ depends on its scoring mode and available calibration statistics. Offline spatia
 assets do not supply those statistics or eliminate online normalization/GLM warmup.
 
 Runtime normalization defaults to `voxel_norm_mode: "zscore"`,
-`voxel_norm_reference: "fixed"`, and `voxel_norm_ref_volumes: 30`. After the
-native-unit cumulative GLM becomes ready, the next 30 emitted residuals establish
-a fixed voxel-wise mean/sample SD; scoring begins with the subsequent normalized
-volume. This occurs in the session EPI grid before spatial transforms and
-smoothing. A short spatial reference acquisition does not replace this runtime
-calibration. `mean` is also available and divides residuals by a reference mean
-of raw MC intensities; `running` updates statistics from prior observations.
+`voxel_norm_reference: "fixed"`, and `voxel_norm_ref_volumes: 30`. The first
+successful original-intensity cumulative GLM fit also estimates voxel-wise mean/sample
+SD from its stored startup residual history. `fixed` freezes the first N valid
+fitted rows; `running` uses all available fitted rows and then updates from prior
+observations. Scoring starts with the next input volume, so its own values do not
+enter its reference. There is no additional N-volume calibration period after
+GLM startup: with N=30 and a first successful fit at volume 30, volume 31 is the
+earliest scored volume. The same N+1 lower bound applies without regression;
+GLM design, coverage, or processing can delay actual readiness.
+
+Spatial transforms and optional smoothing precede cumulative-GLM denoising and
+voxel normalization on the final analysis grid. A short spatial reference
+acquisition does not replace runtime calibration. `mean` remains available as
+`100 * residual / reference_mean`; its reference uses original intensities after
+spatial mapping and optional smoothing, before denoising. JSON N controls the
+statistical reference independently of presentation timing: `--baseline-trs`
+neither overrides N nor extends
+automatically. Increase it explicitly when a longer background period is wanted.
 Keep the runtime settings and trained decoder/PCA feature units consistent.

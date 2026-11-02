@@ -229,7 +229,7 @@ def test_changed_cache_rejected_before_any_overwrite(registration, change):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("cache_kind", ["unversioned", "full_brain", "unknown_version"])
+@pytest.mark.parametrize("cache_kind", ["unversioned", "full_brain", "unknown_version", "previous_sampling"])
 def test_incompatible_cache_is_not_reinterpreted_or_overwritten(registration, cache_kind):
     pipe, epi, mask, calls = registration
     pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
@@ -238,8 +238,14 @@ def test_incompatible_cache_is_not_reinterpreted_or_overwritten(registration, ca
         marker.unlink()
     else:
         saved = json.loads(marker.read_text())
-        saved["version"] = 1 if cache_kind == "full_brain" else 99
-        saved["settings"] = {"mode": "full_brain", "initialization": "center_of_mass", "partial_epi_syn": False}
+        if cache_kind == "previous_sampling":
+            saved["settings"]["recipe"] = "rigid_affine_syn_historical_v1"
+            saved["plan"]["recipe"] = "rigid_affine_syn_historical_v1"
+            for stage in saved["plan"]["stages"]:
+                stage["sampling"] = "Regular,0.2"
+        else:
+            saved["version"] = 1 if cache_kind == "full_brain" else 99
+            saved["settings"] = {"mode": "full_brain", "initialization": "center_of_mass", "partial_epi_syn": False}
         marker.write_text(json.dumps(saved))
     original = {p: p.read_bytes() for p in pipe.trans_dir.iterdir() if p.is_file()}
     with pytest.raises(ValueError, match="fresh day/preparation directory"):

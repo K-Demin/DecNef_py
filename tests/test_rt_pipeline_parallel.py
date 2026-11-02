@@ -73,10 +73,14 @@ class DummyRegressor:
     def __init__(self):
         self.calls = 0
 
-    def apply(self, mc_img, volume_idx, fd_censor=0, dvars_censor=0, support_mask=None):
+    def apply(self, mc_img, volume_idx, fd_censor=0, dvars_censor=0, support_mask=None,
+              nuisance_means=None):
         self.calls += 1
         # This fixture isolates orchestration, not cumulative-GLM warmup.
         return np.asanyarray(mc_img.dataobj), True
+
+    def take_startup_reference(self):
+        return None
 
 
 class IdentityVoxelNormalizer:

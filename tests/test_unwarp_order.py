@@ -10,6 +10,7 @@ import nibabel as nib
 import numpy as np
 import pytest
 import matplotlib
+from scipy.ndimage import gaussian_filter
 
 matplotlib.use("Agg")
 
@@ -72,6 +73,8 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     handler.motion_regressor.get_regressors = lambda idx: ([], None)
     streamed = []
     handler.volume_streamer = SimpleNamespace(publish=lambda idx, path, t1=None: streamed.append(path))
+    expected_temporal = expected.astype(float)
+    expected_support = np.ones(raw.shape, bool)
     if smoothing:
         from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
         kind = "masked" if smoothing == "masked" else "smooth"
@@ -79,6 +82,19 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
         mask = np.ones(raw.shape, bool)
         mask[0] = False
         handler.smoother = MaskedGaussianSmoother(mask, np.eye(4), 0 if kind == "masked" else 4)
+        expected_support = mask
+        expected_temporal = np.zeros(raw.shape)
+        if kind == "masked":
+            expected_temporal[mask] = expected[mask]
+        else:
+            # Independent normalized-convolution oracle, not another call to
+            # the pipeline's smoothing implementation.
+            sigma = 4 / np.sqrt(8 * np.log(2))
+            filtered = gaussian_filter(np.where(mask, expected, 0.).astype(float),
+                                       sigma, mode="constant", cval=0., truncate=4.)
+            density = gaussian_filter(mask.astype(float), sigma,
+                                      mode="constant", cval=0., truncate=4.)
+            expected_temporal[mask] = filtered[mask] / density[mask]
         cfg.enable_scoring = True
         scored = []
 
@@ -89,6 +105,20 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
         handler.scorer = SimpleNamespace(score_from_array=score, baseline_count=0, n_baseline=0)
         handler.reference_score_stats = None
         handler.score_event_tracker = SimpleNamespace(for_volume=lambda idx: None)
+
+    apply_regression = handler.motion_regressor.apply
+
+    def checked_regression(image, volume_idx, **kwargs):
+        # Native MC remains available for nuisance extraction and QC, while the
+        # response entering GLM has already been smoothed/selected.
+        np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
+        np.testing.assert_allclose(np.asarray(image.dataobj), expected_temporal, rtol=1e-6)
+        np.testing.assert_array_equal(kwargs["support_mask"], expected_support)
+        assert kwargs["nuisance_means"] is None
+        events.append("reg")
+        return apply_regression(image, volume_idx, **kwargs)
+
+    handler.motion_regressor.apply = checked_regression
     monkeypatch.setattr(rt, "apply_pyhysco_fieldmap", file_apply)
     settings = SimpleNamespace(epi_phase_encoding="PA", fieldmap_method="pyhysco",
         save_intermediate_unwarped=save_intermediate, enable_fd_censor_reg=False,
@@ -96,18 +126,19 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
         volume_stream_kind="score_input" if smoothing else "unwarped")
     monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", settings)
     assert rt.process_volume(cfg, handler, source, 1, raw_nii=source, volume_timestamp=1.)
-    assert events == ["unwarp", "mc"]
+    assert events == ["unwarp", "mc", "reg"]
     if smoothing:
-        assert streamed == [tmp_path / kind / f"vol_00001_{kind}.nii"]
-        smoothed = handler.smoother.apply(expected).copy()
-        np.testing.assert_allclose(nib.load(streamed[0]).get_fdata(), smoothed)
+        assert streamed == [tmp_path / "norm" / "vol_00001_norm.nii"]
+        np.testing.assert_allclose(nib.load(streamed[0]).get_fdata(), expected_temporal, rtol=1e-6)
+        np.testing.assert_allclose(
+            nib.load(tmp_path / kind / f"vol_00001_{kind}.nii").get_fdata(), expected_temporal)
         assert len(scored) == (2 if original_score else 1)
         for data in scored:
-            np.testing.assert_allclose(data, smoothed)
+            np.testing.assert_allclose(data, expected_temporal, rtol=1e-6)
         original_path = tmp_path / kind / f"vol_00001_{kind}_orig.nii"
         assert original_path.exists() == original_score
         if original_score:
-            np.testing.assert_allclose(nib.load(original_path).get_fdata(), smoothed)
+            np.testing.assert_allclose(nib.load(original_path).get_fdata(), expected_temporal)
     else:
         assert streamed == [cfg.rt_mc_dir / "vol_00001_mc.nii"]
         assert not (tmp_path / "smooth").exists()
@@ -116,7 +147,8 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     np.testing.assert_array_equal(nib.load(cfg.rt_mc_dir / "vol_00001_mc.nii").get_fdata(), expected)
     np.testing.assert_array_equal(handler.prev_mc_for_dvars, expected)
     np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
-    np.testing.assert_array_equal(nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata(), expected)
+    np.testing.assert_allclose(nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata(),
+                               expected_temporal, rtol=1e-6)
 
 
 def test_pca_unwarped_alias_and_historical_runs(tmp_path):
