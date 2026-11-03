@@ -1,3 +1,6 @@
+# DECNEF LOCAL MODIFICATION (2026-11; see the bundled README): publication must
+# check the accepted field and regenerate its corrected images. Objective caches
+# may instead describe a rejected line-search trial, even after a successful fit.
 from EPI_MRI.utils import *
 from EPI_MRI.LeastSquaresCorrection import LeastSquaresCorrection
 from EPI_MRI.Regularizers import TikRegularizer, QuadRegularizer
@@ -193,8 +196,10 @@ class EPIOptimize:
         corr1(, corr2) : torch.Tensor
             corrected image(s)
         """
-        # DecNef local fix (2026-11): convergence alone does not establish
-        # field validity. Check before writing any field or corrected images.
+        # DECNEF LOCAL MODIFICATION: convergence alone does not establish field
+        # validity. Conversely, a valid field can reach its iteration budget.
+        # This guard enforces finite, positive Jacobians for both PE polarities
+        # before writing anything; it does not change the fitted field.
         if self.Bc is None:
             raise ValueError("Run PyHySCO optimization before saving a field.")
         derivative = self.corr_obj.D.mat_mul(self.Bc)

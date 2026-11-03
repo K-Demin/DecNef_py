@@ -1,3 +1,8 @@
+# DECNEF LOCAL MODIFICATIONS are present in this bundled package; see README.md.
+# The default GN path uses the repaired Jacobian barrier, accepted-field export
+# and bounded extra work after barrier rejection. Updating this entry point or
+# replacing the vendor tree must preserve those safeguards. Its field-estimation
+# budget is separate from applying the saved field to real-time BOLD volumes.
 from optimization.ADMM import *
 from EPI_MRI.EPIMRIDistortionCorrection import *
 import argparse

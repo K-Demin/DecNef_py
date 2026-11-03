@@ -112,6 +112,8 @@ class PreloadedPyHyscoApplier:
             dtype=dtype,
             device=requested_device,
         )
+        # The AP/PA estimator has already fitted the field. This object supplies
+        # the averaging and derivative operators for applying it to raw BOLD.
         self.corr_obj = EPIMRIDistortionCorrection(self.data_obj, alpha=1.0, beta=0.0)
         self.phase_encoding_direction = int(phase_encoding_direction)
         self.polarity = int(polarity)
@@ -174,8 +176,10 @@ class PreloadedPyHyscoApplier:
         # Precompute deformation and Jacobian terms from fixed fieldmap.
         bc = self.corr_obj.A.mat_mul(self.fieldmap_internal)
         dbc = self.corr_obj.D.mat_mul(self.fieldmap_internal)
-        # Check both AP and PA, irrespective of the selected runtime polarity.
-        # This is a one-time grid-construction guard, never a per-volume scan.
+        # DecNef local modification (3255b60): check both polarities using the
+        # actual float32 derivative that will modulate BOLD. A field just
+        # inside the float64 validity bound can round onto it in float32.
+        # The preloaded applier reuses this grid and Jacobian across volumes.
         if not torch.isfinite(dbc).all().item() or torch.any(torch.abs(dbc) >= 1).item():
             raise ValueError(
                 "PyHySCO field has nonfinite or nonpositive AP/PA Jacobians in runtime precision "

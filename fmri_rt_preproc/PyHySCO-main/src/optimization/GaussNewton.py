@@ -1,3 +1,9 @@
+# DECNEF LOCAL MODIFICATIONS (2026-11; see the bundled README).
+# This is not an untouched upstream solver: invalid trials must backtrack, and
+# after barrier contact this revision allows more existing PCG work and requires
+# the existing gradient criterion rather than accepting a tiny-step stop.
+# The objective, regularization, Jacobi preconditioner and PCG tolerance remain
+# unchanged. No experimental block preconditioner is used by this module.
 from optimization.EPIOptimize import EPIOptimize
 from optimization.LinearSolvers import *
 import time
@@ -112,6 +118,8 @@ class GaussNewton(EPIOptimize):
             self.log.log_message("total runtime:\t%d min %2.4f sec\n" % (int(elapsed / 60), elapsed % 60))
             return self.Bc
         for i in range(1, self.max_iter + 1):
+            # This is calibration work, once per AP/PA pair. It is not performed
+            # on each incoming BOLD volume; the latter applies a fixed field.
             # Local fix: the barrier's large curvature can exhaust the usual
             # ten PCG iterations. After constraint backtracking, allow a bounded
             # fifty iterations at the same residual tolerance. Explicitly
@@ -161,6 +169,11 @@ class GaussNewton(EPIOptimize):
                 self.log.log_message("reached field map change tolerance")
                 break
 
+        # DECNEF LOCAL MODIFICATION: report stopping and field validity separately.
+        # The iteration cap can return a feasible field without gradient
+        # convergence; EPIOptimize independently checks that field before export.
+        # A larger iteration budget does not change the objective, but may change
+        # the fitted field and therefore requires rebuilding dependent references.
         self.log.log_message(f"termination: {self.convergence_reason}; barrier backtracking: {self.barrier_limited}")
         self.log.log_message(f"total function evaluations: {fevals}")
         stop = time.time()

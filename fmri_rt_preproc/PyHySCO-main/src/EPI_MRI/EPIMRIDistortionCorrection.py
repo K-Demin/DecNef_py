@@ -1,3 +1,7 @@
+# DECNEF LOCAL MODIFICATION (2026-11; see the bundled README).
+# This vendored PyHySCO copy repairs the Jacobian barrier's handling of invalid
+# trials. Within |D(field)| < 1, the published objective, its derivatives and
+# regularization weights are unchanged. Keep this repair when updating upstream.
 import torch
 from EPI_MRI.ImageModels import *
 from EPI_MRI.InitializationMethods import *
@@ -302,8 +306,11 @@ class EPIMRIDistortionCorrection:
 		valid = torch.isfinite(x) & (torch.abs(x) < 1)
 		if (do_derivative or calc_hessian) and not bool(torch.all(valid)):
 			raise ValueError("Field-map derivatives must be finite and strictly between -1 and 1.")
-		# Local fix: inf/inf followed by nan_to_num previously gave invalid fields
-		# zero penalty. Reject them with +inf, without mutating the caller's tensor.
+		# DECNEF LOCAL MODIFICATION: inf/inf followed by nan_to_num previously
+		# gave invalid fields zero penalty. Reject them with +inf so the existing
+		# line search reduces its step; do not clip a field into the valid range.
+		# The feasible-domain penalty, gradient and Hessian formulas below are
+		# the original expressions. Do not replace this with nan_to_num again.
 		safe_x = torch.where(valid, x, torch.zeros_like(x))
 		x2 = safe_x*safe_x
 		G = -(x2*x2) / (x2-1)
