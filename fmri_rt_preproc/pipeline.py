@@ -313,6 +313,13 @@ class FMRIRealtimePreprocessor:
             raise ValueError("A PyHySCO field already exists. Use a fresh preparation directory "
                              "rather than overwrite calibration used by existing references/transforms.")
         pyhysco_src = Path(__file__).resolve().parent / "PyHySCO-main" / "src"
+        # DECNEF LOCAL MODIFICATION: invoke our documented, patched vendor copy,
+        # not an independently installed PyHySCO. The 50 limit below counts outer
+        # calibration updates; the patched GN solver separately permits up to 50
+        # inner PCG iterations after barrier rejection (normally 10). These extra
+        # computations preserve the objective and do not run per incoming BOLD.
+        # This command must write into a fresh preparation directory: changing a
+        # field or its iteration budget requires rebuilding dependent references.
         cmd = [
             "bash", "-lc",
             f"""

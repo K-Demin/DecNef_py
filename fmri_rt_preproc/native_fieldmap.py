@@ -8,6 +8,8 @@ import numpy as np
 
 PIPELINE_ORDER = "unwarp_then_mc_v1"
 NATIVE_DIR = "native_unwarp_v1"
+# DecNef local modification (3255b60): prepared references and transforms
+# depend on the estimator recipe used to generate their calibration field.
 ESTIMATOR_RECIPE = "pyhysco_gn_positive_jacobians_v2"
 _FRESH_CALIBRATION = (
     "Use a fresh preparation directory to re-estimate the AP/PA calibration "
@@ -81,6 +83,9 @@ def _file_key(path):
     return identity["path"], identity["size"], identity["mtime_ns"]
 
 
+# DecNef local modification (3255b60): reuse successful saved-field checks
+# for the same field, AP/PA prototypes and PE axis. A changed file identity
+# causes a fresh check the next time the calibration is loaded.
 @lru_cache(maxsize=32)
 def _validate_field_cached(field_key, ap_key, pa_key, phase_encoding_axis):
     """Validate once per file identity, including both PE polarities.
@@ -103,6 +108,8 @@ def _validate_field_cached(field_key, ap_key, pa_key, phase_encoding_axis):
     spacing = float(np.linalg.norm(ap.affine[:3, axis]))
     if not np.isfinite(spacing) or spacing <= 0 or not np.isfinite(field).all():
         raise ValueError("Native PyHySCO field or its PE spacing is nonfinite/invalid. " + _FRESH_CALIBRATION)
+    # Adjacent field samples bracket one EPI cell. This difference uses the
+    # physical PE spacing from the AP prototype and is evaluated in float64.
     derivative = np.diff(field, axis=axis) / spacing
     if not np.isfinite(derivative).all() or np.any(np.abs(derivative) >= 1):
         raise ValueError(

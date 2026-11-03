@@ -1,28 +1,40 @@
 ## PyHySCO
 This is a package for Echo-Planar MRI susceptibility artifact correction implemented in PyTorch.
 
-## Local corrections in DecNef (November 2026)
+## DecNef local modifications to PyHySCO
 
-This bundled copy contains local changes, marked in the source:
+DecNef commit `3255b60` modified the bundled estimator relative to DecNef commit
+`b30a116`. These changes affect field validity checks and optimizer stopping.
 
-* `phi_EPI` returns infinite cost for nonfinite or out-of-domain derivatives
-  (`abs(Db) >= 1`). Previously, `inf / inf` became NaN and `nan_to_num` turned
-  the intended barrier into zero penalty. Derivatives at an invalid state now
-  raise an error, and the caller's input is no longer modified.
-* The barrier uses `D(field)` directly to avoid rounding through `1 + Db - 1`.
-* Gauss–Newton rejects invalid initialization and nonfinite trial costs. After
-  barrier backtracking, it requires the existing gradient stopping criterion;
-  small field/objective changes alone can reflect the constraint-limited step.
-  Reaching the iteration cap is logged separately from convergence.
-  After a constraint rejection, the default PCG inner solver may use up to 50
-  iterations instead of 10, at the same residual tolerance, to resolve the
-  barrier's high curvature. User-supplied linear solvers keep their settings.
-* Export checks both PE Jacobians before writing, and computes corrected images
-  from the accepted field rather than a possibly rejected trial's cache.
+**Field validity.** Let `Db` be the displacement derivative along the phase-encoding
+axis. The two intensity multipliers are `1 + Db` and `1 - Db`. Both are positive
+only when `abs(Db) < 1`. Within this interval, the original barrier
+`Db⁴ / (1 - Db²)` and its derivatives apply. Previously, invalid values could
+receive zero penalty when `nan_to_num` converted `inf / inf` to zero. The local
+repair evaluates `D(field)` directly to avoid rounding through `1 + Db - 1`,
+assigns infinite cost to invalid trials, and rejects invalid initial fields.
+Before export, it checks both polarities and generates the corrected AP/PA
+images from the accepted field.
 
-The DecNef wrapper also validates cached fields and versions their dependent
-references. Existing preparation caches require a fresh preparation directory;
-they are not silently overwritten. No participant data are included in these fixes.
+**Optimizer stopping.** DecNef allows up to 50 outer Gauss–Newton updates per
+calibration pair. After a nonfinite trial triggers backtracking, a small change
+in the field or objective can reflect a shortened step. From that point, the
+solver uses its gradient criterion to declare convergence and raises the default
+inner PCG limit from 10 to 50 at the same residual tolerance. A fit that exhausts
+the outer budget can still produce a field with positive Jacobians. Its log
+records `maximum_iterations`.
+
+**Preparing and applying the field.** The DecNef wrapper records the estimator
+recipe with the calibration and dependent references. It checks the saved
+field in float64 using the AP prototype's voxel spacing and caches this check
+by file identity. The runtime applier checks the derivative in float32 when it
+builds the sampling grid. Incoming BOLD volumes use that fixed field without
+another optimization.
+
+On November 3, 2026, DecNef refit 72 calibration pairs with `3255b60`. All 72
+had positive Jacobians for both polarities. The optimizer met the gradient
+criterion for 57 and reached the outer cap for 15. All 106 previously saved
+field arrays compared in that test matched the corresponding fresh fits exactly.
 
 ## Associated Publication
 PyHySCO: GPU-Enabled Susceptibility Artifact Distortion Correction in Seconds
