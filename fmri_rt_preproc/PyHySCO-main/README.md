@@ -1,6 +1,29 @@
 ## PyHySCO
 This is a package for Echo-Planar MRI susceptibility artifact correction implemented in PyTorch.
 
+## Local corrections in DecNef (November 2026)
+
+This bundled copy contains local changes, marked in the source:
+
+* `phi_EPI` returns infinite cost for nonfinite or out-of-domain derivatives
+  (`abs(Db) >= 1`). Previously, `inf / inf` became NaN and `nan_to_num` turned
+  the intended barrier into zero penalty. Derivatives at an invalid state now
+  raise an error, and the caller's input is no longer modified.
+* The barrier uses `D(field)` directly to avoid rounding through `1 + Db - 1`.
+* Gauss–Newton rejects invalid initialization and nonfinite trial costs. After
+  barrier backtracking, it requires the existing gradient stopping criterion;
+  small field/objective changes alone can reflect the constraint-limited step.
+  Reaching the iteration cap is logged separately from convergence.
+  After a constraint rejection, the default PCG inner solver may use up to 50
+  iterations instead of 10, at the same residual tolerance, to resolve the
+  barrier's high curvature. User-supplied linear solvers keep their settings.
+* Export checks both PE Jacobians before writing, and computes corrected images
+  from the accepted field rather than a possibly rejected trial's cache.
+
+The DecNef wrapper also validates cached fields and versions their dependent
+references. Existing preparation caches require a fresh preparation directory;
+they are not silently overwritten. No participant data are included in these fixes.
+
 ## Associated Publication
 PyHySCO: GPU-Enabled Susceptibility Artifact Distortion Correction in Seconds
 

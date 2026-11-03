@@ -169,6 +169,8 @@ def test_prepare_calibration_never_registers_ap_pa(tmp_path):
     folder, field, manifest = native_paths(pair)
     manifest.unlink()
     field.unlink()
+    for name in ("AP_mean.nii", "PA_mean.nii"):
+        (field.parent / name).unlink()
     pipe = object.__new__(FMRIRealtimePreprocessor)
     pipe.fmap_dir = pair
     pipe.fieldmap_method = "pyhysco"
@@ -179,7 +181,7 @@ def test_prepare_calibration_never_registers_ap_pa(tmp_path):
         calls.append((ap, pa))
         for original, mean in ((pipe.cfg.ap_file, ap), (pipe.cfg.pa_file, pa)):
             np.testing.assert_array_equal(nib.load(mean).get_fdata(), nib.load(original).get_fdata().mean(axis=3))
-        field.touch()
+        nib.save(nib.Nifti1Image(np.zeros((3, 5, 5), np.float32), np.eye(4)), field)
 
     pipe._run_ap_pa_pyhysco = estimate
     pipe._prepare_fieldmap()

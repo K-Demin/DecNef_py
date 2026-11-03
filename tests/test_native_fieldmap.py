@@ -19,7 +19,10 @@ def make_pair(folder, axis="j"):
     native.mkdir()
     for name in ("AP", "PA"):
         save_native_mean(folder / (name + ".nii"), native / (name + "_mean.nii"))
-    field.touch()  # Geometry of PyHySCO's staggered field is deliberately not image geometry.
+    shape = [3, 4, 5]
+    shape["ijk".index(axis)] += 1
+    # PyHySCO stores a PE-staggered array, not a physical image-space warp.
+    nib.save(nib.Nifti1Image(np.zeros(shape, np.float32), np.eye(4)), field)
     manifest.write_text(json.dumps(calibration_spec(folder / "AP.nii", folder / "PA.nii")))
     return folder
 

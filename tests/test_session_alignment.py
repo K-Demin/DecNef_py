@@ -373,6 +373,33 @@ def test_preparation_metadata_preserves_template_without_saved_config(tmp_path, 
         session.prepared_assets(cfg)
 
 
+@pytest.mark.parametrize("recipe", [None, "legacy_estimator"])
+def test_same_day_reference_rejects_old_estimator_without_changing_outputs(tmp_path, monkeypatch, recipe):
+    cfg, pipe, _ = _prepared_day(tmp_path, monkeypatch)
+    pipe._write_registration_qc()
+    marker = pipe.trans_dir / "preparation_assets.json"
+    saved = json.loads(marker.read_text())
+    saved["fieldmap_estimator_recipe"] = recipe
+    marker.write_text(json.dumps(saved))
+    transform = pipe.trans_dir / "epi2t1_Composite.h5"
+    before = transform.read_bytes(), marker.read_bytes()
+    with pytest.raises(ValueError, match="old or unrecorded fieldmap estimator"):
+        session.prepared_assets(cfg)
+    assert (transform.read_bytes(), marker.read_bytes()) == before
+
+
+def test_frozen_session_rejects_old_estimator_before_reuse(frozen_session):
+    cfg, settings, assets, folder, runner, stages, preparations = frozen_session
+    marker = folder / "session_alignment.json"
+    saved = json.loads(marker.read_text())
+    saved["settings"].pop("fieldmap_estimator_recipe")
+    marker.write_text(json.dumps(saved))
+    before = len(runner.calls), len(stages), marker.read_bytes()
+    with pytest.raises(ValueError, match="inputs/QC policy changed"):
+        session.ensure_nf_session(cfg, settings)
+    assert (len(runner.calls), len(stages), marker.read_bytes()) == before
+
+
 @pytest.mark.parametrize("metadata", [True, False])
 def test_implicit_nf_import_keeps_offline_reference_used_for_rs(tmp_path, monkeypatch, metadata):
     cfg, pipe, assets = _prepared_day(tmp_path, monkeypatch, offline=True)

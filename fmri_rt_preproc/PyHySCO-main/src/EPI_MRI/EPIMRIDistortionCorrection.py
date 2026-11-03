@@ -162,7 +162,9 @@ class EPIMRIDistortionCorrection:
 		Sc, dS, d2S = self.S.eval(yc, do_derivative=do_derivative)
 
 		# intensity regularizer
-		G, dG, d2G = self.phi_EPI(Jac1-1, do_derivative=do_derivative, calc_hessian=calc_hessian)
+		# Use Db directly: (1 + Db) - 1 can round a feasible value just below
+		# one to exactly one, falsely rejecting it at the barrier boundary.
+		G, dG, d2G = self.phi_EPI(self.D.mat_mul(yc), do_derivative=do_derivative, calc_hessian=calc_hessian)
 		Pc = torch.sum(G)
 		dP = None
 		if do_derivative:
@@ -285,21 +287,31 @@ class EPIMRIDistortionCorrection:
 		Returns
 		----------
 		G : torch.Tensor (size m)
-			function value
+			function value; positive infinity outside the feasible domain
 		dG : torch.Tensor (size m)
 			first derivative of the function, None if do_derivative=False
 		d2G : torch.Tensor (size m)
 			second derivative of the function, None if calc_hessian=False
+
+		Raises
+		------
+		ValueError
+			If derivatives are requested at nonfinite values or outside (-1, 1).
 		"""
 		dG, d2G = None, None
-		# penalize values outside of (-1,1)
-		x[torch.abs(x) >= 1] = float('inf')
-		x2 = x*x
-		G = torch.nan_to_num(-(x2*x2) / (x2-1))
+		valid = torch.isfinite(x) & (torch.abs(x) < 1)
+		if (do_derivative or calc_hessian) and not bool(torch.all(valid)):
+			raise ValueError("Field-map derivatives must be finite and strictly between -1 and 1.")
+		# Local fix: inf/inf followed by nan_to_num previously gave invalid fields
+		# zero penalty. Reject them with +inf, without mutating the caller's tensor.
+		safe_x = torch.where(valid, x, torch.zeros_like(x))
+		x2 = safe_x*safe_x
+		G = -(x2*x2) / (x2-1)
+		G = torch.where(valid, G, torch.full_like(G, float('inf')))
 		if do_derivative:
-			dG = torch.nan_to_num(-2*(x*x2)*(x2-2) / (x2-1)**2)
+			dG = -2*(safe_x*x2)*(x2-2) / (x2-1)**2
 		if calc_hessian:
-			d2G = torch.nan_to_num(-2 * x2 * (x2 * x2 - 3 * x2 + 6) / (x2 - 1) ** 3)
+			d2G = -2 * x2 * (x2 * x2 - 3 * x2 + 6) / (x2 - 1) ** 3
 		return G, dG, d2G
 
 	def initialize(self, *args, **kwargs):

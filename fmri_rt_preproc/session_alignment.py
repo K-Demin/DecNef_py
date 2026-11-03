@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import nibabel as nib
 
-from .native_fieldmap import require_same_grid
+from .native_fieldmap import require_same_grid, ESTIMATOR_RECIPE
 from .offline_assets import (apply_image, compose_transforms, file_identity, copy_image,
                              publish_mni_transform, t1_to_mni_transform)
 from .registration import build_epi_bridge_registration, BRIDGE_RECIPE
@@ -133,6 +133,7 @@ def prepared_assets(cfg):
     if not anatomy.exists():
         anatomy = cfg.subject_root / "anat"
     metadata = folder / "preparation_assets.json"
+    estimator_recipe = None
     if metadata.exists():
         recorded = json.loads(metadata.read_text())
         record = recorded["mni_template"]
@@ -144,6 +145,7 @@ def prepared_assets(cfg):
                 raise ValueError("Prepared offline manifest changed; use a fresh preparation directory.")
             return load_offline_assets(offline["path"], cfg.subject)
         mni_template = Path(record["path"])
+        estimator_recipe = recorded.get("fieldmap_estimator_recipe")
     else:
         config_path = cfg.day_root / "config.json"
         if not config_path.exists():
@@ -153,6 +155,9 @@ def prepared_assets(cfg):
         if config.get("offline_assets"):
             return load_offline_assets(config["offline_assets"], cfg.subject)
         mni_template = Path(config["templates"]["mni_t1"])
+    if estimator_recipe != ESTIMATOR_RECIPE:
+        raise ValueError("Same-day EPI preparation uses an old or unrecorded fieldmap estimator recipe. "
+                         "Use a fresh preparation directory to rebuild its EPI reference and transforms.")
     result = {
         "epi_reference": folder / "epi_unwarped_mean.nii",
         "epi_mask": folder / "epi_mask_mean.nii", "t1": anatomy / "T1_N4.nii",
@@ -199,6 +204,7 @@ def ensure_nf_session(cfg, settings):
     policy = getattr(settings, "registration_qc_policy", None)
     policy_id = file_identity(policy) if policy else None
     options = {"recipe": BRIDGE_RECIPE, "initialization": settings.registration_initialization,
+               "fieldmap_estimator_recipe": ESTIMATOR_RECIPE,
                "fieldmap_method": getattr(settings, "fieldmap_method", "pyhysco"),
                "epi_phase_encoding": getattr(settings, "epi_phase_encoding", "PA"),
                "epi_reference_n4": getattr(settings, "epi_reference_n4", True),

@@ -43,6 +43,8 @@ def _load_internal_fieldmap(fieldmap_path: Path, data_obj: DataObject) -> torch.
             "PyHySCO fieldmap shape does not match target EPI geometry. "
             f"Expected {expected_external_shape}, got {tuple(field.shape)}."
         )
+    if not torch.isfinite(field).all().item():
+        raise ValueError("PyHySCO field contains nonfinite values; re-estimate calibration in a fresh preparation directory.")
 
     internal_perm = _inverse_permutation(data_obj.p)
     return field.permute(internal_perm).contiguous()
@@ -172,6 +174,13 @@ class PreloadedPyHyscoApplier:
         # Precompute deformation and Jacobian terms from fixed fieldmap.
         bc = self.corr_obj.A.mat_mul(self.fieldmap_internal)
         dbc = self.corr_obj.D.mat_mul(self.fieldmap_internal)
+        # Check both AP and PA, irrespective of the selected runtime polarity.
+        # This is a one-time grid-construction guard, never a per-volume scan.
+        if not torch.isfinite(dbc).all().item() or torch.any(torch.abs(dbc) >= 1).item():
+            raise ValueError(
+                "PyHySCO field has nonfinite or nonpositive AP/PA Jacobians in runtime precision "
+                "(both 1+Db and 1-Db must be strictly positive). Re-estimate calibration and "
+                "rebuild dependent references/transforms in a fresh preparation directory.")
         jac = (1.0 + dbc).reshape(m).contiguous()
         xt = (self.corr_obj.xc + bc).reshape(m)
 
