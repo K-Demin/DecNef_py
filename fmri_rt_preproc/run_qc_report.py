@@ -20,7 +20,7 @@ CSV_SOURCES = (
     "speed_test.csv", "acquisition_speed_rt.csv", "acquisition_speed.csv",
     "biopac_timelag.csv",
 )
-_TR_KEYS = ("volume_idx", "TR", "tr")
+_TR_KEYS = ("volume_idx", "TR", "tr", "volume")
 _ILLEGAL_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 _NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 

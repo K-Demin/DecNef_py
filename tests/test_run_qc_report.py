@@ -88,3 +88,71 @@ def test_actual_acquisition_speed_basename_is_joined_by_tr(tmp_path):
     assert rows == [{'volume_idx': 2, 'watchdog_to_analysis_s': .14},
                     {'volume_idx': 4, 'watchdog_to_analysis_s': .16}]
     assert sources[0]['file'] == 'acquisition_speed_rt.csv'
+
+
+@pytest.mark.parametrize('other_logs', [False, True])
+def test_actual_speed_recorder_rows_join_by_volume_with_missing_logs(tmp_path, other_logs):
+    from rt_speed import FIELDS, SpeedRecorder
+
+    now = [0.]
+    speed = SpeedRecorder(tmp_path / 'speed_test.csv', clock=lambda: now[0])
+    # Complete out of order so a positional join would assign timing to the
+    # wrong TR. Use the real recorder's schema rather than a reduced CSV mock.
+    for volume in (3, 2):
+        speed.arrive(volume, backlog=True)
+        started = speed.conversion_start(volume)
+        now[0] += .005
+        speed.conversion_end(volume, started)
+        started = speed.process_start(volume)
+        speed.stage(volume, 'MC', volume / 1000)
+        now[0] += volume / 100
+        speed.process_end(volume, started)
+        speed.readiness(volume, volume == 3)
+        speed.finish(volume, True)
+    speed.arrive(4, backlog=True)  # Pending input must not invent a completed row.
+    with speed.path.open(newline='', encoding='utf-8') as stream:
+        reader = csv.DictReader(stream)
+        speed_rows = list(reader)
+        assert reader.fieldnames == FIELDS
+    assert [row['volume'] for row in speed_rows] == ['3', '2']
+    if other_logs:
+        log(tmp_path, 'scores.csv', ['volume_idx', 'score_raw'], [[1, .1], [3, .3]])
+        log(tmp_path, 'fd_rt.csv', ['volume_idx', 'fd'], [[5, .5]])
+
+    columns, rows, sources = collect_run_qc_rows(tmp_path)
+    by_tr = {row['volume_idx']: row for row in rows}
+    assert list(by_tr) == ([1, 2, 3, 5] if other_logs else [2, 3])
+    assert 'volume' not in columns  # One canonical join key in the workbook.
+    assert by_tr[2]['MC_ms'] == pytest.approx(2.)
+    assert by_tr[3]['MC_ms'] == pytest.approx(3.)
+    assert by_tr[2]['processing_ms'] == pytest.approx(25.)
+    assert by_tr[3]['processing_ms'] == pytest.approx(35.)
+    source = next(s for s in sources if s['file'] == 'speed_test.csv')
+    assert source['status'] == 'joined_by_volume'
+    assert source['rows'] == 2
+    if other_logs:
+        assert by_tr[3]['score_raw'] == .3
+        assert 'score_raw' not in by_tr[2]
+        assert 'MC_ms' not in by_tr[1] and 'MC_ms' not in by_tr[5]
+
+    # Inspect the emitted workbook too: timing fields reach Volumes even when
+    # the timing CSV is the only source, with missing observations left blank.
+    path = write_run_qc_workbook(tmp_path)
+    ns = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+    with zipfile.ZipFile(path) as archive:
+        sheet = ET.fromstring(archive.read('xl/worksheets/sheet2.xml'))
+        values = []
+        for row in sheet.findall('s:sheetData/s:row', ns):
+            values.append({''.join(c for c in cell.attrib['r'] if c.isalpha()):
+                           cell.findtext('s:is/s:t', None, ns) if cell.attrib.get('t') == 'inlineStr'
+                           else float(cell.findtext('s:v', 'nan', ns))
+                           for cell in row.findall('s:c', ns)})
+    headers = values[0]
+    written = {int(row['A']): {name: row.get(col) for col, name in headers.items()}
+               for row in values[1:]}
+    assert sorted(written) == sorted(by_tr)
+    assert written[2]['MC_ms'] == pytest.approx(2.)
+    assert written[3]['MC_ms'] == pytest.approx(3.)
+    if other_logs:
+        assert written[1]['MC_ms'] is None and written[5]['MC_ms'] is None
+        assert written[2]['score_raw'] is None
