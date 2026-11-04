@@ -1300,9 +1300,9 @@ def main() -> None:
             pipeline_process.join(timeout=5)
         if rt_cfg is not None:
             try:
-                from brainpong_qc import generate_scores_motion_qc
+                from rs_realtime_parallel import _plot_qc
 
-                generate_scores_motion_qc(rt_cfg.rt_work_dir)
+                _plot_qc(rt_cfg.rt_work_dir)
             except Exception:
                 log.exception("Failed to create qc_scores_motion.png for %s", rt_cfg.rt_work_dir)
 

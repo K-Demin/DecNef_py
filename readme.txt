@@ -27,7 +27,8 @@ EPI-to-anatomy registration and offline reuse
 
 Both registration_direction choices (epi_to_t1, t1_to_epi) now use Rigid,
 Affine and the restored historical SyN schedule. Defaults: direction=epi_to_t1,
-registration_initialization=identity, registration_syn=true. Explicit settings
+registration_initialization=center_of_mass, registration_threads=1 (ITK),
+registration_bridge_initialization=identity, registration_syn=true. Explicit settings
 profiles still override defaults, including an existing registration_syn=false.
 
 epi_reference_n4=true (default) adds a separate N4-corrected EPI reference for
@@ -75,6 +76,7 @@ tradeoff and runtime implications in docs/partial_epi_registration.md.
 Commands/settings: docs/partial_epi_registration.md
 Offline files/fMRIPrep: docs/offline_preparation.md
 Alignment metrics/review: docs/registration_qc.md
+Live decoder-ROI correlation and Excel export: docs/decoder_correlation_qc.md
 
 Final analysis masking and spatial smoothing
 --------------------------------------------

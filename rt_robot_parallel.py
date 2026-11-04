@@ -258,18 +258,40 @@ def _load_reg_ready_map(run_dir: Path) -> Optional[dict[int, bool]]:
 
 
 def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
+    # Parent launchers terminate the acquisition child, so export the completed
+    # CSV snapshot here rather than relying on the child's finally block.
+    try:
+        from fmri_rt_preproc.run_qc_report import write_run_qc_workbook
+        write_run_qc_workbook(run_dir)
+    except Exception:
+        log.exception("Failed to write end-run QC workbook for %s", run_dir)
+
+    from fmri_rt_preproc.decoder_qc import add_reference_correlation_panel, has_decoder_qc
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    reference_qc = has_decoder_qc(run_dir)
+
+    def plot_reference_only():
+        if not reference_qc:
+            return
+        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+        add_reference_correlation_panel(ax, run_dir)
+        fig.tight_layout()
+        fig.savefig(run_dir / "qc_scores_motion.png", dpi=150)
+        plt.close(fig)
+
     scores_path = run_dir / "scores.csv"
     motion_path = run_dir / "motion_rt.1D"
     if not scores_path.exists() or not motion_path.exists():
+        plot_reference_only()
         return
 
     reg_ready_map = _load_reg_ready_map(run_dir) if prefer_reg_ready else None
     if prefer_reg_ready and reg_ready_map is None:
+        plot_reference_only()
         return
 
     first_reg_ready_vol = None
@@ -311,6 +333,7 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
             scores.append(score)
 
     if not scores:
+        plot_reference_only()
         return
 
     motion = np.loadtxt(motion_path)
@@ -323,9 +346,11 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
     motion_vols = motion_vols[include_motion]
 
     if motion.shape[0] == 0:
+        plot_reference_only()
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    fig, axes = plt.subplots(3 if reference_qc else 2, 1,
+                             figsize=(12, 11) if reference_qc else (12, 8), sharex=False)
     axes[0].plot(vols, scores, label="Decoder score (regressed)")
     axes[0].set_xlabel("Volume")
     axes[0].set_ylabel("Score")
@@ -337,6 +362,10 @@ def _plot_qc(run_dir: Path, prefer_reg_ready: bool = True) -> None:
     axes[1].set_ylabel("Motion")
     axes[1].legend(loc="upper right", ncol=3, fontsize=8)
 
+    if reference_qc:
+        # Spatial QC includes every acquired TR, independently of the score
+        # readiness/warmup filtering retained above.
+        add_reference_correlation_panel(axes[2], run_dir)
     fig.tight_layout()
     out_png = run_dir / "qc_scores_motion.png"
     fig.savefig(out_png, dpi=150)

@@ -114,6 +114,31 @@ def test_optional_syn_and_explicit_com(registration):
     assert values(args, "--masks") == [f"[{mask},{pipe.anat_dir / 'T1_combined_mask.nii'}]"] * 3
 
 
+def test_full_anatomical_itk_policy_is_recorded_and_invalidates_cache(registration, monkeypatch):
+    import fmri_rt_preproc.pipeline as pipeline
+    pipe, epi, mask, calls = registration
+    pipe.cfg.registration_threads = 4
+    pipe.cfg.registration_syn = True
+    shell_calls = []
+    original_runner = pipeline.run
+    def capture(command):
+        shell_calls.append(command)
+        return original_runner(command)
+    monkeypatch.setattr(pipeline, 'run', capture)
+    pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    script = shell_calls[0][2]
+    assert 'export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=4\n' in script
+    assert 'export OMP_NUM_THREADS=$(nproc)\n' in script
+    assert values(calls[0], '--transform') == ['Rigid[0.1]', 'Affine[0.1]', 'SyN[0.1,1,0]']
+    saved = json.loads((pipe.trans_dir / 'registration.json').read_text())
+    assert saved['settings']['anatomical_itk_threads'] == 4
+    assert saved['plan']['execution'] == {'ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS': 4, 'OMP_NUM_THREADS': 'nproc'}
+    pipe.cfg.registration_threads = 1
+    with pytest.raises(ValueError, match='fresh'):
+        pipe._register_epi_to_t1(pipe.trans_dir, epi, mask)
+    assert len(shell_calls) == 1
+
+
 def test_forward_fit_keeps_semantic_names_and_distinct_grids(registration):
     pipe, epi, mask, calls = registration
     pipe.cfg.registration_direction = "epi_to_t1"

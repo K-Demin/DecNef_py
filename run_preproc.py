@@ -281,12 +281,14 @@ def preflight_registration(
     day: str,
     ap_block: int | None = None,
     pa_block: int | None = None,
-    registration_initialization: str = "identity",
+    registration_initialization: str = "center_of_mass",
     registration_syn: bool = True,
     registration_direction: str = "epi_to_t1",
     offline_assets=None,
     registration_qc_policy=None,
     epi_reference_n4: bool = True,
+    registration_threads: int = 1,
+    registration_bridge_initialization: str = "identity",
 ) -> None:
     """Reject an incompatible prepared session before staging or waiting for scans."""
     root = Path(base_data) / f"sub-{subject}" / day
@@ -303,6 +305,8 @@ def preflight_registration(
         offline_assets=offline_assets,
         registration_qc_policy=registration_qc_policy,
         epi_reference_n4=epi_reference_n4,
+        registration_threads=registration_threads,
+        registration_bridge_initialization=registration_bridge_initialization,
         mni_template=assets["mni_template"] if assets else None,
     )
     FMRIRealtimePreprocessor(cfg).validate_registration_request()
@@ -401,6 +405,8 @@ def main():
         registration_direction=settings.registration_direction, offline_assets=settings.offline_assets,
         registration_qc_policy=settings.registration_qc_policy,
         epi_reference_n4=settings.epi_reference_n4,
+        registration_threads=settings.registration_threads,
+        registration_bridge_initialization=settings.registration_bridge_initialization,
     )
 
     # data/sub-0001/3
@@ -503,6 +509,8 @@ def main():
         offline_assets=settings.offline_assets,
         registration_qc_policy=settings.registration_qc_policy,
         epi_reference_n4=settings.epi_reference_n4,
+        registration_threads=settings.registration_threads,
+        registration_bridge_initialization=settings.registration_bridge_initialization,
         mni_template=assets["mni_template"] if assets else None,
     )
 

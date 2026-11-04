@@ -14,7 +14,9 @@ feedback calibration are separate requirements.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | registration_direction | epi_to_t1 | epi_to_t1 or t1_to_epi |
-| registration_initialization | identity | Header coordinates; center_of_mass explicit; auto aliases identity |
+| registration_initialization | center_of_mass | Intensity-centre translation before anatomical fitting; identity uses headers; auto aliases identity |
+| registration_threads | 1 | ITK threads for the entire anatomical ANTs call, including SyN |
+| registration_bridge_initialization | identity | Independent EPI-to-EPI bridge initialization; center_of_mass and auto also accepted |
 | registration_syn | true | SyN after Rigid/Affine; false retains Rigid/Affine |
 | epi_reference_n4 | true | N4-correct a separate EPI reference for registration fitting |
 | offline_assets | null | Path to an imported/exported assets.json |
@@ -45,9 +47,22 @@ alignment for every participant, acquisition or slab; inspect each session's
 anatomical QC. Extra metric work occurs during registration fitting, not per-TR
 transform application.
 
-Masks follow the corresponding images in either direction. Identity assumes
-reasonable header overlap; a partial slab's centroid is not a full brain's
-centroid, so choose centre-of-mass initialization deliberately.
+Masks follow the corresponding images in either direction. Centre-of-mass
+initialization adds only a starting translation; rigid/affine/SyN still estimate
+the alignment. Identity remains available when trustworthy header coordinates
+provide a better start, including very restricted slabs. The anatomical setting
+does not change the EPI-to-EPI bridge initializer.
+
+The default follows a 120-fit diagnostic benchmark over ten supplied anatomical
+reference acquisitions: centre-of-mass plus one ITK thread passed all 30 repeated
+fits. Both single-thread initializers reproduced the evaluated images and affine
+mappings exactly; identity/eight-thread fitting failed grossly in 2/30 attempts.
+All benchmark anatomical fits used T1-to-EPI. This does not establish equivalent
+accuracy in the reverse direction or guarantee success on future acquisitions.
+The recipe and iteration limits are unchanged. Single-thread preparation was
+about 78 seconds versus 20 seconds for centre-of-mass/eight-thread fitting on
+the same fast CPU pool. These are preparation timings, not per-volume latency.
+The setting controls ITK; the existing OMP environment policy is retained.
 
 All launchers accept the shared registration CLI flags and JSON profile fields.
 Explicit CLI values override profiles. A profile containing

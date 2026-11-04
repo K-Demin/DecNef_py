@@ -231,6 +231,16 @@ def test_first_nf_uses_online_phase_encoding(frozen_session):
     assert preparations[0].cfg.epi_phase_encoding == settings.epi_phase_encoding
 
 
+def test_anatomical_policy_does_not_change_frozen_epi_bridge(frozen_session):
+    cfg, settings, _, _, runner, _, preparations = frozen_session
+    count = len(runner.calls)
+    settings.registration_initialization = 'center_of_mass'
+    settings.registration_threads = 1
+    session.ensure_nf_session(cfg, settings)
+    assert len(runner.calls) == count and len(preparations) == 1
+    assert preparations[0].cfg.registration_bridge_initialization == 'identity'
+
+
 @pytest.mark.parametrize("change", ["source", "output", "policy", "initialization", "version", "approval", "omitted_report"])
 def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_session, change):
     cfg, settings, assets, folder, runner, stages, preparations = frozen_session
@@ -242,7 +252,7 @@ def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_ses
         settings.registration_qc_policy = folder / "changed_policy.json"
         settings.registration_qc_policy.write_text("{}")
     elif change == "initialization":
-        settings.registration_initialization = "center_of_mass"
+        settings.registration_bridge_initialization = "center_of_mass"
     elif change in {"version", "omitted_report"}:
         path = folder / "session_alignment.json"
         marker = json.loads(path.read_text())

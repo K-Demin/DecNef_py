@@ -12,6 +12,7 @@ import test_rt_pipeline_parallel as headless
 import rt_pipeline as rt
 from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
 from fmri_rt_preproc.voxel_normalization import VoxelNormalizer
+from fmri_rt_preproc.decoder_qc import DecoderSpatialCorrelation
 from test_native_fieldmap import make_pair
 
 
@@ -150,6 +151,10 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
         biopac_timelag=False, analysis_space=space, volume_stream_kind="score_input"))
 
     visual_support = spatial(acquired) & handler.final_brain_mask
+    qc_reference = spatial(native[0])
+    handler.decoder_qc = DecoderSpatialCorrelation(
+        nib.Nifti1Image(qc_reference, np.eye(4)), handler.scorer.mask,
+        fixed_roi_mask=visual_support)
     analysis_support = fit_support.copy()
     history, expected_readiness, expected_scores = [], [], []
     for index, frame in enumerate(native, 1):
@@ -217,4 +222,16 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
     with (tmp_path / "scores.csv").open() as stream:
         scores = list(csv.DictReader(stream))
     assert [bool(int(row["reg_ready"])) for row in scores] == expected_readiness
+    with (tmp_path / "decoder_qc_rt.csv").open() as stream:
+        correlation_rows = list(csv.DictReader(stream))
+    with (tmp_path / "regression_status_rt.csv").open() as stream:
+        status_rows = list(csv.DictReader(stream))
+    assert len(correlation_rows) == len(native)
+    for index, (row, status) in enumerate(zip(correlation_rows, status_rows)):
+        expected_r = np.corrcoef(qc_reference[visual_support], spatial(native[index])[visual_support])[0, 1]
+        assert int(row["volume_idx"]) == index + 1
+        assert row["correlation_status"] == status["correlation_status"] == "ok"
+        assert float(row["reference_coverage_fraction"]) == 1
+        assert float(row["reference_correlation"]) == pytest.approx(expected_r, abs=1e-7)
+        assert float(status["reference_correlation"]) == pytest.approx(expected_r, abs=1e-7)
     assert not list((tmp_path / stage).glob(".vol*"))

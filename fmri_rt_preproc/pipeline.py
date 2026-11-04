@@ -2,7 +2,8 @@ import logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("fmri_rt_preproc_pipeline")
 
-from fmri_rt_preproc.config import SubjectDayConfig, validate_registration_settings
+from fmri_rt_preproc.config import (SubjectDayConfig, validate_registration_settings,
+                                   validate_registration_threads, validate_bridge_initialization)
 from fmri_rt_preproc.utils import run, ensure_dir, run_in_conda
 from fmri_rt_preproc.RTPSpy_tools.rtp_volreg import RtpVolreg
 from pathlib import Path
@@ -605,7 +606,7 @@ class FMRIRealtimePreprocessor:
     def _registration_settings(self):
         cfg = getattr(self, "cfg", None)
         initialization, syn = validate_registration_settings(
-            getattr(cfg, "registration_initialization", "identity"),
+            getattr(cfg, "registration_initialization", "center_of_mass"),
             getattr(cfg, "registration_syn", True),
         )
         assets = getattr(self, "offline_assets", None)
@@ -613,6 +614,9 @@ class FMRIRealtimePreprocessor:
         if not isinstance(reference_n4, bool):
             raise ValueError("epi_reference_n4 must be a boolean.")
         return {"recipe": ANATOMICAL_RECIPE, "initialization": initialization, "syn": syn,
+                "anatomical_itk_threads": validate_registration_threads(getattr(cfg, "registration_threads", 1)),
+                "bridge_initialization": validate_bridge_initialization(
+                    getattr(cfg, "registration_bridge_initialization", "identity")),
                 "fieldmap_estimator_recipe": ESTIMATOR_RECIPE,
                 "direction": getattr(cfg, "registration_direction", "epi_to_t1"),
                 "epi_reference_n4": reference_n4,
@@ -699,13 +703,17 @@ class FMRIRealtimePreprocessor:
                                         direction=settings["direction"],
                                         initialization=settings["initialization"], syn=settings["syn"])
         fixed, moving, native, args = plan.fixed, plan.moving, plan.native_outputs, plan.args
+        # One ITK worker for the full anatomical call (Rigid/Affine/SyN) is the
+        # tested deterministic MI policy. Preserve the independent OMP limit.
+        plan.provenance["execution"] = {"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": settings["anatomical_itk_threads"],
+                                        "OMP_NUM_THREADS": "nproc"}
         print(f"→ Running {settings['direction']} ({settings['initialization']}, SyN={settings['syn']})")
         # A failed/interrupted new fit must not be mistaken for a legacy cache,
         # even if ANTs or publication happened to write all four output files.
         pending = self.trans_dir / "registration_pending.json"
         pending.write_text(json.dumps(settings, indent=2) + "\n")
         run(["bash", "-lc", "export ANTS_USE_GPU=1\n"
-             "export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=$(nproc)\n"
+             f"export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS={settings['anatomical_itk_threads']}\n"
              "export OMP_NUM_THREADS=$(nproc)\n" + shlex.join(args)])
         if not all(p.is_file() and p.stat().st_size for p in native):
             raise RuntimeError("ANTs registration did not produce both transforms and both diagnostic images.")
@@ -752,7 +760,7 @@ class FMRIRealtimePreprocessor:
             raise ValueError("Interrupted registration; use a fresh session directory.")
         pending.write_text(json.dumps(settings, indent=2) + "\n")
         plan = register_session_bridge(self.offline_assets, epi, mask, self.trans_dir, run,
-                                       settings["initialization"],
+                                       settings["bridge_initialization"],
                                        epi_reference_n4=settings["epi_reference_n4"])
         payload = {"version": 3, "settings": settings, "plan": plan.provenance,
                    "inputs": input_records,

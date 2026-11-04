@@ -203,7 +203,8 @@ def ensure_nf_session(cfg, settings):
     source_id = bundle_identity(assets)
     policy = getattr(settings, "registration_qc_policy", None)
     policy_id = file_identity(policy) if policy else None
-    options = {"recipe": BRIDGE_RECIPE, "initialization": settings.registration_initialization,
+    options = {"recipe": BRIDGE_RECIPE,
+               "initialization": getattr(settings, "registration_bridge_initialization", "identity"),
                "fieldmap_estimator_recipe": ESTIMATOR_RECIPE,
                "fieldmap_method": getattr(settings, "fieldmap_method", "pyhysco"),
                "epi_phase_encoding": getattr(settings, "epi_phase_encoding", "PA"),
@@ -244,6 +245,8 @@ def ensure_nf_session(cfg, settings):
         registration_direction=settings.registration_direction,
         registration_initialization=settings.registration_initialization,
         registration_syn=settings.registration_syn,
+        registration_threads=getattr(settings, "registration_threads", 1),
+        registration_bridge_initialization=options["initialization"],
         epi_reference_n4=options["epi_reference_n4"])
     prep_cfg.registration_qc_policy = policy
     prep_cfg.fieldmap_method = options["fieldmap_method"]

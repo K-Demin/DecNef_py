@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import os
 import warnings
+from numbers import Integral
 
 
 def validate_registration_settings(initialization, syn):
@@ -15,6 +16,20 @@ def validate_registration_settings(initialization, syn):
     if not isinstance(syn, bool):
         raise ValueError("registration_syn must be a boolean.")
     return "identity" if initialization == "auto" else initialization, syn
+
+
+def validate_registration_threads(value):
+    """Anatomical ANTs ITK threads; independent OMP policy is unchanged."""
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        raise ValueError("registration_threads must be a positive integer.")
+    return int(value)
+
+
+def validate_bridge_initialization(value):
+    value = str(value).lower()
+    if value not in {"identity", "center_of_mass", "auto"}:
+        raise ValueError("registration_bridge_initialization must be identity, center_of_mass or auto.")
+    return "identity" if value == "auto" else value
 
 
 def validate_registration_direction(direction):
@@ -97,12 +112,14 @@ class SubjectDayConfig:
     fieldmap_dir: Path | None = None
     fieldmap_method: str = "pyhysco"
     epi_phase_encoding: str = "PA"
-    registration_initialization: str = "identity"
+    registration_initialization: str = "center_of_mass"
     registration_syn: bool = True
     registration_direction: str = "epi_to_t1"
     offline_assets: Path | None = None
     registration_qc_policy: str | None = None
     epi_reference_n4: bool = True
+    registration_threads: int = 1
+    registration_bridge_initialization: str = "identity"
     project_root = Path(__file__).resolve().parents[1]
     decoder_template = project_root / "decoders" / "rweights_NSF_grouppred_cvpcrTMP_nonzeros.nii"
 
@@ -111,6 +128,8 @@ class SubjectDayConfig:
             self.registration_initialization, self.registration_syn
         )
         self.registration_direction = validate_registration_direction(self.registration_direction)
+        self.registration_threads = validate_registration_threads(self.registration_threads)
+        self.registration_bridge_initialization = validate_bridge_initialization(self.registration_bridge_initialization)
         self.epi_reference_n4 = validate_epi_reference_n4(self.epi_reference_n4)
         self.offline_assets = optional_registration_path(self.offline_assets, "offline_assets")
         policy = optional_registration_path(self.registration_qc_policy, "registration_qc_policy")
@@ -138,12 +157,14 @@ class SubjectDayConfig:
             runs=runs,
             fieldmap_method=cfg.get("fieldmap_method", "pyhysco"),
             epi_phase_encoding=cfg.get("epi_phase_encoding", "PA"),
-            registration_initialization=cfg.get("registration_initialization", "identity"),
+            registration_initialization=cfg.get("registration_initialization", "center_of_mass"),
             registration_syn=cfg.get("registration_syn", True),
             registration_direction=cfg.get("registration_direction", "epi_to_t1"),
             offline_assets=cfg.get("offline_assets"),
             registration_qc_policy=cfg.get("registration_qc_policy"),
             epi_reference_n4=cfg.get("epi_reference_n4", True),
+            registration_threads=cfg.get("registration_threads", 1),
+            registration_bridge_initialization=cfg.get("registration_bridge_initialization", "identity"),
         )
 
     @classmethod
@@ -153,12 +174,14 @@ class SubjectDayConfig:
         day_id: str,
         root: Path,
         epi_basename: str = "epi.nii",
-        registration_initialization: str = "identity",
+        registration_initialization: str = "center_of_mass",
         registration_syn: bool = True,
         registration_direction: str = "epi_to_t1",
         offline_assets: str | Path | None = None,
         registration_qc_policy: str | Path | None = None,
         epi_reference_n4: bool = True,
+        registration_threads: int = 1,
+        registration_bridge_initialization: str = "identity",
     ) -> "SubjectDayConfig":
         """
         Build config from a standard layout:
@@ -215,6 +238,8 @@ class SubjectDayConfig:
             offline_assets=offline_assets,
             registration_qc_policy=registration_qc_policy,
             epi_reference_n4=epi_reference_n4,
+            registration_threads=registration_threads,
+            registration_bridge_initialization=registration_bridge_initialization,
         )
 
     @classmethod
@@ -229,13 +254,15 @@ class SubjectDayConfig:
         ap_file: Path | None = None,
         pa_file: Path | None = None,
         fieldmap_dir: Path | None = None,
-        registration_initialization: str = "identity",
+        registration_initialization: str = "center_of_mass",
         registration_syn: bool = True,
         registration_direction: str = "epi_to_t1",
         offline_assets: str | Path | None = None,
         registration_qc_policy: str | Path | None = None,
         mni_template: str | Path | None = None,
         epi_reference_n4: bool = True,
+        registration_threads: int = 1,
+        registration_bridge_initialization: str = "identity",
     ) -> "SubjectDayConfig":
         """
         Build config for a SINGLE run, where epi_file is already a merged 4D EPI.
@@ -298,6 +325,8 @@ class SubjectDayConfig:
             offline_assets=offline_assets,
             registration_qc_policy=registration_qc_policy,
             epi_reference_n4=epi_reference_n4,
+            registration_threads=registration_threads,
+            registration_bridge_initialization=registration_bridge_initialization,
         )
 
 
@@ -332,6 +361,8 @@ class SubjectDayConfig:
             "offline_assets": str(self.offline_assets) if self.offline_assets is not None else None,
             "registration_qc_policy": self.registration_qc_policy,
             "epi_reference_n4": self.epi_reference_n4,
+            "registration_threads": self.registration_threads,
+            "registration_bridge_initialization": self.registration_bridge_initialization,
             "t1_file": relative_or_absolute(self.t1_file, self.subject_root),
             "ap_file": relative_or_absolute(self.ap_file, root),
             "pa_file": relative_or_absolute(self.pa_file, root),
