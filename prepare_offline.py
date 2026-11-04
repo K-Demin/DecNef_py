@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import re
 import tempfile
@@ -237,6 +238,15 @@ def export_prepared(args):
                       "inputs": {key: file_identity(path) for key, path in {**sources, **transforms}.items()},
                       "t1_mask_preparation": mask_preparation,
                       "alignment_validation": "not_performed_by_export"}
+        registration_record = trans / "registration.json"
+        if registration_record.is_file():
+            # Carry the actual estimator/execution policy with exported assets;
+            # importing/exporting transforms never refits anatomy or substitutes
+            # today's defaults for the settings that created those transforms.
+            registration = json.loads(registration_record.read_text())
+            provenance["registration"] = {"record": file_identity(registration_record),
+                                          "settings": registration.get("settings"),
+                                          "plan": registration.get("plan")}
         if reference_preparation is not None:
             provenance["epi_registration_reference"] = {
                 "source": "verified_prepared_n4", "preparation": reference_preparation,

@@ -81,7 +81,7 @@ def _build_plan(fixed, moving, fixed_mask, moving_mask, prefix, *,
 
 
 def build_epi_t1_registration(epi, t1, epi_mask, t1_mask, prefix, *,
-                              direction="epi_to_t1", initialization="identity", syn=True):
+                              direction="epi_to_t1", initialization="center_of_mass", syn=True):
     """Plan the full anatomical fit, preserving canonical ``epi2t1_*`` meanings.
 
     ``t1_mask`` may be None. Input masks must already occupy their own image

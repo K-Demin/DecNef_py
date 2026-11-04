@@ -107,6 +107,21 @@ def test_export_without_n4_remains_compatible(prepared):
     assert 'epi_registration_reference' not in assets
 
 
+def test_export_records_actual_registration_policy_without_refitting(prepared):
+    args, epi, _ = prepared
+    metadata = {'settings': {'initialization': 'identity', 'anatomical_itk_threads': 8},
+                'plan': {'execution': {'ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS': 8, 'OMP_NUM_THREADS': 'nproc'}}}
+    record = epi.parent / 'registration.json'
+    record.write_text(json.dumps(metadata))
+    before = record.read_bytes()
+    assets = load_offline_assets(offline.export_prepared(args))
+    saved = assets['provenance']['registration']
+    assert saved['settings'] == metadata['settings']
+    assert saved['plan'] == metadata['plan']
+    assert saved['record'] == offline.file_identity(record)
+    assert record.read_bytes() == before
+
+
 @pytest.mark.parametrize('changed', ['source', 'mask', 'output', 'sidecar_missing', 'output_missing'])
 def test_export_rejects_stale_or_incomplete_n4_before_creating_bundle(prepared, changed):
     args, epi, mask = prepared

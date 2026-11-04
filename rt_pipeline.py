@@ -44,6 +44,7 @@ from fmri_rt_preproc.pyhysco_apply import apply_pyhysco_fieldmap, PreloadedPyHys
 from fmri_rt_preproc.utils import run  # your existing run() wrapper
 
 from decoder_score import DecoderScorer
+from fmri_rt_preproc.decoder_qc import DecoderSpatialCorrelation, write_run_qc_workbook
 from biopac_rt.biopac_receiver import (
     BiopacReceiverConfig,
     BiopacRetroTSReceiver,
@@ -757,6 +758,138 @@ def resolve_analysis_reference(cfg, space):
             raise ValueError("EPI decoder/template must match the stable EPI output grid; "
                              "use a decoder prepared on reference_epi.nii.") from exc
     return reference
+
+
+def prepare_decoder_correlation_qc(cfg, handler):
+    """Freeze the spatial QC reference/ROI once; never use normalized features.
+
+    A supplied training mean tests agreement with decoder construction. Otherwise
+    the corrected session reference provides a labelled within-session check.
+    Only the QC ROI is restricted to the reference's observable brain; decoder
+    weights and the analysis mask remain untouched.
+    """
+    enabled = bool(getattr(REGRESSOR_SETTINGS, "enable_decoder_correlation_qc", True))
+    scorer = getattr(handler, "scorer", None)
+    if not enabled or scorer is None:
+        return None
+    space = str(REGRESSOR_SETTINGS.analysis_space).lower()
+    folder = cfg.rt_work_dir / "decoder_qc"
+    folder.mkdir(parents=True, exist_ok=True)
+    analysis_path = resolve_analysis_reference(cfg, space)
+    analysis_image = nib.load(str(analysis_path))
+    source = cfg.rt_unwarped_analysis_ref_epi
+    source_image = nib.load(str(source))
+    bridge = session_epi_bridge(cfg) if space == "epi" else None
+    spatial = space != "epi" or bridge is not None
+    brain = getattr(handler, "final_brain_mask", None)
+    explicit_reference = getattr(REGRESSOR_SETTINGS, "decoder_qc_reference", None)
+    roi_path = getattr(REGRESSOR_SETTINGS, "decoder_qc_roi_mask", None)
+    # Bind inputs before overwriting any generated reference/support metadata.
+    # Generated fallback mtimes are deliberately excluded: the same request may
+    # be restarted, but existing rows must never change their reference or ROI.
+    import hashlib
+    from fmri_rt_preproc.offline_assets import file_identity
+    def mask_identity(values):
+        if values is None:
+            return None
+        array = np.ascontiguousarray(np.asarray(values, dtype=bool))
+        return {"shape": list(array.shape), "sha256": hashlib.sha256(array.tobytes()).hexdigest()}
+    transforms = ([bridge] if bridge is not None else
+                  [cfg.trans_dir / "epi2t1_Composite.h5"] if spatial else [])
+    if space == "mni":
+        transforms.insert(0, t1_to_mni_transform(cfg))
+    request = {"version": 1, "analysis_space": space,
+               "analysis_grid": {"shape": list(analysis_image.shape[:3]), "affine": analysis_image.affine.tolist()},
+               "session_reference": file_identity(source),
+               "explicit_reference": file_identity(Path(explicit_reference).expanduser()) if explicit_reference else None,
+               "decoder_mask": mask_identity(scorer.mask), "final_brain_mask": mask_identity(brain),
+               "explicit_roi": file_identity(Path(roi_path).expanduser()) if roi_path else None,
+               "transforms": [file_identity(transform) for transform in transforms],
+               "backend": "gpu_resampler" if spatial and handler.gpu_resampler is not None else "ants" if spatial else "identity",
+               "interpolation": str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear"))
+               if spatial and handler.gpu_resampler is not None else "linear"}
+    binding_path = cfg.rt_work_dir / "decoder_qc_request.json"
+    csv_path = cfg.rt_work_dir / "decoder_qc_rt.csv"
+    if csv_path.exists() and csv_path.stat().st_size:
+        try:
+            previous = json.loads(binding_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = None
+        if previous != request:
+            raise ValueError("Existing decoder QC rows use different or unrecorded reference/ROI inputs. Use a fresh run directory; existing files were not overwritten.")
+    binding_temporary = binding_path.with_suffix(".json.tmp")
+    binding_temporary.write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
+    binding_temporary.replace(binding_path)
+    # The same support mapping used for incoming volumes defines a fixed ROI.
+    # This is independent of the first TR's motion and of cGLM history.
+    reference_support = final_volume_support(
+        cfg, handler, np.ones(source_image.shape[:3], dtype=bool),
+        source_image.affine, 0, space, folder_name="decoder_qc/reference_support")
+    if brain is not None:
+        reference_support &= brain
+    reference_path = Path(explicit_reference).expanduser().resolve() if explicit_reference else folder / "session_reference.nii"
+    if not explicit_reference:
+        if not spatial:
+            require_same_grid(source_image, analysis_image)
+            nib.save(nib.Nifti1Image(np.asarray(source_image.dataobj, dtype=np.float32),
+                                    analysis_image.affine), str(reference_path))
+        elif handler.gpu_resampler is not None:
+            handler.gpu_resampler.resample_nifti_to_nifti(source, reference_path)
+        else:
+            transforms = [bridge] if bridge is not None else [cfg.trans_dir / "epi2t1_Composite.h5"]
+            if space == "mni":
+                transforms.insert(0, t1_to_mni_transform(cfg))
+            command = ["antsApplyTransforms", "-d", "3", "-i", str(source),
+                       "-r", str(analysis_path), "-o", str(reference_path),
+                       "-n", "Linear", "--float", "1"]
+            for transform in transforms:
+                command.extend(["-t", str(transform)])
+            run(command)
+    qc = DecoderSpatialCorrelation(
+        reference_path, scorer.mask, analysis_image=analysis_image,
+        fixed_roi_mask=reference_support,
+        roi_image=Path(roi_path).expanduser().resolve() if roi_path else None,
+        reference_kind="decoder_training_mean" if explicit_reference else "prepared_session_reference",
+        reference_label="Decoder-training mean EPI" if explicit_reference else "Prepared session EPI reference (fallback)")
+    metadata = dict(qc.metadata)
+    metadata.update(stage="after_spatial_before_smoothing_glm_normalization",
+                    analysis_space=space, reference=source_identity(reference_path),
+                    decoder=source_identity(resolve_decoder_template(cfg)),
+                    roi_file=source_identity(Path(roi_path).expanduser().resolve()) if roi_path else None,
+                    session_reference=source_identity(source),
+                    reporting_only=True, missing_coverage_policy="nan_without_changing_fixed_roi")
+    nib.save(nib.Nifti1Image(qc.roi.astype(np.uint8), analysis_image.affine),
+             str(folder / "fixed_roi.nii"))
+    metadata_path = cfg.rt_work_dir / "decoder_qc_reference.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    session_path = cfg.rt_work_dir / "session_metadata.json"
+    if session_path.exists():
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+        session["decoder_correlation_qc"] = metadata
+        session_path.write_text(json.dumps(session, indent=2) + "\n", encoding="utf-8")
+    log.info("[QC] Spatial decoder-ROI correlation: %s; fixed ROI %s voxels",
+             metadata["reference_kind"], int(qc.roi.sum()))
+    return qc
+
+
+def record_decoder_correlation(cfg, handler, volume_idx, image_path, support):
+    """Record raw spatial agreement for every TR, including GLM warmup."""
+    qc = getattr(handler, "decoder_qc", None)
+    if qc is None:
+        return {"reference_correlation": float("nan"),
+                "reference_coverage_fraction": float("nan"),
+                "correlation_status": "disabled" if not getattr(
+                    REGRESSOR_SETTINGS, "enable_decoder_correlation_qc", True) else "no_voxel_decoder"}
+    image = image_path if hasattr(image_path, "dataobj") else nib.load(str(image_path))
+    result = qc.evaluate(image, coverage=support).as_dict()
+    path = cfg.rt_work_dir / "decoder_qc_rt.csv"
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["volume_idx", *result])
+        if not exists:
+            writer.writeheader()
+        writer.writerow({"volume_idx": volume_idx, **result})
+    return result
 
 
 def maybe_init_gpu_resampler(cfg: RTSessionConfig):
@@ -1504,6 +1637,7 @@ class DICOMHandler(FileSystemEventHandler):
         else:
             log.info("[SCORE] Scoring disabled; skipping decoder initialization.")
             self.scorer = None
+        self.decoder_qc = prepare_decoder_correlation_qc(cfg, self)
 
     def stop(self):
         if hasattr(self, "normalization_last_volume"):
@@ -1517,6 +1651,19 @@ class DICOMHandler(FileSystemEventHandler):
             self.biopac_receiver.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
         self.volume_streamer.stop()
+        # Let the existing stop path return as before, but do not read a final
+        # workbook snapshot while an active callback can still append CSV rows.
+        # A non-daemon completion thread also covers direct rt_pipeline.py use;
+        # behavioral parents export again after their processing child exits.
+        def export_after_workers():
+            self._executor.shutdown(wait=True)
+            try:
+                write_run_qc_workbook(self.cfg.rt_work_dir)
+            except Exception:
+                log.exception("[QC] Workbook export failed; per-volume CSVs remain available.")
+        self._qc_export_thread = threading.Thread(
+            target=export_after_workers, name="run-qc-export", daemon=False)
+        self._qc_export_thread.start()
 
     def start_biopac(self):
         if self.biopac_receiver is None:
@@ -2391,6 +2538,14 @@ def process_volume(
     if speed is not None:
         speed.stage(volume_idx, "TRANS", time.perf_counter() - coverage_t0)
 
+    # Reuse the spatial image for temporal processing when smoothing is off;
+    # QC needs no additional NIfTI header read on that common path.
+    spatial_image = (nib.load(str(score_input_nii))
+                     if getattr(handler, "decoder_qc", None) is not None
+                     or getattr(handler, "smoother", None) is None else None)
+    correlation_qc = record_decoder_correlation(
+        cfg, handler, volume_idx, spatial_image, spatial_output_support)
+
     # Spatial smoothing/selection precedes temporal denoising and normalization.
     smoother = getattr(handler, "smoother", None)
     if smoother is not None:
@@ -2405,7 +2560,7 @@ def process_volume(
                 folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_orig_support)
         log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
 
-    temporal_image = nib.load(str(score_input_nii))
+    temporal_image = spatial_image if smoother is None else nib.load(str(score_input_nii))
     temporal_data = np.asarray(temporal_image.dataobj, dtype=np.float32).copy()
     processing_mask = getattr(handler, "processing_mask", None)
     if processing_mask is None:
@@ -2536,6 +2691,9 @@ def process_volume(
         glm_ready=glm_ready,
         normalization_ready=normalization_ready,
         normalization_reference_count=reference_count,
+        reference_correlation=correlation_qc["reference_correlation"],
+        reference_coverage_fraction=correlation_qc["reference_coverage_fraction"],
+        correlation_status=correlation_qc["correlation_status"],
     )
     if REGRESSOR_SETTINGS.biopac_timelag and handler.biopac_receiver is not None:
         trigger_ts = handler.biopac_receiver.get_trigger_timestamp(volume_idx)
@@ -2807,6 +2965,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         )
     decoder_template = resolve_decoder_template(cfg)
 
+    validate_regression_status_schema(cfg.rt_work_dir / "regression_status_rt.csv")
+
     ensure_fieldmap_only(cfg)
     from fmri_rt_preproc.session_alignment import ensure_nf_session
     ensure_nf_session(cfg, REGRESSOR_SETTINGS)
@@ -2907,6 +3067,22 @@ def append_regressors(reg_path: Path, volume_idx: int, reg_names: list[str], reg
         w.writerow([volume_idx, *reg_row.tolist()])
 
 
+REGRESSION_STATUS_FIELDS = ["volume_idx", "fd", "dvars", "dvars_z", "fd_censor", "dvars_censor",
+    "reg_ready", "biopac_missing", "glm_ready", "normalization_ready", "normalization_reference_count",
+    "reference_correlation", "reference_coverage_fraction", "correlation_status"]
+
+
+def validate_regression_status_schema(path):
+    """Refuse mixed old/new CSV columns before preparation or new volume work."""
+    path = Path(path)
+    if not path.exists() or not path.stat().st_size:
+        return
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        header = next(csv.reader(stream), [])
+    if header != REGRESSION_STATUS_FIELDS:
+        raise ValueError("Existing regression_status_rt.csv has a different column schema. Use a fresh run directory; existing QC was not changed.")
+
+
 def append_regression_status(
     qc_path: Path,
     volume_idx: int,
@@ -2918,29 +3094,21 @@ def append_regression_status(
     reg_ready: bool,
     biopac_missing: bool,
     *, glm_ready=None, normalization_ready=None, normalization_reference_count=None,
+    reference_correlation=float("nan"), reference_coverage_fraction=float("nan"),
+    correlation_status="unavailable",
 ):
     qc_path.parent.mkdir(parents=True, exist_ok=True)
-    exists = qc_path.exists()
+    validate_regression_status_schema(qc_path)
+    exists = qc_path.exists() and qc_path.stat().st_size > 0
     with open(qc_path, "a", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(
-                [
-                    "volume_idx",
-                    "fd",
-                    "dvars",
-                    "dvars_z",
-                    "fd_censor",
-                    "dvars_censor",
-                    "reg_ready",
-                    "biopac_missing",
-                    "glm_ready", "normalization_ready", "normalization_reference_count",
-                ]
-            )
+            w.writerow(REGRESSION_STATUS_FIELDS)
         w.writerow([volume_idx, fd, dvars, dvars_z, fd_censor, dvars_censor, int(reg_ready), int(biopac_missing),
                     int(glm_ready) if glm_ready is not None else "",
                     int(normalization_ready) if normalization_ready is not None else "",
-                    normalization_reference_count if normalization_reference_count is not None else ""])
+                    normalization_reference_count if normalization_reference_count is not None else "",
+                    reference_correlation, reference_coverage_fraction, correlation_status])
 
 
 def append_biopac_timelag(

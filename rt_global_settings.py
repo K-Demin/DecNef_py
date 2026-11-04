@@ -12,12 +12,15 @@ from fmri_rt_preproc.config import (
     normalize_registration_config, optional_registration_path,
     validate_registration_direction, validate_registration_settings,
     validate_epi_reference_n4,
+    validate_registration_threads, validate_bridge_initialization,
 )
 
 
 REGISTRATION_KEYS = ("registration_initialization", "registration_syn",
-                     "registration_direction", "offline_assets", "registration_qc_policy", "epi_reference_n4")
+                     "registration_direction", "offline_assets", "registration_qc_policy", "epi_reference_n4",
+                     "registration_threads", "registration_bridge_initialization")
 VOXEL_NORMALIZATION_KEYS = ("voxel_norm_mode", "voxel_norm_reference", "voxel_norm_ref_volumes")
+DECODER_QC_KEYS = ("enable_decoder_correlation_qc", "decoder_qc_reference", "decoder_qc_roi_mask")
 
 
 def validate_voxel_normalization_settings(mode: str, reference: str, ref_volumes: int) -> tuple[str, str, int]:
@@ -92,7 +95,7 @@ class RegressorSettings:
     skip_first_trs: int = 0
     truncate_t1_to_epi_fov: bool = True
     truncate_t1_padding_vox: int = 2
-    registration_initialization: str = "identity"
+    registration_initialization: str = "center_of_mass"
     registration_syn: bool = True
     registration_direction: str = "epi_to_t1"
     offline_assets: Optional[Path] = None
@@ -112,6 +115,11 @@ class RegressorSettings:
     volume_stream_window_y: int = 50
     pyhysco_device: str = "cuda"
     pyhysco_backend: str = "grid_sample"  # "grid_sample" or "gather1d"
+    registration_threads: int = 1  # Anatomical ANTs ITK threads, including SyN; OMP policy is independent
+    registration_bridge_initialization: str = "identity"  # Separate EPI-to-EPI initialization
+    enable_decoder_correlation_qc: bool = True
+    decoder_qc_reference: Optional[str] = None
+    decoder_qc_roi_mask: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.update({})
@@ -125,10 +133,21 @@ class RegressorSettings:
             registration_values["registration_initialization"], registration_values["registration_syn"]
         )
         registration_values["registration_direction"] = validate_registration_direction(registration_values["registration_direction"])
+        registration_values["registration_threads"] = validate_registration_threads(registration_values["registration_threads"])
+        registration_values["registration_bridge_initialization"] = validate_bridge_initialization(registration_values["registration_bridge_initialization"])
         registration_values["epi_reference_n4"] = validate_epi_reference_n4(registration_values["epi_reference_n4"])
         registration_values["offline_assets"] = optional_registration_path(registration_values["offline_assets"], "offline_assets")
         policy = optional_registration_path(registration_values["registration_qc_policy"], "registration_qc_policy")
         registration_values["registration_qc_policy"] = str(policy) if policy is not None else None
+        decoder_qc_values = {key: overrides.get(key, getattr(self, key)) for key in DECODER_QC_KEYS}
+        if not isinstance(decoder_qc_values["enable_decoder_correlation_qc"], bool):
+            raise ValueError("enable_decoder_correlation_qc must be a boolean.")
+        for key in ("decoder_qc_reference", "decoder_qc_roi_mask"):
+            value = decoder_qc_values[key]
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"{key} must be a nonempty string path or null.")
+                decoder_qc_values[key] = str(Path(value).expanduser())
         normalization_values = validate_voxel_normalization_settings(*(
             overrides.get(key, getattr(self, key)) for key in VOXEL_NORMALIZATION_KEYS
         ))
@@ -143,7 +162,7 @@ class RegressorSettings:
                 raise ValueError("Lanczos requires use_gpu_resampler=true and a CUDA device.")
         known = {f.name: f for f in fields(self)}
         for key, value in overrides.items():
-            if (key not in known or key in REGISTRATION_KEYS or key in VOXEL_NORMALIZATION_KEYS
+            if (key not in known or key in REGISTRATION_KEYS or key in VOXEL_NORMALIZATION_KEYS or key in DECODER_QC_KEYS
                     or key == "gpu_resampler_interpolation"):
                 continue
             if key == "biopac_file" and value is not None:
@@ -182,6 +201,8 @@ class RegressorSettings:
             else:
                 setattr(self, key, value)
         for key, value in registration_values.items():
+            setattr(self, key, value)
+        for key, value in decoder_qc_values.items():
             setattr(self, key, value)
         for key, value in zip(VOXEL_NORMALIZATION_KEYS, normalization_values):
             setattr(self, key, value)
@@ -230,8 +251,16 @@ def add_registration_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--registration-initialization", choices=["identity", "center_of_mass", "auto"],
         default=None,
-        help="Anatomical registration initialization: identity uses headers (default); "
-             "center_of_mass is an explicit alternative; auto aliases identity.",
+        help="Anatomical registration initialization: center_of_mass is the default; "
+             "explicit identity and auto use headers.",
+    )
+    parser.add_argument(
+        "--registration-threads", type=int, default=None,
+        help="ITK threads for anatomical Rigid/Affine/SyN (default: 1); independent OMP policy is unchanged.",
+    )
+    parser.add_argument(
+        "--registration-bridge-initialization", choices=["identity", "center_of_mass", "auto"], default=None,
+        help="Separate EPI-to-EPI bridge initialization (default: identity); auto aliases identity.",
     )
     parser.add_argument(
         "--registration-syn", action=argparse.BooleanOptionalAction, default=None,
@@ -267,6 +296,8 @@ def registration_cli_arguments(settings: RegressorSettings) -> list[str]:
     arguments = [
         "--registration-direction", settings.registration_direction,
         "--registration-initialization", settings.registration_initialization,
+        "--registration-threads", str(settings.registration_threads),
+        "--registration-bridge-initialization", settings.registration_bridge_initialization,
         "--registration-syn" if settings.registration_syn else "--no-registration-syn",
         "--epi-reference-n4" if settings.epi_reference_n4 else "--no-epi-reference-n4",
     ]

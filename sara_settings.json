@@ -1,4 +1,12 @@
 {
+  "registration_initialization": "center_of_mass",
+  "registration_threads": 1,
+  "registration_bridge_initialization": "identity",
+  "_comment_registration_runtime": "Anatomical ANTs fitting uses centre-of-mass initialization and one ITK thread for repeatability; the rigid EPI-to-EPI bridge keeps header/identity initialization. SyN and fit direction keep their existing settings. New settings require fresh preparation/QC.",
+  "enable_decoder_correlation_qc": true,
+  "decoder_qc_reference": null,
+  "decoder_qc_roi_mask": null,
+  "_comment_decoder_correlation_qc": "QC only: spatial Pearson r within a fixed decoder ROI, after transforms and before smoothing/cGLM/normalization. Supply a decoder-training mean EPI already on the final analysis grid; null uses a labelled session-reference fallback. Optional QC ROI NIfTI on that same grid; useful for genuine feature masks. CSV each TR, PNG and run_qc.xlsx at run completion.",
   "epi_reference_n4": true,
   "_comment_epi_reference_n4": "N4-correct a reference copy before spatial registration; keep the original MC target and incoming BOLD intensities.",
   "_comment_smoothing": "Final mask: whole_brain, cortical_gm, or custom (binary analysis_mask_file; space final/epi/t1/mni). FWHM in mm; 0 skips filtering, cortex/custom still writes masked/. Positive FWHM writes smooth/.",

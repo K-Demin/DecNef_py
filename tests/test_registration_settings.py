@@ -36,7 +36,8 @@ def session_config(tmp_path, monkeypatch, **kwargs):
 
 def test_default_registration_and_config_json_roundtrip(tmp_path, monkeypatch):
     cfg = session_config(tmp_path, monkeypatch)
-    assert (cfg.registration_initialization, cfg.registration_syn, cfg.registration_direction) == ('identity', True, 'epi_to_t1')
+    assert (cfg.registration_initialization, cfg.registration_syn, cfg.registration_direction) == ('center_of_mass', True, 'epi_to_t1')
+    assert cfg.registration_threads == 1 and cfg.registration_bridge_initialization == 'identity'
     cfg.registration_initialization = 'center_of_mass'
     cfg.registration_syn = False
     cfg.registration_direction = 't1_to_epi'
@@ -51,7 +52,7 @@ def test_default_registration_and_config_json_roundtrip(tmp_path, monkeypatch):
     payload.pop('registration_direction')
     target.write_text(json.dumps(payload))
     loaded = SubjectDayConfig.from_json(target)
-    assert (loaded.registration_initialization, loaded.registration_syn, loaded.registration_direction) == ('identity', True, 'epi_to_t1')
+    assert (loaded.registration_initialization, loaded.registration_syn, loaded.registration_direction) == ('center_of_mass', True, 'epi_to_t1')
 
 
 @pytest.mark.parametrize('initialization,syn', [
@@ -187,7 +188,7 @@ def test_preparation_refuses_cache_before_staging_or_config_write(tmp_path, monk
         script.main()
     assert config_path.read_text() == 'existing configuration'
     assert len(calls) == 1
-    assert calls[0].registration_initialization == 'identity'
+    assert calls[0].registration_initialization == 'center_of_mass'
     assert calls[0].registration_syn
     assert calls[0].registration_direction == 'epi_to_t1'
 
@@ -250,7 +251,7 @@ def test_preparation_records_profile_selection_only_after_preflight(
 
 @pytest.mark.parametrize('launcher', ['run_preproc', 'rs_realtime_parallel', 'rs_pca_score_all_rois'])
 @pytest.mark.parametrize('profile_values,overrides,expected', [
-    (None, [], ('identity', True, 'epi_to_t1')),
+    (None, [], ('center_of_mass', True, 'epi_to_t1')),
     ({'registration_initialization': 'center_of_mass', 'registration_syn': True,
       'registration_direction': 't1_to_epi'}, [], ('center_of_mass', True, 't1_to_epi')),
     ({'registration_initialization': 'center_of_mass', 'registration_syn': True,
@@ -450,7 +451,46 @@ def test_shared_cli_roundtrip_preserves_complete_registration_request(tmp_path, 
 def test_shared_cli_defaults_use_syn_and_manual_qc_without_implicit_paths():
     settings = load_regressor_settings(None)
     assert settings.registration_direction == 'epi_to_t1'
-    assert settings.registration_syn and settings.registration_initialization == 'identity'
+    assert settings.registration_syn and settings.registration_initialization == 'center_of_mass'
     assert settings.offline_assets is None and settings.registration_qc_policy is None
     assert registration_cli_arguments(settings) == ['--registration-direction', 'epi_to_t1',
-        '--registration-initialization', 'identity', '--registration-syn', '--epi-reference-n4']
+        '--registration-initialization', 'center_of_mass', '--registration-threads', '1',
+        '--registration-bridge-initialization', 'identity', '--registration-syn', '--epi-reference-n4']
+
+
+@pytest.mark.parametrize('value', [0, -1, True, '1', 1.0, None])
+def test_anatomical_threads_are_strict_and_atomically_validated(tmp_path, monkeypatch, value):
+    settings = RegressorSettings()
+    with pytest.raises(ValueError, match='registration_threads'):
+        settings.update({'registration_threads': value, 'TR': 9.0})
+    assert settings.TR == 1.0 and settings.registration_threads == 1
+    with pytest.raises(ValueError, match='registration_threads'):
+        session_config(tmp_path, monkeypatch, registration_threads=value)
+
+
+def test_threads_and_separate_bridge_settings_survive_config_json_and_cli(tmp_path, monkeypatch):
+    cfg = session_config(tmp_path, monkeypatch, registration_initialization='identity',
+                         registration_threads=8, registration_bridge_initialization='center_of_mass')
+    path = tmp_path / 'config.json'; cfg.to_json(path)
+    restored = SubjectDayConfig.from_json(path)
+    assert restored.registration_initialization == 'identity'
+    assert restored.registration_threads == 8
+    assert restored.registration_bridge_initialization == 'center_of_mass'
+    settings = RegressorSettings(registration_initialization='identity', registration_threads=8,
+                                 registration_bridge_initialization='center_of_mass')
+    parser = argparse.ArgumentParser(); add_registration_arguments(parser)
+    child = RegressorSettings()
+    apply_registration_arguments(child, parser.parse_args(registration_cli_arguments(settings)))
+    assert child.to_json_dict() == settings.to_json_dict()
+    apply_registration_arguments(child, parser.parse_args(['--registration-threads', '2',
+        '--registration-bridge-initialization', 'auto']))
+    assert child.registration_threads == 2 and child.registration_bridge_initialization == 'identity'
+    assert child.registration_initialization == 'identity'
+
+
+@pytest.mark.parametrize('value', [None, True, 'bad'])
+def test_separate_bridge_initialization_rejects_invalid_values(value):
+    settings = RegressorSettings()
+    with pytest.raises(ValueError, match='registration_bridge_initialization'):
+        settings.update({'registration_bridge_initialization': value, 'registration_threads': 8, 'TR': 9})
+    assert settings.registration_threads == 1 and settings.TR == 1
