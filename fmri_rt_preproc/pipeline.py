@@ -128,7 +128,7 @@ class FMRIRealtimePreprocessor:
             self._run_fastsurfer(t1, fastsurfer_dir)
 
         # ---------- 3. BRAIN MASKS ----------
-        t1_combined = self.anat_dir / "T1_combined_mask.nii"
+        t1_combined = prefer_uncompressed_nifti(self.anat_dir / "T1_combined_mask.nii")
 
         if t1_combined.exists() and (self.anat_dir / "T1_brain.nii").exists():
             print("✓ Brain masks: already exist — skipping")
@@ -171,10 +171,11 @@ class FMRIRealtimePreprocessor:
         aparc_aseg = fs_mri_dir / "aparc.DKTatlas+aseg.deep.mgz"
 
         brainmask_noCSF = self.anat_dir / "brainmask_noCSF.nii"
-        filled = self.anat_dir / "brainmask_noCSF_filled.nii"
+        filled = prefer_uncompressed_nifti(self.anat_dir / "brainmask_noCSF_filled.nii")
         t1_brain = self.anat_dir / "T1_brain.nii"
         t1_mask_skull = self.anat_dir / "T1_mask_skull.nii"
-        t1_combined = self.anat_dir / "T1_combined_mask.nii"
+        t1_combined = prefer_uncompressed_nifti(self.anat_dir / "T1_combined_mask.nii")
+        rebuild_filled = not filled.exists() or not brainmask_noCSF.exists()
 
         # 1) binarize aparc+aseg into cortical/GM mask without CSF
         if not brainmask_noCSF.exists():
@@ -207,7 +208,11 @@ class FMRIRealtimePreprocessor:
                 "2029", "2030", "2031", "2034", "2035",
                 "--o", str(brainmask_noCSF)
             ])
+        # FSL normally writes .nii.gz even when given an output ending in .nii.
+        # Rebuild this intermediate independently after a partially completed run.
+        if rebuild_filled:
             run(["fslmaths", str(brainmask_noCSF), "-fillh", str(filled)])
+            filled = prefer_uncompressed_nifti(filled)
         # 2) SynthStrip on T1_N4
         if not t1_brain.exists() or not t1_mask_skull.exists():
             run([
@@ -228,11 +233,14 @@ class FMRIRealtimePreprocessor:
                 "-applyxfm", "-usesqform",
                 "-out", str(brainmask_resampled)
             ])
+            brainmask_resampled = prefer_uncompressed_nifti(brainmask_resampled)
             run([
                 "fslmaths", str(brainmask_resampled),
                 "-mul", str(t1_mask_skull),
                 str(t1_combined)
             ])
+        if not prefer_uncompressed_nifti(t1_combined).is_file():
+            raise FileNotFoundError(f"Brain mask generation produced neither {t1_combined} nor its compressed NIfTI counterpart.")
 
     def _run_synthmorph(self, t1_n4: Path):
         warp = self.anat_dir / "warp_T1_to_MNI_synth.nii"
@@ -676,7 +684,7 @@ class FMRIRealtimePreprocessor:
         settings = self._registration_settings()
         t1_n4 = self.anat_dir / "T1_N4.nii"
         t1 = self.anat_dir / "T1_brain.nii"
-        t1_mask = self.anat_dir / "T1_combined_mask.nii"
+        t1_mask = prefer_uncompressed_nifti(self.anat_dir / "T1_combined_mask.nii")
         inputs = [epi_mean, epi_mask_mean, t1, t1_n4, t1_mask]
         input_records = [source_identity(p) for p in dict.fromkeys(inputs)]
         outputs = self._registration_outputs()
@@ -775,7 +783,7 @@ class FMRIRealtimePreprocessor:
         assets = getattr(self, "offline_assets", None)
         reports = write_registration_reports(
             self.trans_dir, self.rt_unwarped_analysis_ref_epi, self.rt_unwarped_analysis_ref_mask,
-            self.anat_dir / "T1_N4.nii", self.anat_dir / "T1_combined_mask.nii",
+            self.anat_dir / "T1_N4.nii", prefer_uncompressed_nifti(self.anat_dir / "T1_combined_mask.nii"),
             self.cfg.mni_template,
             t1_to_mni_transform(SimpleNamespace(trans_dir=self.trans_dir, subject_root=self.cfg.subject_root)),
             run, getattr(self.cfg, "registration_qc_policy", None),
