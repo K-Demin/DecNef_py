@@ -144,13 +144,12 @@ def test_refuse_disagreeing_readiness_before_export(native_runs):
     assert not output.exists()
 
 
-@pytest.mark.parametrize("problem", ["subject", "units", "smoothing", "nuisance", "policy", "order", "decoder"])
-def test_refuse_changed_subject_method_units_or_model(native_runs, problem, tmp_path):
+@pytest.mark.parametrize("problem", ["subject", "smoothing", "nuisance", "policy", "order", "decoder"])
+def test_refuse_changed_subject_method_or_model(native_runs, problem, tmp_path):
     runs, output, kwargs = native_runs
     path = runs[1] / "session_metadata.json"
     metadata = json.loads(path.read_text())
     if problem == "subject": metadata["subject"] = "other"
-    elif problem == "units": metadata["normalization"]["ref_volumes"] = 60
     elif problem == "smoothing": metadata["smoothing_fwhm_mm"] = 6.
     elif problem == "nuisance": metadata["regression"]["use_vent"] = False
     elif problem == "policy": metadata["processing_mask"]["nuisance_source"] = "final_t1_unsmoothed_fmriprep"
@@ -163,6 +162,23 @@ def test_refuse_changed_subject_method_units_or_model(native_runs, problem, tmp_
     with pytest.raises(ValueError):
         pool.pool_native_references(runs, output, **kwargs)
     assert not output.exists()
+
+
+def test_pool_normalization_metadata_difference_warns_without_blocking(native_runs, caplog):
+    runs, output, kwargs = native_runs
+    path = runs[1] / "session_metadata.json"
+    metadata = json.loads(path.read_text())
+    metadata["normalization"]["ref_volumes"] = 60
+    write_json(path, metadata)
+
+    result = pool.pool_native_references(runs, output, **kwargs)
+
+    assert result["n"] == 4
+    assert (output / "scores.csv").is_file()
+    assert "Reference voxel normalization differs or is unrecorded" in caplog.text
+    assert "Recorded=" in caplog.text and "current=" in caplog.text
+    # Selecting that reference must not rewrite its source metadata.
+    assert json.loads(path.read_text())["normalization"]["ref_volumes"] == 60
 
 
 def test_existing_pool_is_immutable(native_runs):

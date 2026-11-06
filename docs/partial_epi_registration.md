@@ -116,22 +116,24 @@ Changing this setting requires fresh anatomical/session preparation and renewed
 QC. Existing transforms are not silently reused as if N4 had been enabled when
 they were fitted; keep the previous preparation intact for comparison.
 
-## Session preparation and gate
+## Reference preparation and NF reuse
 
-Scans 11-30 of a current reference acquisition are unwarped, motion corrected,
-and averaged over acquired observations. Prefer a short reference block before
-NF when visual review is required. The NF launcher can prepare from its initial
-volumes if no session reference exists, but a required review stops startup;
-do not begin the timed task before preparation/QC is finished.
+Scans 11-30 of the RS or behavioral reference acquisition are unwarped, motion
+corrected, and averaged over acquired observations. Its normal preparation writes
+the current-session reference, transforms and masks once, before later NF runs.
+NF validates and reuses those files; it never builds a replacement reference from
+its own initial volumes. Missing preparation is an error. Automatic first-NF
+spatial preparation is not currently an option.
 
 ```bash
-python prepare_session.py --sub 001 --day 1 --base-data /data \
-  --incoming-root /scanner/export --reference-run 4 \
+python run_preproc.py --sub 001 --day 1 --base-data /data \
+  --incoming-root /scanner/export --epi-block 4 \
   --ap-block 2 --pa-block 3 --settings-file study_settings.json
 ```
 
 For offline reuse, add `--offline-assets /data/sub-001/offline/assets.json`
-or put the same path in the settings file used by NF.
+or put the same path in the settings file used by the reference run and NF.
+The same-day spatial output location remains the same for either source.
 
 The bridge fixes current EPI and moves the prepared EPI, using their masks.
 It is a separate rigid MI fit: 500x250x50 iterations, shrink 2x2x1, smoothing
@@ -139,7 +141,7 @@ It is a separate rigid MI fit: 500x250x50 iterations, shrink 2x2x1, smoothing
 dense-evaluation recipe. The inverse supplies current EPI -> prepared EPI. Very small slabs can
 have insufficient information; a current whole-brain EPI intermediate may help.
 
-Files in `day/func/session_trans/`:
+Files in `day/func/trans/` (bridge-specific files apply to offline-anchored preparation):
 
 - `epi_unwarped_mean.nii`, `epi_mask_mean.nii`: current MC reference/grid.
 - `epi_registration_reference.nii` and `.json`: N4 fitting copy and provenance when enabled.
@@ -149,16 +151,15 @@ Files in `day/func/session_trans/`:
 - `epi2t1_*.h5`: composed current-EPI/T1 mappings.
 - `offline_anat/`: exact anatomical images and masks.
 - `registration_qc_*.json/.png`: EPI/EPI, EPI/T1 and T1/template diagnostics.
-- `session_alignment.json`: frozen sources, settings, outputs and QC set.
+- `registration.json`, `preparation_assets.json`: completed reference preparation
+  and its source metadata. NF does not require `session_alignment.json`.
 
-Review overlays/reports, then record explicit review:
+QC reports are available for review without blocking an NF run for approval:
 
 ```bash
-python check_registration.py --trans /data/sub-001/1/func/session_trans \
-  --approve --reviewer YourName
+python check_registration.py --trans /data/sub-001/1/func/trans
 ```
 
-The gate is checked before every NF run; unchanged approvals are reused.
 Later runs retain the current-session MC target. Changed slab geometry requires
 new preparation. Run-specific fieldmaps remain native to their acquisitions.
 

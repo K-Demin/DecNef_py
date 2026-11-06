@@ -599,8 +599,8 @@ class RTSessionConfig:
     enable_scoring: bool = True
     enable_original_score: bool = False
     test_speed: bool = False
-    # RS/preparation runs establish the anatomical reference. NF runs always
-    # use a separately fitted, QC-gated first-run session EPI bridge.
+    # Reference runs establish the current-session spatial assets. NF only
+    # consumes those assets, whether fitted online or anchored to offline data.
     preparation_only: bool = False
     # Process one fixed existing-DICOM snapshot and return without a watchdog.
     recorded_only: bool = False
@@ -633,9 +633,6 @@ class RTSessionConfig:
 
     @property
     def trans_dir(self) -> Path:
-        session = self.day_root / "func" / "session_trans"
-        if not self.preparation_only and (session / "session_alignment.json").exists():
-            return session
         return self.day_root / "func" / "trans"
 
     @property
@@ -1037,10 +1034,27 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
 
     metadata_path = run_dir / "session_metadata.json"
     metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-    if metadata.get("normalization") != normalization_spec():
-        raise ValueError(
-            f"Reference scores in {run_dir} use different or unrecorded voxel normalization. "
-            "Collect/reprocess the reference run with the current JSON normalization settings."
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Invalid reference session metadata in {metadata_path}")
+    # Older behavioral references contain scores and optional readiness logs,
+    # without a preprocessing contract. Do not invent one for those recordings.
+    legacy_reference = not any(key in metadata for key in (
+        "normalization", "coverage_policy", "processing_mask", "temporal_processing_order",
+    ))
+    recorded_normalization = metadata.get("normalization")
+    current_normalization = normalization_spec()
+    if legacy_reference:
+        log.warning(
+            "[SCORE] Legacy score reference in %s has no preprocessing metadata; "
+            "using its recorded scores and legacy sample selection.", run_dir,
+        )
+    elif recorded_normalization != current_normalization:
+        # A score reference is an explicit analysis choice. Preserve its
+        # recorded units for review without holding up the live run.
+        log.warning(
+            "[SCORE] Reference voxel normalization differs or is unrecorded in %s; "
+            "using the selected score reference. Recorded=%s; current=%s",
+            run_dir, recorded_normalization, current_normalization,
         )
     # RS and NF can use different source masks/grids and different amounts of
     # padding (for example native RS EPI versus a bridged NF EPI). Compare the
@@ -1063,7 +1077,7 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
             recorded_processing = canonical_final_processing_mask(recorded_processing, legacy_zero_width)
         except ValueError:
             recorded_processing = None
-    if (metadata.get("coverage_policy") != COVERAGE_POLICY
+    if not legacy_reference and (metadata.get("coverage_policy") != COVERAGE_POLICY
             or not isinstance(recorded_processing, dict)
             or any(recorded_processing.get(key) != value
                    for key, value in expected_processing.items())):
@@ -1091,10 +1105,17 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                 reg_ready_map = None
 
     scores = []
+    scores_all = []
+    skipped_first_reg_ready = False
     with open(scores_path, newline="") as f:
         reader = csv.DictReader(f)
         has_score_reg_ready = bool(reader.fieldnames and "reg_ready" in reader.fieldnames)
         for row in reader:
+            if row.get("reference_selection_role") == "first_ready_transient":
+                # Legacy gameplay exports explicitly retain this row for the
+                # old loader to drop. Modern exports contain gameplay rows only.
+                skipped_first_reg_ready = True
+                continue
             try:
                 vol = int(row["volume_idx"])
                 raw = float(row["score_raw"])
@@ -1102,6 +1123,7 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                 continue
             if not np.isfinite(raw):
                 continue
+            scores_all.append(raw)
             score_reg_ready = None
             if has_score_reg_ready:
                 try:
@@ -1110,14 +1132,26 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
                     score_reg_ready = None
             ready = reg_ready_map.get(vol, False) if reg_ready_map is not None else score_reg_ready
             if ready is None:
-                ready = False
+                ready = legacy_reference
             if ready:
                 scores.append(raw)
 
     used_reg_ready = (reg_ready_map is not None) or has_score_reg_ready
-    skipped_first_reg_ready = False
-    # Normalization now gates the first valid score after its calibration; the
-    # old first-GLM-fit unit mismatch no longer requires dropping that score.
+    if legacy_reference:
+        # Preserve the historical loader's first-ready transient exclusion.
+        # An explicitly marked transient was already removed above.
+        if scores and not skipped_first_reg_ready:
+            scores = scores[1:]
+            skipped_first_reg_ready = True
+        if used_reg_ready and not scores:
+            log.warning(
+                "[SCORE] No usable ready legacy reference scores in %s; "
+                "falling back to its finite recorded scores.", scores_path,
+            )
+            scores = scores_all
+            used_reg_ready = False
+    # Modern normalization gates the first valid score after calibration, so
+    # its first ready value is retained unless explicitly marked as transient.
     if used_reg_ready and not scores:
         log.warning(
             "[SCORE] No normalization-ready reference scores found in %s.",
@@ -2976,13 +3010,23 @@ def validate_run_provenance(cfg):
 
 # ---------- Main ----------
 
+def validate_nf_reference(cfg, settings=None):
+    """Require the reference run's spatial files without preparing new assets."""
+    from fmri_rt_preproc.session_alignment import validate_prepared_reference
+    validate_prepared_reference(cfg, REGRESSOR_SETTINGS if settings is None else settings)
+
+
 def prepare_nf_run(cfg, settings=None):
-    """Shared parent-process preparation/QC gate, before any feedback UI starts."""
+    """Check reference-run assets and prepare only the selected run's fieldmap.
+
+    Spatial preparation belongs to RS/behavioral reference runs, never NF.
+    Launchers use validate_nf_reference before opening and run this fieldmap
+    readiness path inside their processing worker.
+    """
     if settings is not None:
         REGRESSOR_SETTINGS.update(vars(settings))
-    ensure_fieldmap_only(cfg)
     from fmri_rt_preproc.session_alignment import ensure_nf_session
-    ensure_nf_session(cfg, REGRESSOR_SETTINGS)
+    ensure_nf_session(cfg, REGRESSOR_SETTINGS, prepare_fieldmap=ensure_fieldmap_only)
 
 
 def _process_recorded_snapshot(event_handler, existing):
@@ -3026,9 +3070,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
 
     validate_regression_status_schema(cfg.rt_work_dir / "regression_status_rt.csv")
 
-    ensure_fieldmap_only(cfg)
     from fmri_rt_preproc.session_alignment import ensure_nf_session
-    ensure_nf_session(cfg, REGRESSOR_SETTINGS)
+    ensure_nf_session(cfg, REGRESSOR_SETTINGS, prepare_fieldmap=ensure_fieldmap_only)
     validate_run_provenance(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
@@ -3060,6 +3103,15 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
             event_handler.speed.arrive(parse_dicom_name(path.name)[2], backlog=True)
 
     observer.start()
+    # Handler initialization can take several seconds. Files written after the
+    # initial snapshot but before the observer started have no queued event.
+    # Subscribe first, then rescan before submitting any work. Overlapping
+    # created/closed events use the handler's existing deduplication guards.
+    existing = []
+    for path in sorted(cfg.incoming_dir.glob("*.dcm")):
+        parsed = parse_dicom_name(path.name)
+        if parsed is not None and parsed[1] == int(cfg.run):
+            existing.append(path)
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:

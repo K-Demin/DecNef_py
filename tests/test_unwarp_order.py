@@ -74,6 +74,7 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     streamed = []
     handler.volume_streamer = SimpleNamespace(publish=lambda idx, path, t1=None: streamed.append(path))
     expected_temporal = expected.astype(float)
+    expected_regression = expected.astype(float)
     expected_support = np.ones(raw.shape, bool)
     if smoothing:
         from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
@@ -83,6 +84,7 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
         mask[0] = False
         handler.smoother = MaskedGaussianSmoother(mask, np.eye(4), 0 if kind == "masked" else 4)
         expected_support = mask
+        expected_regression = np.where(mask, expected, 0.)
         expected_temporal = np.zeros(raw.shape)
         if kind == "masked":
             expected_temporal[mask] = expected[mask]
@@ -110,9 +112,9 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
 
     def checked_regression(image, volume_idx, **kwargs):
         # Native MC remains available for nuisance extraction and QC, while the
-        # response entering GLM has already been smoothed/selected.
+        # response entering GLM is selected but still unsmoothed.
         np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
-        np.testing.assert_allclose(np.asarray(image.dataobj), expected_temporal, rtol=1e-6)
+        np.testing.assert_allclose(np.asarray(image.dataobj), expected_regression, rtol=1e-6)
         np.testing.assert_array_equal(kwargs["support_mask"], expected_support)
         assert kwargs["nuisance_means"] is None
         events.append("reg")
@@ -148,7 +150,7 @@ def test_raw_unwarp_then_mc_reaches_regression_and_qc(tmp_path, monkeypatch, fal
     np.testing.assert_array_equal(handler.prev_mc_for_dvars, expected)
     np.testing.assert_array_equal(handler.proc_src.proc_data, expected)
     np.testing.assert_allclose(nib.load(cfg.rt_reg_dir / "vol_00001_reg.nii").get_fdata(),
-                               expected_temporal, rtol=1e-6)
+                               expected_regression, rtol=1e-6)
 
 
 def test_pca_unwarped_alias_and_historical_runs(tmp_path):

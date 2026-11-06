@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from test_registration_pipeline import registration, values
-from test_session_alignment import bridge, frozen_session, _prepared_day
+from test_session_alignment import bridge, _prepared_day
 import fmri_rt_preproc.pipeline as pipeline
 import fmri_rt_preproc.session_alignment as session
 from fmri_rt_preproc.epi_reference import prepare_epi_registration_reference
@@ -113,16 +113,6 @@ def test_qc_uses_original_intensity_bridge_diagnostic(bridge, monkeypatch):
     epi_report = next(args for args, kwargs in observed if kwargs["comparison"] == "epi_epi")
     assert epi_report[0] == epi
     assert epi_report[1] == folder / "session_to_reference_InverseWarped.nii"
-
-
-def test_session_rejects_changed_n4_setting_before_reusing_approved_fit(frozen_session):
-    cfg, settings, assets, folder, runner, stages, preparations = frozen_session
-    assert preparations[0].cfg.epi_reference_n4 is False
-    settings.epi_reference_n4 = True
-    before = len(runner.calls)
-    with pytest.raises(ValueError, match="inputs/QC policy changed"):
-        session.ensure_nf_session(cfg, settings)
-    assert len(runner.calls) == before
 
 
 @pytest.mark.parametrize("suffix", [".nii", ".nii.gz"])
