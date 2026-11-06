@@ -385,10 +385,24 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
 
 
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
-    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+    # Start independent preparation immediately in this child while the main
+    # process opens the presentation. Never wait for SPACE or scanner triggers.
+    try:
+        from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    REGRESSOR_SETTINGS.update(settings)
-    run_rt_pipeline(cfg, score_queue)
+        REGRESSOR_SETTINGS.update(settings)
+        run_rt_pipeline(cfg, score_queue)
+    except Exception as exc:
+        try:
+            score_queue.put_nowait({"pipeline_error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+        raise
+
+
+def _raise_if_pipeline_failed(message):
+    if message.get("pipeline_error"):
+        raise RuntimeError(f"Real-time processing failed: {message['pipeline_error']}")
 
 
 
@@ -1243,7 +1257,7 @@ def run_robot_task_presentation(
     while True:
         try:
             while True:
-                score_queue.get_nowait()
+                _raise_if_pipeline_failed(score_queue.get_nowait())
         except Empty:
             pass
         waiting_text.draw()
@@ -1425,6 +1439,7 @@ def run_robot_task_presentation(
         try:
             while True:
                 message = score_queue.get_nowait()
+                _raise_if_pipeline_failed(message)
                 vol_idx = int(message.get("volume_idx", 0))
                 if vol_idx:
                     if vol_idx not in seen_vols:
@@ -1878,7 +1893,7 @@ def main() -> None:
     parser.add_argument(
         "--rs",
         dest="reference_score_run",
-        help="Reference run ID for z-scoring (uses scores.csv from that run).",
+        help="Score-reference run ID or folder. With offline assets, defaults to this subject's offline/func/pooled_reference.",
     )
     parser.add_argument(
         "--pca-mode",
@@ -2075,6 +2090,13 @@ def main() -> None:
     if use_pca and args.decoder_roi_txt:
         log.info("PCA score source enabled: ignoring --decoder-roi-txt=%s", args.decoder_roi_txt)
 
+    if (not use_pca and args.feedback_signal == "z" and not args.reference_score_run
+            and getattr(REGRESSOR_SETTINGS, "offline_assets", None)):
+        offline_reference = (subject_root / "offline" / "func" / "pooled_reference").resolve()
+        if (offline_reference / "scores.csv").is_file():
+            args.reference_score_run = str(offline_reference)
+            log.info("[SCORE] Using pooled offline score reference: %s", offline_reference)
+
     cfg_decoder_template = (
         None
         if use_pca
@@ -2093,9 +2115,6 @@ def main() -> None:
         ap_block=args.ap_block,
         pa_block=args.pa_block,
     )
-
-    from rt_pipeline import prepare_nf_run
-    prepare_nf_run(cfg)
 
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)

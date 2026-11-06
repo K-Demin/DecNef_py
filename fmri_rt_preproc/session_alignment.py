@@ -184,17 +184,68 @@ def prepared_assets(cfg):
     return result
 
 
-def ensure_nf_session(cfg, settings):
-    """Build the first NF reference once, then enforce its session-bound QC gate.
+def _require_prepared_reference(cfg, settings):
+    """Check the existing same-session RS assets without fitting another bridge.
 
+    These are the actual motion target, native nuisance masks and transform
+    files the live pipeline will use. Do not import an offline anchor or select
+    a prior ``session_trans`` directory while reusing this reference.
+    """
+    folder = cfg.day_root / "func" / "trans"
+    required = {
+        "corrected EPI reference": cfg.rt_unwarped_analysis_ref_epi,
+        "EPI brain mask": cfg.rt_unwarped_analysis_ref_mask,
+    }
+    native_masks = [cfg.rt_unwarped_analysis_ref_mask]
+    if getattr(settings, "enable_motion_regression", False):
+        for label, enabled, path in (
+                ("WM nuisance mask", "use_wm", cfg.rt_wm_mask),
+                ("ventricle nuisance mask", "use_vent", cfg.rt_vent_mask)):
+            if getattr(settings, enabled, False):
+                required[label] = path
+                native_masks.append(path)
+    space = str(getattr(settings, "analysis_space", "mni")).lower()
+    mask_space = ("t1" if getattr(settings, "analysis_mask", "whole_brain") == "cortical_gm"
+                  else getattr(settings, "analysis_mask_space", "final")
+                  if getattr(settings, "analysis_mask", "whole_brain") == "custom" else "epi")
+    if space in {"t1", "mni"}:
+        required["EPI-to-T1 transform"] = folder / "epi2t1_Composite.h5"
+    elif space == "epi" and mask_space == "t1":
+        required["T1-to-EPI transform"] = folder / "epi2t1_InverseComposite.h5"
+    if space == "mni":
+        required["T1-to-MNI transform"] = t1_to_mni_transform(cfg)
+    missing = [f"{label}: {path}" for label, path in required.items()
+               if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError(
+            "Prepared RS/behavioral reference is incomplete in " + str(folder) + ". "
+            "Run the reference preparation for this subject/day first. Missing: " + "; ".join(missing))
+    reference = nib.load(str(cfg.rt_unwarped_analysis_ref_epi))
+    for path in native_masks:
+        require_same_grid(nib.load(str(path)), reference)
+
+
+def ensure_nf_session(cfg, settings, prepare_fieldmap=None):
+    """Build the first NF reference once and save QC for post-run review.
+
+    A same-session prepared RS/behavioral reference can be reused directly.
     Scans 11-30 of the first reference acquisition supply a current-grid reference.
-    A restart after reviewing QC reuses the frozen alignment. Subsequent NF
-    runs use that same motion target; each incoming volume's grid is checked.
+    Otherwise subsequent NF runs reuse that frozen alignment and its checks.
+    Diagnostic QC never requires operator approval during an acquisition.
     """
     if getattr(cfg, "preparation_only", False):
+        if prepare_fieldmap is not None:
+            prepare_fieldmap(cfg)
+        return
+    if getattr(cfg, "reuse_prepared_reference", False):
+        if getattr(settings, "offline_assets", None):
+            raise ValueError("reuse_prepared_reference requires the same-session RS/behavioral "
+                             "reference; offline_assets needs the current-session EPI bridge.")
+        _require_prepared_reference(cfg, settings)
+        if prepare_fieldmap is not None:
+            prepare_fieldmap(cfg)
         return
     from .offline_assets import load_offline_assets, bundle_identity
-    from .registration_qc import assert_qc_gate
     from .utils import run
     folder = cfg.day_root / "func" / "session_trans"
     marker = folder / "session_alignment.json"
@@ -223,24 +274,30 @@ def ensure_nf_session(cfg, settings):
         for record in saved["outputs"]:
             if file_identity(record["path"]) != record:
                 raise ValueError("Session alignment output changed; prepare a new session directory.")
-        assert_qc_gate([Path(p) for p in saved["qc_reports"]])
+        if prepare_fieldmap is not None:
+            prepare_fieldmap(cfg)
         return
-    if folder.exists() and any(folder.iterdir()):
-        raise ValueError(f"Incomplete session preparation in {folder}; inspect it and use a fresh session directory.")
+    if folder.exists():
+        # An interrupted pre-acquisition wait may contain only imported anatomy.
+        # It is safe to stage that again; never adopt a partial EPI fit instead.
+        anatomy_staging = {"t1_to_mni.h5", "t1_to_mni.nii", "t1_to_mni.nii.gz",
+                           "t1_to_mni_Composite.h5"}
+        for entry in folder.iterdir():
+            if entry.name == "offline_anat" and entry.is_dir():
+                continue
+            if entry.name in anatomy_staging and entry.is_file():
+                continue
+            raise ValueError(f"Incomplete session preparation in {folder}; inspect it and use a fresh session directory.")
     folder.mkdir(parents=True, exist_ok=True)
     from run_preproc import _stage_epi_block, _wait_for_epi_dicoms
     from .config import SubjectDayConfig
     from .pipeline import FMRIRealtimePreprocessor
     from .native_fieldmap import find_source
-    _wait_for_epi_dicoms(cfg.incoming_dir, int(cfg.run), expected=20)
     raw_dir = folder / "reference_input"
-    files = _stage_epi_block(cfg.incoming_dir, int(cfg.run), raw_dir)
     merged = raw_dir / "epi_4d.nii.gz"
-    run(["fslmerge", "-t", str(merged)] + [str(p) for p in files])
     prep_cfg = SubjectDayConfig.for_single_run(
         cfg.subject, cfg.day, cfg.day_root, str(cfg.run), merged,
-        t1_file=assets["t1"], ap_file=find_source(cfg.fmap_dir, "AP"),
-        pa_file=find_source(cfg.fmap_dir, "PA"), fieldmap_dir=cfg.fmap_dir,
+        t1_file=assets["t1"], fieldmap_dir=cfg.fmap_dir,
         mni_template=assets["mni_template"],
         registration_direction=settings.registration_direction,
         registration_initialization=settings.registration_initialization,
@@ -255,7 +312,16 @@ def ensure_nf_session(cfg, settings):
     pipe.trans_dir, pipe.anat_dir, pipe.offline_assets = folder, folder / "offline_anat", assets
     pipe.rt_unwarped_analysis_ref_epi = folder / "epi_unwarped_mean.nii"
     pipe.rt_unwarped_analysis_ref_mask = folder / "epi_mask_mean.nii"
+    # Imported anatomy and its masks need no current EPI or fieldmap. Stage
+    # them immediately while the presentation/acquisition starts independently.
     pipe._prepare_anat()
+    if prepare_fieldmap is not None:
+        prepare_fieldmap(cfg)
+    prep_cfg.ap_file = find_source(cfg.fmap_dir, "AP")
+    prep_cfg.pa_file = find_source(cfg.fmap_dir, "PA")
+    _wait_for_epi_dicoms(cfg.incoming_dir, int(cfg.run), expected=20)
+    files = _stage_epi_block(cfg.incoming_dir, int(cfg.run), raw_dir)
+    run(["fslmerge", "-t", str(merged)] + [str(p) for p in files])
     unwarped = raw_dir / "epi_unwarped.nii"
     pipe._unwarp_epi(merged, unwarped)
     pipe._motion_correct_and_mean(unwarped, pipe.rt_unwarped_analysis_ref_epi, 20)
@@ -271,10 +337,9 @@ def ensure_nf_session(cfg, settings):
                folder / "session_to_reference_Composite.h5", folder / "session_to_reference_InverseComposite.h5",
                t1_to_mni_transform(SimpleNamespace(trans_dir=folder, subject_root=cfg.subject_root))]
     outputs += reference_preparation_outputs(folder)
-    # The EPI/EPI QC image must also be immutable after review.
+    # Keep the diagnostic EPI/EPI image tied to the fitted alignment.
     outputs += [folder / "session_to_reference_InverseWarped.nii"]
     payload = {"version": 1, "reference_run": str(cfg.run), "sources": source_id, "settings": options,
                "qc_policy": policy_id, "qc_reports": [str(p.resolve()) for p in reports],
                "outputs": [file_identity(p) for p in outputs]}
     marker.write_text(json.dumps(payload, indent=2) + "\n")
-    assert_qc_gate(reports)

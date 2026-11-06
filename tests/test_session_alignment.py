@@ -13,7 +13,7 @@ matplotlib.use("Agg")
 import test_rt_pipeline_parallel as headless  # Optional GUI/native RTPSpy dependencies.
 from fmri_rt_preproc import session_alignment as session
 from fmri_rt_preproc.offline_assets import copy_image
-from fmri_rt_preproc.registration_qc import approve_registration_qc, build_registration_qc
+from fmri_rt_preproc.registration_qc import build_registration_qc
 
 
 def _image(path, shape, affine, mask=False):
@@ -201,19 +201,19 @@ def frozen_session(tmp_path, monkeypatch):
                 "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii")]
 
     monkeypatch.setattr("fmri_rt_preproc.pipeline.FMRIRealtimePreprocessor", Preparation)
-    with pytest.raises(ValueError, match="needs visual approval"):
-        session.ensure_nf_session(cfg, settings)
+    session.ensure_nf_session(cfg, settings)
     folder = day / "func" / "session_trans"
     marker = json.loads((folder / "session_alignment.json").read_text())
     assert marker["reference_run"] == "4"
     assert len(preparations) == 1
-    for path in marker["qc_reports"]:
-        approve_registration_qc(path, reviewer="Unit test reviewer")
+    assert all(json.loads(Path(path).read_text())["gate_status"] == "review_required"
+               for path in marker["qc_reports"])
+    assert not list(folder.glob("*.approval.json"))
     return cfg, settings, assets, folder, runner, stages, preparations
 
 
 @pytest.mark.parametrize("offline", [False, True])
-def test_first_nf_is_frozen_and_reused_across_runs_after_bound_review(frozen_session, offline):
+def test_first_nf_is_frozen_and_reused_across_runs_without_visual_approval(frozen_session, offline):
     cfg, settings, assets, folder, runner, stages, preparations = frozen_session
     assert stages[0][0] == (cfg.incoming_dir, 4)
     assert stages[0][1] == {"expected": 20}
@@ -231,6 +231,25 @@ def test_first_nf_uses_online_phase_encoding(frozen_session):
     assert preparations[0].cfg.epi_phase_encoding == settings.epi_phase_encoding
 
 
+def test_failed_diagnostic_qc_does_not_block_live_session(frozen_session):
+    cfg, settings, assets, folder, runner, _, preparations = frozen_session
+    image = nib.load(assets["t1_mask"])
+    empty = folder / "diagnostic_empty_mask.nii"
+    nib.save(nib.Nifti1Image(np.zeros(image.shape, np.uint8), image.affine), empty)
+    report = folder / "registration_qc_epi_epi.json"
+    result = build_registration_qc(
+        assets["t1"], assets["t1"], assets["t1_mask"], comparison="epi_epi",
+        aligned_mask_file=empty, output_json=report,
+        transform_files=[folder / "epi2t1_Composite.h5"])
+    saved = json.loads(report.read_text())
+    assert saved["gate_status"] == "fail" and saved["hard_failures"]
+    count = len(runner.calls)
+    cfg.run = "7"
+    session.ensure_nf_session(cfg, settings)
+    assert len(runner.calls) == count and len(preparations) == 1
+    assert not list(folder.glob("*.approval.json"))
+
+
 def test_anatomical_policy_does_not_change_frozen_epi_bridge(frozen_session):
     cfg, settings, _, _, runner, _, preparations = frozen_session
     count = len(runner.calls)
@@ -241,8 +260,8 @@ def test_anatomical_policy_does_not_change_frozen_epi_bridge(frozen_session):
     assert preparations[0].cfg.registration_bridge_initialization == 'identity'
 
 
-@pytest.mark.parametrize("change", ["source", "output", "policy", "initialization", "version", "approval", "omitted_report"])
-def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_session, change):
+@pytest.mark.parametrize("change", ["source", "output", "policy", "initialization", "version", "omitted_report"])
+def test_session_cache_rejects_changed_source_output_policy_or_report_set(frozen_session, change):
     cfg, settings, assets, folder, runner, stages, preparations = frozen_session
     if change == "source":
         assets["epi_to_t1"].write_text("changed transform")
@@ -261,9 +280,6 @@ def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_ses
         else:
             marker["qc_reports"] = marker["qc_reports"][:1]
         path.write_text(json.dumps(marker))
-    else:
-        approval = folder / "registration_qc_epi_epi.approval.json"
-        approval.unlink()
     count = len(runner.calls)
     with pytest.raises(ValueError):
         session.ensure_nf_session(cfg, settings)
@@ -271,10 +287,15 @@ def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_ses
     assert len(preparations) == 1
 
 
-def test_incomplete_session_does_not_adopt_unvalidated_outputs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("partial", ["epi2t1_Composite.h5", "registration_pending.json",
+                                      "reference_input", "unknown.nii", "offline_anat"])
+def test_incomplete_session_does_not_adopt_unvalidated_outputs(tmp_path, monkeypatch, partial):
     folder = tmp_path / "func" / "session_trans"
     folder.mkdir(parents=True)
-    (folder / "epi2t1_Composite.h5").write_bytes(b"interrupted output")
+    if partial == "reference_input":
+        (folder / partial).mkdir()
+    else:
+        (folder / partial).write_bytes(b"interrupted output")
     monkeypatch.setattr(session, "prepared_assets", lambda cfg: {})
     cfg = SimpleNamespace(preparation_only=False, day_root=tmp_path)
     settings = SimpleNamespace(offline_assets=None, registration_qc_policy=None,
@@ -285,6 +306,73 @@ def test_incomplete_session_does_not_adopt_unvalidated_outputs(tmp_path, monkeyp
 
 def test_preparation_run_does_not_build_nf_reference(tmp_path):
     session.ensure_nf_session(SimpleNamespace(preparation_only=True), SimpleNamespace())
+    assert not list(tmp_path.iterdir())
+
+
+def test_offline_anatomy_starts_before_fieldmaps_and_incoming_epi(frozen_session, monkeypatch):
+    cfg, settings, _, _, _, _, preparations = frozen_session
+    cfg = SimpleNamespace(**vars(cfg))
+    cfg.day_root = cfg.day_root.with_name("eager")
+    cfg.day = "eager"
+    cfg.fmap_dir = cfg.day_root / "fmap"
+    settings.offline_assets = Path("assets.json")
+    order = []
+    preparation = type(preparations[0])
+    original = preparation._prepare_anat
+
+    def anatomy(pipe):
+        order.append("anatomy")
+        original(pipe)
+
+    def fieldmaps(current):
+        assert current is cfg and order == ["anatomy"]
+        assert (cfg.day_root / "func/session_trans/offline_anat").is_dir()
+        assert not (cfg.day_root / "func/session_trans/reference_input/epi_4d.nii.gz").exists()
+        order.append("fieldmaps")
+        for name in ("AP", "PA"):
+            _image(cfg.fmap_dir / (name + ".nii"), (7, 8, 4), np.eye(4))
+
+    def wait(*args, **kwargs):
+        assert order == ["anatomy", "fieldmaps"]
+        order.append("wait")
+
+    monkeypatch.setattr(preparation, "_prepare_anat", anatomy)
+    monkeypatch.setattr("run_preproc._wait_for_epi_dicoms", wait)
+    session.ensure_nf_session(cfg, settings, prepare_fieldmap=fieldmaps)
+    assert order == ["anatomy", "fieldmaps", "wait"]
+
+
+def test_anatomy_only_staging_restarts_without_adopting_an_epi_fit(frozen_session, monkeypatch):
+    cfg, settings, _, _, _, _, preparations = frozen_session
+    cfg = SimpleNamespace(**vars(cfg))
+    cfg.day_root = cfg.day_root.with_name("retry")
+    cfg.day = "retry"
+    folder = cfg.day_root / "func/session_trans"
+    anatomy = folder / "offline_anat"
+    anatomy.mkdir(parents=True)
+    (anatomy / "T1_N4.nii").write_bytes(b"interrupted anatomy staging")
+    (folder / "t1_to_mni.h5").write_text("staged template transform")
+    preparation = type(preparations[0])
+    original = preparation._prepare_anat
+    calls = []
+
+    def restage(pipe):
+        calls.append("anatomy")
+        # The production importer creates/refreshes canonical anatomy outputs.
+        pipe.anat_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(preparation, "_prepare_anat", restage)
+    session.ensure_nf_session(cfg, settings)
+    assert calls == ["anatomy"]
+    assert (folder / "session_alignment.json").is_file()
+    assert len(preparations) == 2
+
+
+def test_preparation_only_still_prepares_fieldmaps_without_building_session(tmp_path):
+    cfg = SimpleNamespace(preparation_only=True)
+    calls = []
+    session.ensure_nf_session(cfg, SimpleNamespace(), prepare_fieldmap=calls.append)
+    assert calls == [cfg]
     assert not list(tmp_path.iterdir())
 
 

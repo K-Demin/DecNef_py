@@ -57,7 +57,10 @@ def test_recorded_runtime_never_constructs_observer_or_activates_online(tmp_path
     monkeypatch.setattr(rt, "load_reference_score_stats", lambda *args: None)
     monkeypatch.setattr(rt, "write_session_metadata", lambda *args: None)
     import fmri_rt_preproc.session_alignment as alignment
-    monkeypatch.setattr(alignment, "ensure_nf_session", lambda *args: None)
+    def prepare_session(cfg, settings, prepare_fieldmap=None):
+        if prepare_fieldmap is not None:
+            prepare_fieldmap(cfg)
+    monkeypatch.setattr(alignment, "ensure_nf_session", prepare_session)
     handler = Handler()
     calls = []
     monkeypatch.setattr(rt, "DICOMHandler", lambda cfg, **kwargs: (calls.append(kwargs), handler)[1])

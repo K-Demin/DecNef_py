@@ -1,4 +1,4 @@
-"""RS score references require compatible voxel units and spatial processing."""
+"""Score-reference normalization differences warn without blocking live runs."""
 import json
 from types import SimpleNamespace
 
@@ -25,18 +25,25 @@ def reference_run(tmp_path):
     return run, SimpleNamespace(day_root=tmp_path)
 
 
-@pytest.mark.parametrize("change", ["missing", "mode", "reference", "ref_volumes"])
-def test_reject_reference_with_unverified_or_different_voxel_units(tmp_path, change):
+@pytest.mark.parametrize("change", [
+    "missing", "mode", "reference", "ref_volumes", "version", "glm_input_units", "zscore_startup",
+])
+def test_reference_with_unverified_or_different_voxel_units_warns_and_loads(tmp_path, change, caplog):
     run, cfg = reference_run(tmp_path)
+    path = run / "session_metadata.json"
+    metadata = json.loads(path.read_text())
     spec = rt.normalization_spec()
     if change == "missing":
         spec = None
     else:
         spec[change] = "different"
-    (run / "session_metadata.json").write_text(json.dumps({"normalization": spec}))
+    metadata["normalization"] = spec
+    path.write_text(json.dumps(metadata))
     (run / "scores.csv").write_text("volume_idx,score_raw,reg_ready\n1,3,1\n2,5,1\n")
-    with pytest.raises(ValueError, match="voxel normalization"):
-        rt.load_reference_score_stats(cfg, "1")
+    result = rt.load_reference_score_stats(cfg, "1")
+    assert (result["mean"], result["std"], result["n"]) == (4, 1, 2)
+    assert "Reference voxel normalization differs or is unrecorded" in caplog.text
+    assert "Recorded=" in caplog.text and "current=" in caplog.text
 
 
 def test_use_first_ready_score_and_exclude_calibration_and_nonfinite(tmp_path):
@@ -48,7 +55,7 @@ def test_use_first_ready_score_and_exclude_calibration_and_nonfinite(tmp_path):
     assert not result["skipped_first_reg_ready"]
 
 
-def test_reject_reference_from_removed_second_calibration_window(tmp_path, monkeypatch):
+def test_reference_from_different_calibration_window_warns_and_loads(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(rt, "REGRESSOR_SETTINGS", SimpleNamespace(
         voxel_norm_mode="zscore", voxel_norm_reference="fixed", voxel_norm_ref_volumes=30,
         enable_motion_regression=True, analysis_space="epi"))
@@ -59,8 +66,9 @@ def test_reject_reference_from_removed_second_calibration_window(tmp_path, monke
     metadata["normalization"]["version"] = 1
     path.write_text(json.dumps(metadata))
     (run / "scores.csv").write_text("volume_idx,score_raw,reg_ready\n60,3,1\n61,5,1\n")
-    with pytest.raises(ValueError, match="voxel normalization"):
-        rt.load_reference_score_stats(cfg, "1")
+    result = rt.load_reference_score_stats(cfg, "1")
+    assert (result["mean"], result["std"], result["n"]) == (4, 1, 2)
+    assert "Reference voxel normalization differs or is unrecorded" in caplog.text
 
 
 @pytest.mark.parametrize("rows", ["1,1000,0\n2,2000,0\n", "1,1000,\n2,2000,\n"])

@@ -126,12 +126,34 @@ def _merge_session_metadata(run_dir: Path, payload: dict[str, Any]) -> None:
 
 
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: mp.Queue, settings: dict[str, Any]) -> None:
-    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+    try:
+        from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    for key, value in settings.items():
-        if hasattr(REGRESSOR_SETTINGS, key):
-            setattr(REGRESSOR_SETTINGS, key, value)
-    run_rt_pipeline(cfg, score_queue)
+        for key, value in settings.items():
+            if hasattr(REGRESSOR_SETTINGS, key):
+                setattr(REGRESSOR_SETTINGS, key, value)
+        run_rt_pipeline(cfg, score_queue)
+    except Exception as exc:
+        try:
+            score_queue.put_nowait({"pipeline_error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+        raise
+
+
+def _drain_pipeline_scores(score_queue):
+    """Poll without waiting; surface worker failures instead of default feedback."""
+    messages = []
+    if score_queue is not None:
+        try:
+            while True:
+                message = score_queue.get_nowait()
+                if message.get("pipeline_error"):
+                    raise RuntimeError(f"Real-time processing failed: {message['pipeline_error']}")
+                messages.append(message)
+        except Empty:
+            pass
+    return messages
 
 
 class SyntheticScoreSource:
@@ -424,10 +446,17 @@ def _run_legacy_brainpong_presentation(
     sim_mouse = event.Mouse(win=win) if sim_cfg.get("enabled") and str(sim_cfg.get("input_method", "")).lower() in {"mouse_wheel", "wheel"} else None
 
     first_trigger_timestamp: Optional[float] = None
+    pending_scores = []
     if not sim_cfg.get("enabled") or bool(task_cfg.get("wait_for_trigger_in_simulation", False)):
         while True:
             waiting_text.draw()
             win.flip()
+            try:
+                pending_scores.extend(_drain_pipeline_scores(score_queue))
+            except RuntimeError:
+                win.close()
+                logger.finish()
+                raise
             keys = event.getKeys()
             if "s" in keys:
                 first_trigger_timestamp = time.time()
@@ -441,7 +470,8 @@ def _run_legacy_brainpong_presentation(
         first_trigger_timestamp = time.time()
 
     def drain_scores(block_idx: int, trial_idx: int, target_direction: str) -> BrainPongScoreState:
-        messages: list[dict[str, Any]] = []
+        messages: list[dict[str, Any]] = pending_scores[:]
+        pending_scores.clear()
         if source and (time.time() - drain_scores.last_sim_time) >= float(cfg.get("TR", 1.0)):
             msg = source.next_score()
             drain_scores.last_sim_time = time.time()
@@ -449,12 +479,7 @@ def _run_legacy_brainpong_presentation(
                 messages.append(msg)
         if tailer:
             messages.extend(tailer.drain())
-        if score_queue is not None:
-            try:
-                while True:
-                    messages.append(score_queue.get_nowait())
-            except Empty:
-                pass
+        messages.extend(_drain_pipeline_scores(score_queue))
 
         state = adapter.current_state()
         for message in messages:
@@ -774,10 +799,17 @@ def run_brainpong_presentation(
         else None
     )
 
+    pending_scores = []
     if not sim_cfg.get("enabled") or bool(task_cfg.get("wait_for_trigger_in_simulation", False)):
         while True:
             waiting_text.draw()
             win.flip()
+            try:
+                pending_scores.extend(_drain_pipeline_scores(score_queue))
+            except RuntimeError:
+                win.close()
+                logger.finish()
+                raise
             keys = event.getKeys()
             if "s" in keys:
                 break
@@ -804,7 +836,8 @@ def run_brainpong_presentation(
 
     def drain_scores() -> BrainPongScoreState:
         nonlocal latest_state
-        messages: list[dict[str, Any]] = []
+        messages: list[dict[str, Any]] = pending_scores[:]
+        pending_scores.clear()
         if sim_cfg.get("enabled"):
             manual = None
             response = ""
@@ -832,12 +865,7 @@ def run_brainpong_presentation(
                 messages.append(message)
         if tailer:
             messages.extend(tailer.drain())
-        if score_queue is not None:
-            try:
-                while True:
-                    messages.append(score_queue.get_nowait())
-            except Empty:
-                pass
+        messages.extend(_drain_pipeline_scores(score_queue))
 
         # Pipeline completion order need not equal acquisition order.
         messages.sort(key=lambda m: int(m.get("volume_idx") or m.get("volume_index") or 0))
@@ -1254,8 +1282,12 @@ def main() -> None:
 
     if runs_pipeline:
         rt_cfg = _prepare_rt_config(args, cfg)
-        from rt_pipeline import prepare_nf_run
-        prepare_nf_run(rt_cfg, rt_settings)
+        # Online behavioral reference processing already established this day's
+        # MC target, masks and spatial transforms. Reuse those assets directly;
+        # a supplied offline bundle still needs its current-session EPI bridge.
+        rt_cfg.reuse_prepared_reference = not bool(rt_settings.offline_assets)
+        from rt_pipeline import REGRESSOR_SETTINGS
+        REGRESSOR_SETTINGS.update(vars(rt_settings))
         if uses_reference_score:
             from rt_pipeline import load_reference_score_stats
 
