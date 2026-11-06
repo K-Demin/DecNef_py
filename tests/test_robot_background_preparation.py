@@ -117,7 +117,10 @@ def test_presentation_checks_worker_errors_in_wait_and_active_loops():
                    and node.func.id == "_raise_if_pipeline_failed" for node in ast.walk(loop))
 
 
-def test_actual_main_opens_presentation_while_background_preparation_is_blocked(monkeypatch, tmp_path):
+@pytest.mark.parametrize("preparation_available", [True, False])
+@pytest.mark.parametrize("offline_assets", [None, "/offline/prepared-reference"])
+def test_actual_main_validates_then_opens_presentation_while_fieldmap_is_blocked(
+        monkeypatch, tmp_path, preparation_available, offline_assets):
     main = function("main")
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                    and node.func.id == "prepare_nf_run" for node in ast.walk(main))
@@ -137,7 +140,20 @@ def test_actual_main_opens_presentation_while_background_preparation_is_blocked(
         chronology.append("processing")
         done.set()
 
-    run_worker, _ = worker(monkeypatch, process)
+    run_worker, runtime = worker(monkeypatch, process)
+
+    def validate(cfg):
+        chronology.append("validate_reference")
+        if not preparation_available:
+            raise FileNotFoundError("Prepared reference missing; run reference preparation first")
+
+    runtime.validate_nf_reference = validate
+    # Retain the real validation call and process/UI tail. Intermediate condition
+    # assignment is independent of this boundary and is supplied below.
+    validation_index = next(index for index, node in enumerate(main.body)
+        if isinstance(node, ast.ImportFrom) and node.module == "rt_pipeline"
+        and any(alias.name == "validate_nf_reference" for alias in node.names))
+    boundary = [*main.body[validation_index:validation_index + 2], *main.body[first:]]
 
     class Process:
         def __init__(self, target, args):
@@ -176,18 +192,27 @@ def test_actual_main_opens_presentation_while_background_preparation_is_blocked(
         result_sec=3., rest_baseline_sec=0., start_level=None, jingle=None,
         jingle_volume=.8, audio_lib=None, audio_device=None)
     namespace = dict(ctx=SimpleNamespace(Process=Process, Event=threading.Event),
-        _run_pipeline_with_settings=run_worker, cfg=object(), score_queue=Queue(),
-        settings_payload={"TR": 1.}, use_pca=False, args=args,
+        _run_pipeline_with_settings=run_worker, cfg=SimpleNamespace(), score_queue=Queue(),
+        settings_payload={"TR": 1., "offline_assets": offline_assets}, use_pca=False, args=args,
         run_robot_task_presentation=present, condition=object(),
         condition_scores_path=tmp_path / "condition.csv", max_trs=100,
         REGRESSOR_SETTINGS=SimpleNamespace(TR=1.), rest_lead_s=45., subject_root=tmp_path,
         log=logging.getLogger("robot-startup-test"), biopac_stop=None, biopac_process=None,
         _plot_qc=lambda path: None, run_dir=tmp_path)
     try:
-        exec(compile(ast.Module(body=main.body[first:], type_ignores=[]), str(SOURCE), "exec"), namespace)
+        if preparation_available:
+            exec(compile(ast.Module(body=boundary, type_ignores=[]), str(SOURCE), "exec"), namespace)
+        else:
+            with pytest.raises(FileNotFoundError, match="run reference preparation first"):
+                exec(compile(ast.Module(body=boundary, type_ignores=[]), str(SOURCE), "exec"), namespace)
     finally:
         release.set()
         if "pipeline_process" in namespace:
             namespace["pipeline_process"].join(timeout=2)
     assert not failures
-    assert chronology == ["preparation", "visible", "background", "processing"]
+    assert not hasattr(namespace["cfg"], "reuse_prepared_reference")
+    if preparation_available:
+        assert chronology == ["validate_reference", "preparation", "visible", "background", "processing"]
+    else:
+        assert chronology == ["validate_reference"]
+        assert list(tmp_path.iterdir()) == []

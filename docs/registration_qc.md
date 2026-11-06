@@ -1,11 +1,11 @@
-# Registration QC before neurofeedback
+# Registration QC reports
 
 Registration produces aligned images; QC checks those results. A numerical
-similarity is not proof of anatomical alignment. The first NF preparation in
-each session generates reports for the current session reference and its
-transform chain. The NF launcher checks the expected report set and current
-assets before continuing. Review approval is reused only while its inputs and
-QC policy remain unchanged.
+similarity is not proof of anatomical alignment. RS or behavioral reference
+preparation generates reports for the current-session reference and its transform
+chain in `<day>/func/trans/`. NF reuses the prepared spatial files and does not
+perform another reference fit. These reports support review; NF does not wait for
+manual QC approval during acquisition.
 
 ## Reports and review
 
@@ -21,22 +21,22 @@ limits, and missing signal. The montage samples three planes; inspect the
 NIfTIs in a viewer when additional locations are needed.
 
 ```bash
-python check_registration.py --trans /path/to/session/func/session_trans
+python check_registration.py --trans /path/to/session/func/trans
 ```
 
 Without validated automatic criteria, this prints `review_required` and exits
 with status 1. After inspecting the images, explicitly record the review:
 
 ```bash
-python check_registration.py --trans /path/to/session/func/session_trans \
+python check_registration.py --trans /path/to/session/func/trans \
   --approve --reviewer "Operator name" --note "Checked anatomy and slab coverage"
 ```
 
 This creates `.approval.json` sidecars bound to the report IDs. It does not
 perform a visual review automatically. Reports that failed data or configured
 threshold checks cannot be waived by this command. Correct the cause and
-regenerate QC. Repeat the original NF command after approval; the launcher
-checks that the session assets and complete expected report set still match.
+regenerate QC. Approval records belong to this optional review command; an NF
+launcher does not require those sidecars.
 
 The optional `--weights decoder.nii.gz --min-frac 0.90` preserves the old
 decoder signal-presence guard. It counts nonzero decoder voxels with EPI

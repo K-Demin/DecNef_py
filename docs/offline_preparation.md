@@ -244,7 +244,7 @@ and, for an enhanced bridge anchor, `reference_epi_registration.nii` in the
 transform folder. Earlier isolated Linux measurements took about 4.1 seconds
 per N4 reference; an old unenhanced anchor can require another correction.
 Those measurements are not a full new-session runtime benchmark. Changing
-the setting requires a fresh preparation/session directory and new QC approval.
+the setting requires fresh reference-run preparation and renewed QC review.
 
 Direct preparation can consume the bundle:
 
@@ -256,29 +256,32 @@ python run_preproc.py --sub 99988 --day session-10 \
   --offline-assets /offline/sub-99988/reference-v1/assets.json
 ```
 
-To initialize the current session before neurofeedback:
+Standard RS or the behavioral reference run performs the same preparation through
+`run_preproc.py`. Scans 11–30 establish the current-session reference; the imported
+bundle supplies its offline anchor and anatomical mappings. The resulting reference,
+composed transforms, masks and QC reports use the existing `<day>/func/trans/`
+layout for both online-fitted and offline-anchored studies.
+
+Every NF launcher requires those prepared current-session files. It does not collect
+reference EPIs, fit a bridge, or create a replacement spatial preparation. Missing
+files produce an error directing the operator to the reference run. An older
+`func/session_trans/` directory is not automatically selected or migrated.
+
+`offline_assets` in the JSON selects the bundle used by the reference preparation;
+the same profile identifies that bundle during NF validation. `--rs` independently
+selects the decoder-score reference directory. No extra spatial-reference mode flag
+or NF preparation command is needed. The compatibility `prepare_session.py` command
+now only validates an existing `func/trans/`; it does not create one.
+
+The run's fieldmap pair must match the current acquisition. A new selected pair can
+still be prepared by the processing worker; it does not replace the fixed EPI target
+or repeat anatomical registration. Offline assets do not replace that fieldmap pair.
+
+Registration QC is saved for inspection without a manual approval gate in NF.
+The optional report-review command remains available:
 
 ```bash
-python prepare_session.py --sub 99988 --day session-10 --reference-run 4 \
-  --base-data /data --incoming-root /scanner/session-10 \
-  --ap-block 2 --pa-block 3 --settings-file /profiles/sub-99988.json
-```
-
-Reference scans 11–30 form the current-session reference. Use a separate reference
-acquisition before the timed NF task when visual QC is required. If preparation
-uses the first NF run itself, startup waits for preparation/QC; the processor then
-handles existing volumes using its normal skip/warmup settings. It does not
-automatically start at scan 31. Session assets are written to `func/session_trans`;
-later runs reuse the accepted alignment.
-The session fieldmap pair must match the current acquisition. The bundle does
-not replace that pair.
-
-Inspect the generated `registration_qc_*.png/json` reports. With no QC policy,
-manual review is required:
-
-```bash
-python check_registration.py --trans /data/sub-99988/session-10/func/session_trans \
-  --approve --reviewer YOUR_NAME
+python check_registration.py --trans /data/sub-99988/session-10/func/trans
 ```
 
 Canonical warped images and QC use original intensities through the estimated

@@ -31,8 +31,9 @@ def execute(nodes, namespace):
 
 @pytest.mark.parametrize("offline_assets", [None, "/prepared/offline/reference-v1"])
 @pytest.mark.parametrize("reference", ["4", "4/reference_gameplay", "/reference/pooled"])
+@pytest.mark.parametrize("preparation_available", [True, False])
 def test_actual_main_opens_game_while_backend_waits_and_preserves_reference(
-        monkeypatch, tmp_path, offline_assets, reference):
+        monkeypatch, tmp_path, offline_assets, reference, preparation_available):
     main = function("main")
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                    and node.func.id == "prepare_nf_run" for node in ast.walk(main))
@@ -49,12 +50,20 @@ def test_actual_main_opens_game_while_backend_waits_and_preserves_reference(
 
     def make_config(**kwargs):
         cfg = SimpleNamespace(**kwargs, rt_work_dir=tmp_path / "run",
-                              fmap_dir=tmp_path / "fmap", reuse_prepared_reference=False)
+                              fmap_dir=tmp_path / "fmap")
         created.append(cfg)
         return cfg
 
     runtime.RTSessionConfig = make_config
     reference_stats = {"baseline_mean": 2.5, "baseline_std": .7}
+
+    def validate_reference(cfg, settings=None):
+        assert vars(runtime.REGRESSOR_SETTINGS) == vars(rt_settings)
+        chronology.append("validate_reference")
+        if not preparation_available:
+            raise FileNotFoundError("Prepared reference is missing; run preparation first")
+
+    runtime.validate_nf_reference = validate_reference
 
     def load_reference(cfg, rs):
         assert rs == reference
@@ -136,12 +145,21 @@ def test_actual_main_opens_game_while_backend_waits_and_preserves_reference(
         log=logging.getLogger("brainpong-startup-test"))
     execute([function("_prepare_rt_config"), function("_run_pipeline_with_settings")], namespace)
     try:
-        execute(main.body[first:], namespace)
+        if preparation_available:
+            execute(main.body[first:], namespace)
+        else:
+            with pytest.raises(FileNotFoundError, match="run preparation first"):
+                execute(main.body[first:], namespace)
     finally:
         release.set()
     assert not failures
-    assert chronology == ["load_reference", "backend_waiting", "presentation"]
-    assert created[0].reuse_prepared_reference is (offline_assets is None)
+    assert not hasattr(created[0], "reuse_prepared_reference")
+    if not preparation_available:
+        assert chronology == ["validate_reference"]
+        assert received == []
+        assert list(tmp_path.iterdir()) == []
+        return
+    assert chronology == ["validate_reference", "load_reference", "backend_waiting", "presentation"]
     assert cfg["logging"]["output_dir"] == str(tmp_path / "run" / "brainpong")
     assert received[-1] == ("qc", tmp_path / "run")
 

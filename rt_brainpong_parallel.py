@@ -1282,12 +1282,11 @@ def main() -> None:
 
     if runs_pipeline:
         rt_cfg = _prepare_rt_config(args, cfg)
-        # Online behavioral reference processing already established this day's
-        # MC target, masks and spatial transforms. Reuse those assets directly;
-        # a supplied offline bundle still needs its current-session EPI bridge.
-        rt_cfg.reuse_prepared_reference = not bool(rt_settings.offline_assets)
-        from rt_pipeline import REGRESSOR_SETTINGS
+        # The reference run already established this day's MC target, masks
+        # and transforms, including any bridge to imported offline assets.
+        from rt_pipeline import REGRESSOR_SETTINGS, validate_nf_reference
         REGRESSOR_SETTINGS.update(vars(rt_settings))
+        validate_nf_reference(rt_cfg)
         if uses_reference_score:
             from rt_pipeline import load_reference_score_stats
 

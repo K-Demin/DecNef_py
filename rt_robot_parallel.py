@@ -2116,6 +2116,9 @@ def main() -> None:
         pa_block=args.pa_block,
     )
 
+    from rt_pipeline import validate_nf_reference
+    validate_nf_reference(cfg)
+
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)
 

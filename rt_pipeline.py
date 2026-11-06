@@ -599,8 +599,8 @@ class RTSessionConfig:
     enable_scoring: bool = True
     enable_original_score: bool = False
     test_speed: bool = False
-    # RS/preparation runs establish the anatomical reference. Imported/offline
-    # assets use a first-run session EPI bridge unless a prepared RS is reused.
+    # Reference runs establish the current-session spatial assets. NF only
+    # consumes those assets, whether fitted online or anchored to offline data.
     preparation_only: bool = False
     # Process one fixed existing-DICOM snapshot and return without a watchdog.
     recorded_only: bool = False
@@ -608,9 +608,6 @@ class RTSessionConfig:
     # NEW
     ap_block: Optional[int] = None
     pa_block: Optional[int] = None
-    # Same-session NF can use its already prepared RS/behavioral reference.
-    # Internal launcher choice: do not collect/fit another current-run reference.
-    reuse_prepared_reference: bool = False
 
     @property
     def fmap_dir(self) -> Path:
@@ -636,11 +633,6 @@ class RTSessionConfig:
 
     @property
     def trans_dir(self) -> Path:
-        if self.reuse_prepared_reference:
-            return self.day_root / "func" / "trans"
-        session = self.day_root / "func" / "session_trans"
-        if not self.preparation_only and (session / "session_alignment.json").exists():
-            return session
         return self.day_root / "func" / "trans"
 
     @property
@@ -3018,8 +3010,19 @@ def validate_run_provenance(cfg):
 
 # ---------- Main ----------
 
+def validate_nf_reference(cfg, settings=None):
+    """Require the reference run's spatial files without preparing new assets."""
+    from fmri_rt_preproc.session_alignment import validate_prepared_reference
+    validate_prepared_reference(cfg, REGRESSOR_SETTINGS if settings is None else settings)
+
+
 def prepare_nf_run(cfg, settings=None):
-    """Prepare independent offline assets first, then fieldmaps and current EPI."""
+    """Check reference-run assets and prepare only the selected run's fieldmap.
+
+    Spatial preparation belongs to RS/behavioral reference runs, never NF.
+    Launchers use validate_nf_reference before opening and run this fieldmap
+    readiness path inside their processing worker.
+    """
     if settings is not None:
         REGRESSOR_SETTINGS.update(vars(settings))
     from fmri_rt_preproc.session_alignment import ensure_nf_session
