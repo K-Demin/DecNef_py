@@ -22,12 +22,26 @@ def _save(path, values):
     return path
 
 
+def _smooth_expected(values, support, fwhm):
+    """Independent normalized convolution over eligible residuals only."""
+    source = np.where(support, values, 0).astype(np.float64)
+    if not fwhm:
+        return source.astype(np.float32)
+    sigma = fwhm / np.sqrt(8 * np.log(2))
+    density = gaussian_filter(support.astype(float), sigma, mode="constant", cval=0., truncate=4.)
+    numerator = gaussian_filter(source, sigma, mode="constant", cval=0., truncate=4.)
+    result = np.zeros(source.shape, np.float32)
+    result[support] = numerator[support] / density[support]
+    return result
+
+
 @pytest.mark.parametrize("space", ["t1", "mni", "epi"])
 @pytest.mark.parametrize("gpu", [False, True])
 @pytest.mark.parametrize("glm", [False, True])
 @pytest.mark.parametrize("fwhm", [0, 3])
+@pytest.mark.parametrize("norm_mode", ["zscore", "mean"])
 def test_warmup_transforms_mc_for_viewing_without_scoring(
-        tmp_path, monkeypatch, space, gpu, glm, fwhm):
+        tmp_path, monkeypatch, space, gpu, glm, fwhm, norm_mode):
     """Exercise actual normalization, file publication, preview and score gates.
 
     A known spatial permutation replaces native registration/GPU libraries.
@@ -68,16 +82,21 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
     fit_support = np.flip(acquired, axis=0).copy() & final_brain
     if glm:
         fit_support[1, 2, 2] = False
+        residuals[:, 1, 2, 2] = 1e6  # Rejected neighbors must not leak into smoothing.
+    # Startup moments must describe the same smoothed residuals scored later,
+    # including their covariance, rather than smoothed per-voxel SD maps.
+    startup_residuals = np.asarray([_smooth_expected(frame, fit_support, fwhm)
+                                   for frame in residuals[:2]], dtype=np.float64)
     startup_mean, startup_m2 = np.zeros(shape), np.zeros(shape)
-    startup_mean[fit_support] = residuals[:2, fit_support].mean(axis=0, dtype=np.float64)
-    startup_m2[fit_support] = ((residuals[:2, fit_support] - startup_mean[fit_support]) ** 2).sum(axis=0)
+    startup_mean[fit_support] = startup_residuals[:, fit_support].mean(axis=0)
+    startup_m2[fit_support] = ((startup_residuals[:, fit_support] - startup_mean[fit_support]) ** 2).sum(axis=0)
     startup = [dict(mean=startup_mean, m2=startup_m2,
                     count=fit_support.astype(np.int64) * 2, reference_count=2)]
     handler.anatomical_brain_mask = brain
     handler.final_brain_mask = final_brain
     handler.processing_mask = final_brain.copy()
     handler.native_nuisance_masks = {}
-    handler.voxel_normalizer = VoxelNormalizer("zscore", "fixed", 2, final_brain)
+    handler.voxel_normalizer = VoxelNormalizer(norm_mode, "fixed", 2, final_brain)
     glm_inputs = []
 
     def regress(image, index, **kwargs):
@@ -162,19 +181,17 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
         ready = glm_ready and len(history) >= 2
         expected_readiness.append(ready)
         expected_image = np.where(visual_support, spatial(np.where(acquired, frame, 0)), 0)
-        expected_pre_glm = expected_image.astype(np.float64)
-        if fwhm:
-            sigma = fwhm / np.sqrt(8 * np.log(2))
-            density = gaussian_filter(visual_support.astype(float), sigma, mode="constant", cval=0., truncate=4.)
-            numerator = gaussian_filter(expected_pre_glm, sigma, mode="constant", cval=0., truncate=4.)
-            expected_pre_glm[visual_support] = numerator[visual_support] / density[visual_support]
-        expected_pre_glm = expected_pre_glm.astype(np.float32)
+        expected_pre_glm = expected_image.astype(np.float32)
         clean = residuals[index - 1] if glm else expected_pre_glm
+        score_input = _smooth_expected(clean, fit_support, fwhm)
         normalized = np.zeros(shape, np.float32)
         if ready:
             prior = np.asarray(history, dtype=np.float64)
-            normalized[fit_support] = ((clean[fit_support] - prior.mean(axis=0)) /
-                                       prior.std(axis=0, ddof=1))
+            if norm_mode == "zscore":
+                normalized[fit_support] = ((score_input[fit_support] - prior.mean(axis=0)) /
+                                           prior.std(axis=0, ddof=1))
+            else:
+                normalized[fit_support] = score_input[fit_support] / prior.mean(axis=0) * 100.
         source = _save(tmp_path / f"raw_{index}.nii", frame)
         assert rt.process_volume(cfg, handler, source, index, raw_nii=source,
                                  volume_timestamp=float(index))
@@ -185,7 +202,7 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
                                    normalized, rtol=2e-5, atol=2e-5)
         if fwhm:
             smoothed = nib.load(tmp_path / "smooth" / f"vol_{index:05d}_smooth.nii").get_fdata()
-            np.testing.assert_allclose(smoothed, expected_pre_glm, rtol=2e-6, atol=2e-5)
+            np.testing.assert_allclose(smoothed, score_input, rtol=2e-6, atol=2e-5)
         if glm:
             np.testing.assert_allclose(glm_inputs[-1], expected_pre_glm, rtol=2e-6, atol=2e-5)
         np.testing.assert_allclose(nib.load(tmp_path / "reg" / f"vol_{index:05d}_reg.nii").get_fdata(),
@@ -206,16 +223,20 @@ def test_warmup_transforms_mc_for_viewing_without_scoring(
         payload = handler.score_queue.get_nowait()
         assert payload["reg_ready"] == ready
         assert np.isfinite(payload["score_raw"]) == ready
-        if glm and index == 2:
-            history = list(residuals[:2, fit_support].copy())
-        elif glm_ready and len(history) < 2:
-            history.append(clean[fit_support].copy())
+        if norm_mode == "mean" and len(history) < 2:
+            # Percent scaling keeps a raw-intensity denominator, independently
+            # smoothed using current coverage rather than historical GLM loss.
+            history.append(_smooth_expected(expected_pre_glm, visual_support, fwhm)[fit_support])
+        elif norm_mode == "zscore" and glm and index == 2:
+            history = list(startup_residuals[:, fit_support].copy())
+        elif norm_mode == "zscore" and glm_ready and len(history) < 2:
+            history.append(score_input[fit_support].copy())
 
     for actual, expected in zip(scored, expected_scores):
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
     for actual, expected in zip(baseline, expected_scores):
         np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
-    if glm:
+    if glm and not fwhm and norm_mode == "zscore":
         # This sample is normalized to zero, but its geometric support remains.
         assert normalized[1, 2, 1] == pytest.approx(0, abs=1e-6)
         assert saved_support[1, 2, 1] == 1

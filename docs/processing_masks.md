@@ -3,7 +3,7 @@
 Incoming BOLD is unwarped and motion-corrected on the session EPI grid, then
 processed in this order:
 
-**Spatial mapping → optional masked smoothing → cumulative-GLM denoising →
+**Spatial mapping → cumulative-GLM denoising → optional masked smoothing →
 voxel normalization.**
 
 The response data, denoising mask and normalization statistics all use the final
@@ -23,6 +23,12 @@ mapped brain mask intersected with the selected analysis mask. Consequently,
 `analysis_mask: "whole_brain"`, `"cortical_gm"` and `"custom"` control the response
 voxels processed by denoising and normalization as well as smoothing. A zero
 FWHM skips Gaussian filtering; a cortex/custom selection still applies.
+
+Smoothing uses the surviving cGLM support, excluding voxels lost earlier in the
+run from its neighbourhoods. It does not fill those unavailable voxels back in.
+The initial z-score reference is computed from smoothed first-fit residuals,
+without adding a second calibration window. `reg/` contains unsmoothed residuals;
+`smooth/` contains smoothed residuals and `norm/` contains the decoder features.
 
 Spatial mapping receives acquired motion-corrected BOLD before response
 masking or temporal processing. There is no response-processing interpolation
@@ -99,12 +105,16 @@ write are included in the existing `SCORE` stage timing.
 ## Processing provenance and reuse
 
 The response policy is `final_analysis_grid`, version 1. Metadata records the
-order `spatial_transform`, `smoothing`, `denoising`, `normalization` and nuisance
+order `spatial_transform`, `denoising`, `smoothing`, `normalization` and nuisance
 source `native_unsmoothed_mc`. The former `source_grid_cubic_halo` policy remains
 recognizable as historical provenance and is not treated as equivalent.
 
-**Use a fresh run output directory and rebuild RS score/PCA calibration assets
-after this order change.** Scalar score references and PCA assets compare
+**Use a fresh run output directory when reprocessing a run. Rebuild references
+that previously used nonzero smoothing.** Scalar score references explicitly
+recorded with FWHM 0 remain equivalent and can be reused when the current
+profile also has FWHM 0 and its remaining settings match. Missing FWHM cannot
+establish this exception. Old PCA contracts that lack the width still require
+rebuilding from verified source runs. Scalar score references and PCA assets compare
 normalization, coverage and processing-mask provenance. Missing or incompatible
 modern provenance is rejected. Source mask paths, hashes and native nuisance
 padding widths are acquisition-specific and need not match across RS and NF.

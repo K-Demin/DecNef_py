@@ -7,7 +7,7 @@ The pipeline order is `unwarp_then_mc_v1`.
 3. Estimate PyHySCO's field from those native means.
 4. Apply that field to each incoming raw BOLD volume, using the configured AP or PA polarity.
 5. Motion-correct the unwarped volume to the fixed, corrected session reference (`func/trans/epi_unwarped_mean.nii[.gz]`).
-6. Compute motion/FD and DVARS on corrected EPI. Apply the selected spatial transforms and optional smoothing, then denoise and normalize on the final analysis grid before decoding. Nuisance signals retain their native, unsmoothed MC source.
+6. Compute motion/FD and DVARS on corrected EPI. Apply the selected spatial transforms, denoise, optionally smooth the supported residuals, and normalize on the final analysis grid before decoding. Nuisance signals retain their native, unsmoothed MC source.
 
 For a new session, offline preparation also unwarps before MC. Its first corrected BOLD volume supplies the initial MC target; the resulting aligned mean becomes the fixed online reference. Subsequent runs retain that reference. Changing the calibration pair does not rebuild anatomical segmentation, nuisance masks, or spatial transforms.
 
@@ -26,8 +26,9 @@ Current output products include:
 | `raw/vol_*.nii` | Raw distorted BOLD |
 | `unwarped/vol_*_uw_native.nii` | Unwarped BOLD before MC, when intermediate saving is enabled (also written by file fallback) |
 | `mc/vol_*_mc.nii` | Unwarped and motion-corrected BOLD |
-| `reg/vol_*_reg.nii` | Original-intensity cumulative-GLM output on the final analysis grid |
-| `norm/` | Final normalized decoder features, after spatial mapping, optional smoothing and denoising |
+| `reg/vol_*_reg.nii` | Unsmoothed original-intensity cumulative-GLM residuals on the final analysis grid |
+| `smooth/` | Smoothed residuals, when a nonzero FWHM is configured |
+| `norm/` | Final normalized decoder features, after spatial mapping, denoising and optional smoothing |
 
 Fully corrected volumes are written once, in `mc/`. The `unwarped` PCA/stream option is a compatibility alias for this product; historical runs can still be read from their old `unwarped/vol_*_mc_uw.nii` paths. No duplicate is written for new runs. FD describes registration of corrected BOLD; DVARS uses corrected and aligned BOLD with the corrected reference mask.
 

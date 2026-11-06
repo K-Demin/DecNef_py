@@ -33,6 +33,7 @@ from fmri_rt_preproc.processing_mask import (
     make_processing_mask, processing_margin_vox,
     FINAL_PROCESSING_MASK_POLICY, FINAL_PROCESSING_MASK_POLICY_VERSION,
     FINAL_NUISANCE_SOURCE, FINAL_PROCESSING_ORDER,
+    canonical_final_processing_mask,
 )
 
 from watchdog.observers import Observer
@@ -68,7 +69,7 @@ logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 # ---------- Regressor config ----------
 REGRESSOR_SETTINGS = load_regressor_settings()
 COVERAGE_POLICY = "separate_brain_processing_observed_support_v3"
-TEMPORAL_PROCESSING_ORDER = "spatial_smooth_glm_norm_v1"
+TEMPORAL_PROCESSING_ORDER = "spatial_glm_smooth_norm_v2"
 
 from fmri_rt_preproc.offline_assets import t1_to_mni_transform
 from fmri_rt_preproc.voxel_normalization import VoxelNormalizer
@@ -455,6 +456,7 @@ class MotionRegressor:
         rtp_physio: Optional[object] = None,
         normalization_mode: Optional[str] = None,
         normalization_reference: str = "fixed",
+        startup_residual_transform=None,
     ):
         wait_num = max(0, int(norm_ref_volumes) - 1)
         kwargs = dict(
@@ -474,6 +476,7 @@ class MotionRegressor:
             scale_before_glm=False,
             startup_ref_volumes=(int(norm_ref_volumes) if normalization_mode == "zscore" else None),
             startup_ref_reference=normalization_reference,
+            startup_residual_transform=startup_residual_transform,
         )
         self._regress = RtpRegress(**kwargs)
 
@@ -599,6 +602,8 @@ class RTSessionConfig:
     # RS/preparation runs establish the anatomical reference. NF runs always
     # use a separately fitted, QC-gated first-run session EPI bridge.
     preparation_only: bool = False
+    # Process one fixed existing-DICOM snapshot and return without a watchdog.
+    recorded_only: bool = False
 
     # NEW
     ap_block: Optional[int] = None
@@ -1049,6 +1054,15 @@ def load_reference_score_stats(cfg: RTSessionConfig, run_id: Optional[str]) -> O
         "interpolation": str(getattr(REGRESSOR_SETTINGS, "gpu_resampler_interpolation", "linear")).lower(),
     }
     recorded_processing = metadata.get("processing_mask")
+    if isinstance(recorded_processing, dict):
+        # Zero-FWHM references have no Gaussian operation to reorder. Preserve
+        # them only when both recorded and current settings explicitly agree.
+        legacy_zero_width = (metadata.get("smoothing_fwhm_mm")
+                             if getattr(REGRESSOR_SETTINGS, "smoothing_fwhm_mm", 0) == 0 else None)
+        try:
+            recorded_processing = canonical_final_processing_mask(recorded_processing, legacy_zero_width)
+        except ValueError:
+            recorded_processing = None
     if (metadata.get("coverage_policy") != COVERAGE_POLICY
             or not isinstance(recorded_processing, dict)
             or any(recorded_processing.get(key) != value
@@ -1596,6 +1610,8 @@ class DICOMHandler(FileSystemEventHandler):
                 norm_ref_volumes=REGRESSOR_SETTINGS.voxel_norm_ref_volumes,
                 normalization_mode=REGRESSOR_SETTINGS.voxel_norm_mode,
                 normalization_reference=REGRESSOR_SETTINGS.voxel_norm_reference,
+                startup_residual_transform=(self.smoother.apply
+                    if self.smoother is not None and self.smoother.output_kind == "smooth" else None),
                 enable_fd_censor_reg=REGRESSOR_SETTINGS.enable_fd_censor_reg,
                 enable_dvars_censor_reg=REGRESSOR_SETTINGS.enable_dvars_censor_reg,
                 phys_reg=phys_reg,
@@ -2538,29 +2554,24 @@ def process_volume(
     if speed is not None:
         speed.stage(volume_idx, "TRANS", time.perf_counter() - coverage_t0)
 
-    # Reuse the spatial image for temporal processing when smoothing is off;
-    # QC needs no additional NIfTI header read on that common path.
-    spatial_image = (nib.load(str(score_input_nii))
-                     if getattr(handler, "decoder_qc", None) is not None
-                     or getattr(handler, "smoother", None) is None else None)
+    # Both correlation QC and cGLM use the unsmoothed spatial output.
+    spatial_image = nib.load(str(score_input_nii))
     correlation_qc = record_decoder_correlation(
         cfg, handler, volume_idx, spatial_image, spatial_output_support)
 
-    # Spatial smoothing/selection precedes temporal denoising and normalization.
+    # Keep experiment-mask selection before cGLM; smooth only its output below.
     smoother = getattr(handler, "smoother", None)
-    if smoother is not None:
-        smooth_t0 = time.perf_counter()
-        kind = smoother.output_kind
-        folder = cfg.rt_work_dir / kind
+    if smoother is not None and smoother.output_kind == "masked":
+        # Zero FWHM is still mask-only selection, with the existing raw preview.
+        mask_t0 = time.perf_counter()
+        folder = cfg.rt_work_dir / "masked"
         score_input_nii = smooth_file(smoother, score_input_nii,
-                                      folder / f"vol_{volume_idx:05d}_{kind}.nii",
-                                      support_mask=spatial_output_support)
+            folder / f"vol_{volume_idx:05d}_masked.nii", support_mask=spatial_output_support)
         if score_input_orig_nii is not None:
             score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
-                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_orig_support)
-        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
-
-    temporal_image = spatial_image if smoother is None else nib.load(str(score_input_nii))
+                folder / f"vol_{volume_idx:05d}_masked_orig.nii", support_mask=final_orig_support)
+        log_step("MASK", volume_idx, start_t=mask_t0, speed=speed)
+    temporal_image = spatial_image
     temporal_data = np.asarray(temporal_image.dataobj, dtype=np.float32).copy()
     processing_mask = getattr(handler, "processing_mask", None)
     if processing_mask is None:
@@ -2618,7 +2629,22 @@ def process_volume(
     current_brain_support = brain_mask & final_coverage
     current_processing_support = temporal_support
 
-    # ---------- Voxel normalization after final-grid cGLM ----------
+    # ---------- Smooth residuals over cGLM's surviving coverage ----------
+    # An earlier coverage loss permanently excludes a voxel from the fitted
+    # history. Do not mix that voxel into its surviving neighbours afterward.
+    if smoother is not None and smoother.output_kind == "smooth":
+        smooth_t0 = time.perf_counter()
+        kind = smoother.output_kind
+        folder = cfg.rt_work_dir / kind
+        score_input_nii = smooth_file(smoother, reg_nii,
+            folder / f"vol_{volume_idx:05d}_{kind}.nii", support_mask=cleaned_support)
+        cleaned = np.asarray(nib.load(str(score_input_nii)).dataobj, dtype=np.float32).copy()
+        if score_input_orig_nii is not None:
+            score_input_orig_nii = smooth_file(smoother, score_input_orig_nii,
+                folder / f"vol_{volume_idx:05d}_{kind}_orig.nii", support_mask=final_orig_support)
+        log_step("SMOOTH" if kind == "smooth" else "MASK", volume_idx, start_t=smooth_t0, speed=speed)
+
+    # ---------- Voxel normalization after denoising and smoothing ----------
     norm_t0 = time.perf_counter()
     glm_ready = bool(reg_ready)
     normalizer = handler.voxel_normalizer
@@ -2636,7 +2662,14 @@ def process_volume(
     was_calibrated = normalizer.ready
     if normalizer.mode == "mean":
         if current_brain_support.any():
-            normalizer.observe(temporal_data, current_processing_support)
+            # Keep percent-of-raw-mean units: the denominator comes from raw
+            # BOLD with the same spatial kernel, not zero-centred residuals.
+            raw_reference = temporal_data
+            if (smoother is not None and smoother.output_kind == "smooth"
+                    and (normalizer.reference == "running"
+                         or normalizer.reference_count < normalizer.ref_volumes)):
+                raw_reference = smoother.apply(temporal_data, support_mask=current_processing_support)
+            normalizer.observe(raw_reference, current_processing_support)
     elif glm_ready:
         # Preserve the GLM's valid support separately from normalization's
         # not-yet-calibrated output support.
@@ -2952,6 +2985,30 @@ def prepare_nf_run(cfg, settings=None):
     ensure_nf_session(cfg, REGRESSOR_SETTINGS)
 
 
+def _process_recorded_snapshot(event_handler, existing):
+    """Use the normal ordered workers, then complete their normal stop/export."""
+    try:
+        indices = [parse_dicom_name(path.name)[2] for path in existing]
+        expected = set(range(1, len(indices) + 1))
+        if not indices or len(set(indices)) != len(indices) or set(indices) != expected:
+            raise ValueError("Recorded DICOM snapshot must be nonempty, unique and contiguous from volume 1.")
+        for path in existing:
+            event_handler.enqueue_path(path, backlog=True)
+        while True:
+            while event_handler.submit_pending():
+                pass
+            with event_handler._lock:
+                completed = set(event_handler._processed_scans)
+            if expected.issubset(completed):
+                break
+            time.sleep(0.01)
+    finally:
+        event_handler.stop()
+        exporter = getattr(event_handler, "_qc_export_thread", None)
+        if exporter is not None:
+            exporter.join()
+
+
 def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
     analysis_space = str(REGRESSOR_SETTINGS.analysis_space).lower()
     if analysis_space not in {"epi", "t1", "mni"}:
@@ -2959,6 +3016,8 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
             f"Unsupported analysis_space={REGRESSOR_SETTINGS.analysis_space!r}. "
             "Use 'epi', 't1', or 'mni'."
         )
+    if getattr(cfg, "recorded_only", False) and REGRESSOR_SETTINGS.enable_biopac_physio:
+        raise ValueError("recorded_only does not support live BIOPAC; disable enable_biopac_physio.")
     if cfg.enable_scoring and analysis_space in {"epi", "t1"} and cfg.decoder_template is None:
         raise ValueError(
             "EPI/T1-space scoring requires --decoder-template pointing to a decoder in the selected space."
@@ -2989,6 +3048,9 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
         score_queue=score_queue,
         start_biopac=not defer_biopac,
     )
+    if getattr(cfg, "recorded_only", False):
+        _process_recorded_snapshot(event_handler, existing)
+        return
     observer = Observer()
     observer.schedule(event_handler, str(cfg.incoming_dir), recursive=False)
 
@@ -3332,6 +3394,8 @@ def main():
     add_registration_arguments(parser)
     parser.add_argument("--preparation-only", action="store_true",
                         help="Process a preparation/RS run without the NF session gate.")
+    parser.add_argument("--recorded-only", action="store_true",
+                        help="Process existing contiguous DICOMs and return; do not start a watchdog.")
     args = parser.parse_args()
 
     if args.settings_file:
@@ -3371,6 +3435,7 @@ def main():
 
     cfg = RTSessionConfig(
         preparation_only=args.preparation_only,
+        recorded_only=args.recorded_only,
         subject=args.sub,
         day=args.day,
         run=args.run,

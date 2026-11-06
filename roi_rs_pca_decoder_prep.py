@@ -323,7 +323,8 @@ def _discover_rs_inputs(run_dir: Path, pca_mode: str = "auto") -> Tuple[Path, Pa
     pca_mode = (pca_mode or "auto").lower()
     metadata = run_dir / "session_metadata.json"
     info = json.loads(metadata.read_text(encoding="utf-8")) if metadata.exists() else None
-    if info is not None and info.get("temporal_processing_order") == "spatial_smooth_glm_norm_v1":
+    if info is not None and info.get("temporal_processing_order") in {
+            "spatial_smooth_glm_norm_v1", "spatial_glm_smooth_norm_v2"}:
         if pca_mode not in {"auto", "mc", "unwarped", "reg", "norm", "t1", "mni", "epi_ref", "smooth", "masked"}:
             pca_mode = "auto"
         if final_normalized_series(info, pca_mode) is not None:

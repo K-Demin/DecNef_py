@@ -1076,7 +1076,8 @@ def condition_for_index(
 
 def final_normalized_series(metadata: dict, volume_kind: str) -> tuple[str, str] | None:
     """Resolve final-stream aliases only for the spatial-before-temporal order."""
-    if metadata.get("temporal_processing_order") != "spatial_smooth_glm_norm_v1":
+    if metadata.get("temporal_processing_order") not in {
+            "spatial_smooth_glm_norm_v1", "spatial_glm_smooth_norm_v2"}:
         return None
     if volume_kind in {"mc", "unwarped"}:
         return None

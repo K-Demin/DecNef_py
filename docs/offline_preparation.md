@@ -13,7 +13,7 @@ At the scanner, a short current-session reference is aligned to the offline EPI
 reference. Online volumes are unwarped with their current acquisition's fieldmap,
 motion-corrected to the session reference, and mapped through the session
 EPI→offline EPI→T1→MNI chain as required by the selected analysis space. Optional
-smoothing, denoising and normalization then run on that final grid. The session's
+denoising, smoothing and normalization then run on that final grid. The session's
 nuisance signals still use unsmoothed MC volumes and masks on its own EPI grid. The anatomical
 registration is therefore reusable without requiring identical slab prescriptions.
 
@@ -117,6 +117,67 @@ The T1→MNI transform, supplied template and decoder must refer to the **same
 named template space**. `MNI152NLin2009cAsym` and `MNI152NLin6Asym` are not
 interchangeable. The final resampling still uses the decoder's voxel grid;
 recording `--mni-space` does not convert an incorrectly selected template.
+
+### Short recipe: copied fMRIPrep files and recorded reference runs
+
+Copy the matching files from one subject/session, keeping their original names:
+
+```text
+data/sub-SUBJECT_ID/
+  fmriprep_offline/
+    anat/                 # Native T1, brain/WM masks and matching transforms
+    func/                 # Native desc-coreg_boldref and boldref-to-T1w affine
+    FreeSurfer/mri/       # aseg.mgz in fsnative space
+    templates/            # The matching named MNI T1 template
+  dcm/                    # Recorded BOLD and AP/PA DICOMs
+```
+
+The `anat/` files must include the matching `from-fsnative_to-T1w` transform.
+The folder importer selects the fMRIPrep 23.2.1 filename patterns listed above
+and derives the native EPI and T1-space tissue masks. From the project directory:
+
+```bash
+conda activate rt_pipe
+SUB="SUBJECT_ID"
+python prepare_offline.py import-fmriprep-folder \
+  --subject "$SUB" --input "data/sub-$SUB/fmriprep_offline" \
+  --reference-run 01
+```
+
+Add `--reference-task TASK` if several tasks share that run number. The new
+bundle is `data/sub-$SUB/fmriprep_offline/prepared/assets.json`. Set its absolute
+path in the JSON profile used for both recorded reference processing and NF:
+
+```json
+"offline_assets": "/SSD2/DecNef_py/data/sub-SUBJECT_ID/fmriprep_offline/prepared/assets.json"
+```
+
+To estimate the decoder reference, replay the recorded DICOMs through the shared
+RS preparation and real-time processing code. This does not score the already
+preprocessed fMRIPrep BOLD. The flat `dcm/` folder must already use the scanner
+filename convention, such as `001_000008_000001.dcm`; the wrapper does not rename
+original `.IMA` files or infer fieldmap associations.
+
+```bash
+python rs_offline_reference.py \
+  --sub "$SUB" --day offline --incoming-root "data/sub-$SUB/dcm" \
+  --base-data data --settings-file settings_v2.json \
+  --decoder-template /path/to/decoder_weights.nii.gz \
+  --run 8 6 7 --run 9 6 7
+```
+
+Each repeated `--run` supplies **BOLD series, AP series, PA series**, in that
+order. Select the actual series for the recordings; the example uses pair 6/7
+for BOLD runs 8 and 9. Preparation uses the first listed run, and each run gets
+independent temporal-processing state. Batch replay disables the live viewer.
+
+The ordinary outputs are `data/sub-$SUB/offline/func/8/` and `func/9/`.
+`func/pooled_reference/` combines their finite, ready decoder scores without
+recentering each run. Supply its absolute path to the NF launcher, for example
+`--rs /SSD2/DecNef_py/data/sub-SUBJECT_ID/offline/func/pooled_reference`.
+An individual run directory, such as `.../offline/func/8`, is also a valid
+reference. Existing run or pooled-output folders are refused rather than
+overwritten; use a fresh day name when repeating the replay.
 
 ## Option 2: export an existing prepared DecNef day
 
@@ -249,12 +310,19 @@ GLM startup: with N=30 and a first successful fit at volume 30, volume 31 is the
 earliest scored volume. The same N+1 lower bound applies without regression;
 GLM design, coverage, or processing can delay actual readiness.
 
-Spatial transforms and optional smoothing precede cumulative-GLM denoising and
-voxel normalization on the final analysis grid. A short spatial reference
+Spatial transforms precede cumulative-GLM denoising, optional smoothing and
+voxel normalization on the final analysis grid. Smoothing uses the surviving
+GLM support. The initial z-score statistics use the smoothed first-fit residual
+history, preserving the existing startup timing. A short spatial reference
 acquisition does not replace runtime calibration. `mean` remains available as
 `100 * residual / reference_mean`; its reference uses original intensities after
-spatial mapping and optional smoothing, before denoising. JSON N controls the
+spatial mapping and optional smoothing, rather than the residual mean. JSON N controls the
 statistical reference independently of presentation timing: `--baseline-trs`
 neither overrides N nor extends
 automatically. Increase it explicitly when a longer background period is wanted.
 Keep the runtime settings and trained decoder/PCA feature units consistent.
+
+References made with the former smoothing-before-denoising order need
+reprocessing when smoothing was enabled. An explicitly recorded FWHM of 0 can
+be reused with a current 0-mm profile and otherwise matching settings. Existing
+PCA contracts without the recorded width cannot establish that equivalence.

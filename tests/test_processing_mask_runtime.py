@@ -37,7 +37,8 @@ def test_final_grid_spatial_smoothing_glm_normalization(tmp_path, monkeypatch, m
 
     Native and response grids differ in both shape and affine. Spatial mapping
     must see the acquired native values before temporal masking; cGLM must see
-    the mapped, smoothed response. Missing slices remain unavailable throughout.
+    the mapped, unsmoothed response. Smooth its residuals before normalization.
+    Missing slices remain unavailable throughout.
     """
     handler = headless._mk_handler(tmp_path)
     cfg = handler.cfg
@@ -84,6 +85,8 @@ def test_final_grid_spatial_smoothing_glm_normalization(tmp_path, monkeypatch, m
         _motion=np.zeros((12, 6)), resample_support=lambda *a: acquired.astype(float))
     handler.biopac_receiver = handler.gpu_resampler = None
     handler.smoother = MaskedGaussianSmoother(processing, final_affine, fwhm)
+    if glm and fwhm > 0 and mode == "zscore":
+        handler.motion_regressor._regress.startup_residual_transform = handler.smoother.apply
     (tmp_path / handler.smoother.output_kind).mkdir()
     handler.scorer = SimpleNamespace(mask=processing.copy())
     previews = []
@@ -129,7 +132,8 @@ def test_final_grid_spatial_smoothing_glm_normalization(tmp_path, monkeypatch, m
 
     spatial_samples = np.asarray([np.where(brain & final_coverage,
         spatial(np.where(acquired, frame, 0)), 0) for frame in native])
-    response = np.asarray([smooth_oracle(frame) for frame in spatial_samples], np.float32)
+    response = np.asarray([np.where(valid, frame, 0) for frame in spatial_samples], np.float32)
+    smoothed_raw = np.asarray([smooth_oracle(frame) for frame in response], np.float32)
     history = []
     became_ready = False
     for index, frame in enumerate(native, 1):
@@ -144,16 +148,19 @@ def test_final_grid_spatial_smoothing_glm_normalization(tmp_path, monkeypatch, m
             values = response[index - 1, valid]
         expected_reg = np.zeros(final_shape)
         expected_reg[valid] = values
+        expected_smooth = smooth_oracle(expected_reg)
+        final_values = expected_smooth[valid]
         expected_norm = np.zeros(final_shape)
         ready = glm_ready and len(history) >= 3
         if ready:
             prior = np.asarray(history)
-            expected_norm[valid] = (100 * values / prior.mean(axis=0) if mode == "mean"
-                else (values - prior.mean(axis=0)) / prior.std(axis=0, ddof=1))
+            expected_norm[valid] = (100 * final_values / prior.mean(axis=0) if mode == "mean"
+                else (final_values - prior.mean(axis=0)) / prior.std(axis=0, ddof=1))
         assert rt.process_volume(cfg, handler, raw, index, raw_nii=raw, volume_timestamp=float(index))
         for folder, kind, expected in (
             ("t1", "t1", spatial_samples[index - 1]),
-            (handler.smoother.output_kind, handler.smoother.output_kind, response[index - 1]),
+            (handler.smoother.output_kind, handler.smoother.output_kind,
+             response[index - 1] if fwhm == 0 else expected_smooth),
             ("reg", "reg", expected_reg), ("norm", "norm", expected_norm)):
             saved = nib.load(tmp_path / folder / f"vol_{index:05d}_{kind}.nii")
             assert saved.shape == final_shape
@@ -170,9 +177,14 @@ def test_final_grid_spatial_smoothing_glm_normalization(tmp_path, monkeypatch, m
         assert previews[-1][1] == cfg.rt_mc_dir / f"vol_{index:05d}_mc.nii"
         became_ready |= ready
         if glm and mode == "zscore" and index == 4:
-            history = list(residuals[:3].copy())
+            history = []
+            for residual in residuals[:3]:
+                residual_volume = np.zeros(final_shape)
+                residual_volume[valid] = residual
+                history.append(smooth_oracle(residual_volume)[valid].copy())
         elif len(history) < 3 and (mode == "mean" or glm_ready):
-            history.append(response[index - 1, valid].copy() if mode == "mean" else values.copy())
+            history.append(smoothed_raw[index - 1, valid].copy()
+                           if mode == "mean" else final_values.copy())
 
     assert became_ready
     assert set(transformed_sources) == {"mc", "coverage"}

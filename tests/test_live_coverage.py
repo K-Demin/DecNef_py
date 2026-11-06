@@ -131,7 +131,10 @@ def test_missing_mc_slices_do_not_enter_final_image_or_smoothing(tmp_path, monke
     if space != "epi":
         assert len(transform_inputs) == 2
         np.testing.assert_array_equal(transform_inputs[0][..., -1], 0)
-    for suffix, value, final_valid in (("", 7, expected_orig), ("_orig", 7, expected_orig)):
+    # Gaussian output now contains cleaned residuals; the optional original
+    # stream and zero-FWHM mask-only preview retain raw-intensity semantics.
+    primary = ("", -4, expected_cleaned) if fwhm else ("", 7, expected_orig)
+    for suffix, value, final_valid in (primary, ("_orig", 7, expected_orig)):
         final = nib.load(tmp_path / kind / f"vol_00001_{kind}{suffix}.nii").get_fdata()
         np.testing.assert_allclose(final[final_valid], value, atol=1e-6)
         np.testing.assert_array_equal(final[~final_valid], 0)
@@ -180,7 +183,7 @@ def test_dvars_excludes_entering_and_leaving_acquisition_coverage():
 @pytest.mark.parametrize("mode", ["zscore", "mean"])
 @pytest.mark.parametrize("reference", ["fixed", "running"])
 @pytest.mark.parametrize("fwhm", [0, 3])
-def test_spatial_smoothing_glm_then_prior_normalization_and_score(
+def test_spatial_glm_smoothing_then_prior_normalization_and_score(
         tmp_path, monkeypatch, mode, reference, fwhm):
     # Execute the real CPU Torch GLM and real normalizer, with only scanner/MC/
     # spatial native-library work replaced by known synthetic operators.
@@ -240,6 +243,10 @@ def test_spatial_smoothing_glm_then_prior_normalization_and_score(
     handler.voxel_normalizer = VoxelNormalizer(mode, reference, 3, final_brain)
     handler.processing_mask = handler.final_brain_mask = final_brain
     handler.smoother = MaskedGaussianSmoother(final_brain, target_affine, fwhm) if fwhm else None
+    # The production handler installs this callback for its first-fit history;
+    # this fixture constructs the real GLM wrapper directly instead.
+    if fwhm:
+        handler.motion_regressor._regress.startup_residual_transform = handler.smoother.apply
     if fwhm:
         (tmp_path / "smooth").mkdir()
     handler.gpu_resampler = None
@@ -285,11 +292,18 @@ def test_spatial_smoothing_glm_then_prior_normalization_and_score(
         glm_ready = index >= 4
         if glm_ready:
             design = np.column_stack((np.ones(index), np.linspace(-1., 1., index)))
-            target = responses[:index, final_valid].astype(np.float64)
+            target = mapped_history[:index, final_valid].astype(np.float64)
             fitted_residuals = target - design @ np.linalg.lstsq(design, target, rcond=None)[0]
             native_residual = fitted_residuals[-1]
+            # Fixed support makes these linear operations commute. Fitting
+            # independently smoothed BOLD provides a separate score oracle.
+            smoothed_target = responses[:index, final_valid].astype(np.float64)
+            fitted_smoothed_residuals = (smoothed_target - design @
+                np.linalg.lstsq(design, smoothed_target, rcond=None)[0])
+            score_residual = fitted_smoothed_residuals[-1]
         else:
-            native_residual = responses[index - 1][final_valid]
+            native_residual = mapped_history[index - 1][final_valid]
+            score_residual = responses[index - 1][final_valid]
         expected_reg = np.zeros(target_shape)
         expected_reg[final_valid] = native_residual
         expected_norm = np.zeros(target_shape)
@@ -299,13 +313,17 @@ def test_spatial_smoothing_glm_then_prior_normalization_and_score(
         if ready:
             samples = np.asarray(history)
             if mode == "zscore":
-                expected_norm[final_valid] = (native_residual - samples.mean(axis=0)) / samples.std(axis=0, ddof=1)
+                expected_norm[final_valid] = (score_residual - samples.mean(axis=0)) / samples.std(axis=0, ddof=1)
             else:
-                expected_norm[final_valid] = 100. * native_residual / samples.mean(axis=0)
+                expected_norm[final_valid] = 100. * score_residual / samples.mean(axis=0)
             expected_scores.append(expected_norm.copy())
         assert rt.process_volume(cfg, handler, source, index, raw_nii=source, volume_timestamp=float(index))
         np.testing.assert_allclose(nib.load(cfg.rt_reg_dir / f"vol_{index:05d}_reg.nii").get_fdata(),
                                    expected_reg, atol=.002, rtol=1e-5)
+        if fwhm:
+            smoothed = nib.load(tmp_path / "smooth" / f"vol_{index:05d}_smooth.nii").get_fdata()
+            np.testing.assert_allclose(smoothed[final_valid], score_residual, atol=.002, rtol=1e-5)
+            np.testing.assert_array_equal(smoothed[~final_valid], 0)
         normalized = nib.load(tmp_path / "norm" / f"vol_{index:05d}_norm.nii").get_fdata()
         np.testing.assert_allclose(normalized, expected_norm, atol=.002, rtol=1e-5)
         mapped = nib.load(tmp_path / "t1" / f"vol_{index:05d}_t1.nii").get_fdata()
@@ -313,9 +331,9 @@ def test_spatial_smoothing_glm_then_prior_normalization_and_score(
         np.testing.assert_array_equal(nib.load(tmp_path / "norm" / f"vol_{index:05d}_norm.nii").affine, target_affine)
         assert handler.score_queue.get_nowait()["reg_ready"] == ready
         if mode == "zscore" and index == 4:
-            history = list(fitted_residuals[:3 if reference == "fixed" else index].copy())
+            history = list(fitted_smoothed_residuals[:3 if reference == "fixed" else index].copy())
         elif (mode == "mean" or glm_ready) and (reference == "running" or len(history) < 3):
-            history.append(responses[index - 1][final_valid] if mode == "mean" else native_residual.copy())
+            history.append(responses[index - 1][final_valid] if mode == "mean" else score_residual.copy())
 
     assert len(transformed_normalized) == 0
     assert len(scored) == len(baseline) == sum(expected_ready)
