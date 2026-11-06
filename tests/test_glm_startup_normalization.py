@@ -4,13 +4,16 @@ from types import SimpleNamespace
 import nibabel as nib
 import numpy as np
 import pytest
+from scipy.ndimage import gaussian_filter
 
 from fmri_rt_preproc.voxel_normalization import VoxelNormalizer
+from fmri_rt_preproc.volume_smooth import MaskedGaussianSmoother
 from test_regression_coverage import RtpRegress
 
 
 @pytest.mark.parametrize("reference", ["fixed", "running"])
-def test_first_fit_exports_supported_residual_moments_once(tmp_path, reference):
+@pytest.mark.parametrize("fwhm", [0., 3.])
+def test_first_fit_exports_supported_residual_moments_once(tmp_path, reference, fwhm):
     rng = np.random.default_rng(416)
     shape = (2, 2, 3)
     brain = np.ones(shape, bool)
@@ -23,12 +26,22 @@ def test_first_fit_exports_supported_residual_moments_once(tmp_path, reference):
     motion = rng.normal(size=(30, 6)).astype(np.float32)
     motion[:, 1] = 2 * motion[:, 0]  # A rank-deficient nuisance design is valid.
     values = (1000. + rng.normal(size=(15, *shape)) * 40).astype(np.float32)
+    smoother = MaskedGaussianSmoother(brain, np.eye(4), fwhm) if fwhm else None
+    transformed_supports = []
+
+    def transform(frame, support_mask):
+        transformed_supports.append(support_mask.copy())
+        # The real smoother reuses its output buffer; moments must consume
+        # each frame before the next call overwrites that buffer.
+        return smoother.apply(frame, support_mask=support_mask)
+
     reg = RtpRegress(mask_file=brain_path, WM_reg=True, WM_mask=wm_path,
         mask_src_proc=SimpleNamespace(proc_data=None),
         volreg=SimpleNamespace(_motion=motion), mot_reg="mot6",
         TR=1., max_poly_order=1, max_scan_length=30, wait_num=11,
         onGPU=False, reg_retro_proc=False, scale_before_glm=False,
-        startup_ref_volumes=6, startup_ref_reference=reference)
+        startup_ref_volumes=6, startup_ref_reference=reference,
+        startup_residual_transform=transform if fwhm else None)
     assert reg.ready_proc()
     supports, first_fit = [], None
     for index, frame in enumerate(values, 1):
@@ -66,6 +79,25 @@ def test_first_fit_exports_supported_residual_moments_once(tmp_path, reference):
         if reference == "fixed":
             rows = rows[:6]
         residuals = residuals[rows]
+        if fwhm:
+            # Smoothing variances or SD maps is mathematically insufficient:
+            # temporal covariance between neighboring residuals matters.
+            sigma = fwhm / np.sqrt(8 * np.log(2))
+            density = gaussian_filter(complete.astype(float), sigma,
+                                      mode="constant", cval=0., truncate=4.)
+            expected_frames = []
+            for row in residuals:
+                frame = np.zeros(shape)
+                frame[complete] = row
+                numerator = gaussian_filter(frame, sigma, mode="constant", cval=0., truncate=4.)
+                expected_frames.append(numerator[complete] / density[complete])
+            smoothed_residuals = np.asarray(expected_frames)
+            unsmoothed_std = np.zeros(shape)
+            unsmoothed_std[complete] = residuals.std(axis=0, ddof=1)
+            smoothed_std_map = gaussian_filter(unsmoothed_std, sigma,
+                mode="constant", cval=0., truncate=4.)[complete] / density[complete]
+            assert np.max(np.abs(smoothed_std_map - smoothed_residuals.std(axis=0, ddof=1))) > 1.
+            residuals = smoothed_residuals
         expected_mean = residuals.mean(axis=0)
         expected_m2 = np.sum((residuals - expected_mean) ** 2, axis=0)
         assert payload["reference_count"] == len(rows)
@@ -82,6 +114,9 @@ def test_first_fit_exports_supported_residual_moments_once(tmp_path, reference):
                                    atol=.004, rtol=.001)
         reg.startup_residual_moments = None
     assert first_fit is not None
+    assert len(transformed_supports) == (len(rows) if fwhm else 0)
+    for support in transformed_supports:
+        np.testing.assert_array_equal(support, complete)
 
 
 @pytest.mark.parametrize("reference", ["fixed", "running"])
@@ -178,20 +213,33 @@ def test_startup_export_is_disabled_by_default_and_validates_configuration():
     reg = RtpRegress(max_scan_length=20, onGPU=False)
     assert reg.startup_ref_volumes is None
     assert reg.startup_residual_moments is None
+    assert reg.startup_residual_transform is None
     for invalid in (True, 1, 2.5, np.nan):
         with pytest.raises(ValueError, match="integer count"):
             RtpRegress(max_scan_length=20, onGPU=False, startup_ref_volumes=invalid)
     with pytest.raises(ValueError, match="fixed or running"):
         RtpRegress(max_scan_length=20, onGPU=False, startup_ref_reference="unknown")
+    for invalid in (False, 1, "smooth"):
+        with pytest.raises(ValueError, match="callable or None"):
+            RtpRegress(max_scan_length=20, onGPU=False, startup_residual_transform=invalid)
 
 
-def test_capture_waits_for_requested_rows_without_extra_fits_or_replay(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fwhm", [0., 3.])
+def test_capture_waits_for_requested_rows_without_extra_fits_or_replay(tmp_path, monkeypatch, fwhm):
     mask = np.ones((2, 2, 2), bool)
     mask_path = tmp_path / "brain.nii"
     nib.save(nib.Nifti1Image(mask.astype(np.uint8), np.eye(4)), mask_path)
+    smoother = MaskedGaussianSmoother(mask, np.eye(4), fwhm) if fwhm else None
+    transformed = []
+
+    def transform(frame, support_mask):
+        transformed.append(1)
+        return smoother.apply(frame, support_mask=support_mask)
+
     reg = RtpRegress(mask_file=mask_path, max_scan_length=20, max_poly_order=1,
         TR=1., wait_num=3, onGPU=False, reg_retro_proc=False,
-        scale_before_glm=False, startup_ref_volumes=6, save_proc=False)
+        scale_before_glm=False, startup_ref_volumes=6, save_proc=False,
+        startup_residual_transform=transform if fwhm else None)
     assert reg.ready_proc()
     calls, emitted = [], []
     solver = reg.do_proc.__globals__["lstsq_SVDsolver"]
@@ -216,6 +264,7 @@ def test_capture_waits_for_requested_rows_without_extra_fits_or_replay(tmp_path,
         else:
             assert reg.startup_residual_moments is None
     assert len(calls) == 4  # One solve for each ordinary ready volume.
+    assert len(transformed) == (6 if fwhm else 0)
     assert emitted == [3, 4, 5, 6]  # No retrospective downstream emissions.
     # The test's lightweight RTP base includes only __init__; supply its no-op
     # reset so the real RtpRegress reset can be exercised independently.

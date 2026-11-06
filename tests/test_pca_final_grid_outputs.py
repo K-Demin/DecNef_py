@@ -12,13 +12,17 @@ import roi_rs_pca_decoder_prep as prep
 import rs_pca_runtime as runtime
 from fmri_rt_preproc.processing_mask import (
     FINAL_PROCESSING_MASK_POLICY, FINAL_PROCESSING_MASK_POLICY_VERSION,
-    FINAL_NUISANCE_SOURCE, FINAL_PROCESSING_ORDER,
+    FINAL_NUISANCE_SOURCE, FINAL_PROCESSING_ORDER, LEGACY_FINAL_PROCESSING_ORDER,
 )
 
 
-def _metadata(run_dir, *, space="t1", mapped=False, smoothing=0, mask="whole_brain"):
+PROCESSING_ORDERS = ["spatial_smooth_glm_norm_v1", "spatial_glm_smooth_norm_v2"]
+
+
+def _metadata(run_dir, *, space="t1", mapped=False, smoothing=0, mask="whole_brain",
+              order="spatial_smooth_glm_norm_v1"):
     info = {
-        "temporal_processing_order": "spatial_smooth_glm_norm_v1",
+        "temporal_processing_order": order,
         "final_output": {"folder": "norm", "suffix": "norm", "space": space},
         "regression": {"analysis_space": space}, "epi_reference_mapped": mapped,
         "smoothing_fwhm_mm": smoothing, "analysis_mask": mask,
@@ -27,7 +31,8 @@ def _metadata(run_dir, *, space="t1", mapped=False, smoothing=0, mask="whole_bra
         "coverage_policy": "test_separate_support",
         "processing_mask": {"policy": FINAL_PROCESSING_MASK_POLICY,
                             "version": FINAL_PROCESSING_MASK_POLICY_VERSION, "interpolation": "linear",
-                            "processing_order": list(FINAL_PROCESSING_ORDER),
+                            "processing_order": list(FINAL_PROCESSING_ORDER if order == "spatial_glm_smooth_norm_v2"
+                                                     else LEGACY_FINAL_PROCESSING_ORDER),
                             "nuisance_source": FINAL_NUISANCE_SOURCE},
     }
     (run_dir / "session_metadata.json").write_text(json.dumps(info), encoding="utf-8")
@@ -58,9 +63,10 @@ def merge_locally(monkeypatch):
 @pytest.mark.parametrize("space,mapped,spatial", [
     ("epi", False, "mc"), ("epi", True, "epi_ref"), ("t1", False, "t1"), ("mni", False, "mni"),
 ])
+@pytest.mark.parametrize("order", PROCESSING_ORDERS)
 def test_final_aliases_select_norm_and_tsnr_uses_original_final_grid(
-        tmp_path, merge_locally, space, mapped, spatial):
-    _metadata(tmp_path, space=space, mapped=mapped)
+        tmp_path, merge_locally, space, mapped, spatial, order):
+    _metadata(tmp_path, space=space, mapped=mapped, order=order)
     _series(tmp_path, "norm", [0, 0, 2])
     _series(tmp_path, "reg", [0, 0, 200])
     _series(tmp_path, spatial, [100, 110, 120])
@@ -77,8 +83,9 @@ def test_final_aliases_select_norm_and_tsnr_uses_original_final_grid(
 
 
 @pytest.mark.parametrize("kind,smoothing,mask", [("smooth", 4, "whole_brain"), ("masked", 0, "cortical_gm")])
-def test_spatial_stage_alias_cannot_select_pre_denoising_input(tmp_path, merge_locally, kind, smoothing, mask):
-    _metadata(tmp_path, smoothing=smoothing, mask=mask)
+@pytest.mark.parametrize("order", PROCESSING_ORDERS)
+def test_spatial_stage_alias_cannot_select_pre_denoising_input(tmp_path, merge_locally, kind, smoothing, mask, order):
+    _metadata(tmp_path, smoothing=smoothing, mask=mask, order=order)
     _series(tmp_path, "norm", [0, 0, -2])
     _series(tmp_path, "t1", [100, 101, 102])
     _series(tmp_path, kind, [999, 999, 999])
@@ -129,8 +136,9 @@ def test_disabled_or_different_grid_alias_is_not_silently_decoded(tmp_path, kind
 
 @pytest.mark.parametrize("declaration", [None, {}, {"folder": "t1", "suffix": "t1", "space": "t1"},
                                         {"folder": "norm", "suffix": "norm", "space": "epi"}])
-def test_new_order_requires_consistent_final_output_metadata(tmp_path, declaration):
-    info = _metadata(tmp_path)
+@pytest.mark.parametrize("order", PROCESSING_ORDERS)
+def test_new_order_requires_consistent_final_output_metadata(tmp_path, declaration, order):
+    info = _metadata(tmp_path, order=order)
     info["final_output"] = declaration
     (tmp_path / "session_metadata.json").write_text(json.dumps(info), encoding="utf-8")
     with pytest.raises(ValueError, match="final_output"):
@@ -139,8 +147,9 @@ def test_new_order_requires_consistent_final_output_metadata(tmp_path, declarati
         prep._discover_rs_inputs(tmp_path, "auto")
 
 
-def test_final_grid_pca_still_excludes_warmup_and_keeps_first_ready_volume(tmp_path, merge_locally):
-    _metadata(tmp_path)
+@pytest.mark.parametrize("order", PROCESSING_ORDERS)
+def test_final_grid_pca_still_excludes_warmup_and_keeps_first_ready_volume(tmp_path, merge_locally, order):
+    _metadata(tmp_path, order=order)
     _series(tmp_path, "norm", [0, 0, 0, 2])
     _series(tmp_path, "t1", [100, 101, 102, 103])
     (tmp_path / "regression_status_rt.csv").write_text(
@@ -182,11 +191,12 @@ def test_mni_mask_is_never_sent_through_t1_to_epi_transform(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("kind", ["norm", "epi_ref"])
-def test_all_roi_final_aliases_keep_existing_readiness_filter(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize("order", PROCESSING_ORDERS)
+def test_all_roi_final_aliases_keep_existing_readiness_filter(tmp_path, monkeypatch, kind, order):
     import test_rt_pipeline_parallel  # headless launcher imports
     import rs_pca_score_all_rois as all_rois
 
-    _metadata(tmp_path, space="epi", mapped=True)
+    _metadata(tmp_path, space="epi", mapped=True, order=order)
     _series(tmp_path, "norm", [0, 0, 4, 6, 8])
     (tmp_path / "regression_status_rt.csv").write_text(
         "volume_idx,reg_ready,glm_ready,normalization_ready\n"

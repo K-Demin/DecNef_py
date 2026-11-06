@@ -11,12 +11,12 @@
   "_comment_epi_reference_n4": "N4-correct a reference copy before spatial registration; keep the original MC target and incoming BOLD intensities.",
   "_comment": "Realtime defaults for Olga's PFC presence/absence DecNef session. Derived from the lab template; deviations are annotated below.",
   "_comment_json": "JSON does not support native comments, so this file uses _comment fields for inline notes.",
-  "_comment_timing": "Acquisition/model settings. analysis_space: epi (selected EPI reference), t1 (T1), or mni (MNI). Spatial transforms and optional smoothing precede original-intensity cGLM and voxel normalization, both on the final analysis grid.",
+  "_comment_timing": "Acquisition/model settings. analysis_space: epi (selected EPI reference), t1 (T1), or mni (MNI). Spatial transforms, original-intensity cGLM, optional smoothing and voxel normalization run in that order on the final analysis grid.",
   "TR": 1.0,
   "save_decoder_contributions": true,
   "analysis_space": "t1",
   "skip_first_trs": 10,
-  "_comment_voxel_normalization": "zscore: center and divide by sample SD of denoised final-grid voxels; mean: 100 * denoised value / pre-GLM mean after transforms and optional smoothing. The first successful cGLM fit seeds z-scoring from stored startup residual history: fixed takes the first N valid fitted rows; running takes all available fitted rows and then updates from prior samples only. Scoring starts on the next TR, without a second calibration window. With N=30 and a first fit at volume 30, the earliest scored volume is 31; design or coverage can delay readiness.",
+  "_comment_voxel_normalization": "zscore: center and divide by sample SD of denoised, optionally smoothed final-grid voxels; mean: 100 * smoothed denoised value / raw BOLD mean after transforms and optional smoothing. The first successful cGLM fit seeds z-scoring from stored startup residual history with the same smoothing: fixed takes the first N valid fitted rows; running takes all available fitted rows and then updates from prior samples only. Scoring starts on the next TR, without a second calibration window. With N=30 and a first fit at volume 30, the earliest scored volume is 31; design or coverage can delay readiness.",
   "voxel_norm_mode": "zscore",
   "voxel_norm_reference": "fixed",
   "voxel_norm_ref_volumes": 30,
@@ -69,7 +69,7 @@
   "volume_stream_window_y": 50,
   "_comment_baseline_sync": "voxel_norm_ref_volumes independently sets the statistical window. --baseline-trs controls presentation timing and does not override it or extend automatically. The first successful cGLM fit also seeds z-score calibration from stored history; scoring can start on the next TR once sufficient valid data exist. Increase --baseline-trs explicitly if a longer background period is wanted.",
   "_comment_skip_sync": "Keep skip_first_trs consistent with the resolved --skip-first-trs launcher setting; these discarded initial volumes do not replace the GLM or normalization calibration.",
-  "_comment_scoring": "The pipeline applies transforms, optional smoothing, denoising, then voxel normalization on the final analysis grid. The probability launcher must score these features without a second voxel z-score. The fixed startup reference differs from offline run-wise standardization: compare the trained decoder feature contract before reusing its weights. Supply --decoder-roi-txt to include the trained intercept.",
+  "_comment_scoring": "The pipeline applies transforms, denoising, optional smoothing, then voxel normalization on the final analysis grid. The probability launcher must score these features without a second voxel z-score. The fixed startup reference differs from offline run-wise standardization: compare the trained decoder feature contract before reusing its weights. Supply --decoder-roi-txt to include the trained intercept.",
   "_comment_workers": "Raised from 2. TR=1s with T1-space resampling and a 5-stage trial structure leaves little slack; verify the per-volume latency in the run log stays under 1.0 s and drop back to 2 if the GPU resampler is contended.",
   "_comment_gs": "Changed from false to TRUE. The offline decoder was trained on data cleaned with global_signal, csf and white_matter as confounds (mvpa_pfc.config.DEFAULT_MOTION_COLS). Any regressor present offline but absent online leaves its variance in the real-time features, where the weights treat it as signal. use_wm/use_vent were already true; global signal was the one gap."
 

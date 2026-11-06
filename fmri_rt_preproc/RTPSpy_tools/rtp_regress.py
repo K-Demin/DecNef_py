@@ -99,7 +99,7 @@ class RtpRegress(RTP):
                  tshift=0.0, desMtx=None, wait_num=0, mask_file=0,
                  max_scan_length=800, onGPU=gpu_available, reg_retro_proc=True, spike_reg_num=200,
                  scale_before_glm=True, startup_ref_volumes=None,
-                 startup_ref_reference='fixed',
+                 startup_ref_reference='fixed', startup_residual_transform=None,
                  **kwargs):
         """
         Parameters
@@ -187,6 +187,12 @@ class RtpRegress(RTP):
         startup_ref_reference : {'fixed', 'running'}, optional
             Fixed uses the first startup_ref_volumes valid fitted rows; running
             uses every valid fitted row available at that first fit.
+        startup_residual_transform : callable or None, optional
+            Apply this spatial operation to each selected full-grid residual
+            before reducing startup moments. It receives a NumPy volume and
+            support_mask keyword. This makes calibration describe subsequent
+            spatial smoothing without another GLM fit or calibration window.
+            None preserves the original tensor-only moment reduction.
 
         """
         super(RtpRegress, self).__init__(**kwargs)
@@ -231,6 +237,9 @@ class RtpRegress(RTP):
             startup_ref_volumes = n_startup
         self.startup_ref_volumes = startup_ref_volumes
         self.startup_ref_reference = startup_ref_reference
+        if startup_residual_transform is not None and not callable(startup_residual_transform):
+            raise ValueError('Startup residual transform must be callable or None.')
+        self.startup_residual_transform = startup_residual_transform
         self.wait_num = wait_num
 
         self.spike_reg_num = int(spike_reg_num) if spike_reg_num else 0
@@ -839,17 +848,40 @@ class RtpRegress(RTP):
         else:
             residuals = (fitted_data.index_select(0, rows) -
                          prediction.index_select(0, rows))
-        variance, mean = torch.var_mean(residuals, dim=0, unbiased=False)
-        if not (torch.isfinite(mean).all() and torch.isfinite(variance).all()):
-            raise ValueError('Nonfinite startup residual moments.')
-        # Transfer only per-voxel moments, not the full time-by-voxel history.
         support = np.zeros_like(self.maskV, dtype=bool)
         support[self.maskV] = self.Y_mean_mask.detach().cpu().numpy()
         means = np.zeros(self.maskV.shape, dtype=np.float64)
         m2 = np.zeros(self.maskV.shape, dtype=np.float64)
         counts = np.zeros(self.maskV.shape, dtype=np.int64)
-        means[support] = mean.detach().cpu().numpy()
-        m2[support] = variance.detach().cpu().numpy().astype(np.float64) * count
+        if self.startup_residual_transform is None:
+            # With no smoothing, retain the tensor-only fast path: transfer
+            # per-voxel moments, never the full time-by-voxel history.
+            variance, mean = torch.var_mean(residuals, dim=0, unbiased=False)
+            if not (torch.isfinite(mean).all() and torch.isfinite(variance).all()):
+                raise ValueError('Nonfinite startup residual moments.')
+            means[support] = mean.detach().cpu().numpy()
+            m2[support] = variance.detach().cpu().numpy().astype(np.float64) * count
+        else:
+            # Smooth actual residual frames, not SD maps: the variance of a
+            # spatial average also depends on covariance between neighbors.
+            # Stream one frame at a time and retain only Welford moments.
+            frame = np.zeros(self.maskV.shape, dtype=np.float32)
+            mean = np.zeros(int(support.sum()), dtype=np.float64)
+            sum_squares = np.zeros_like(mean)
+            for index, residual in enumerate(residuals, 1):
+                frame[support] = residual.detach().cpu().numpy()
+                transformed = np.asarray(self.startup_residual_transform(
+                    frame, support_mask=support))
+                if transformed.shape != frame.shape:
+                    raise ValueError('Startup residual transform changed the volume shape.')
+                values = transformed[support].astype(np.float64)
+                if not np.isfinite(values).all():
+                    raise ValueError('Nonfinite transformed startup residuals.')
+                delta = values - mean
+                mean += delta / index
+                sum_squares += delta * (values - mean)
+            means[support] = mean
+            m2[support] = sum_squares
         counts[support] = count
         return dict(mean=means, m2=m2, count=counts, reference_count=count)
 
@@ -1984,7 +2016,7 @@ class RtpRegress(RTP):
                       'desMtx', 'maskV', 'motcols', 'rtp_retrots',
                       'col_names_read', 'Y_mean', 'Y_mean_mask', 'GS_maskdata',
                       'raw_reference_mean', 'raw_reference_count', 'raw_reference_valid',
-                      'startup_residual_moments',
+                      'startup_residual_moments', 'startup_residual_transform',
                       'WM_maskdata', 'Vent_maskdata', 'GS_col', 'WM_col',
                       'Vent_col', 'desMtx_read', 'mask_src_proc', 'work_dir')
         sel_opts = {}

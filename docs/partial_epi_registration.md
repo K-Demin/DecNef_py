@@ -165,7 +165,7 @@ new preparation. Run-specific fieldmaps remain native to their acquisitions.
 In EPI analysis mode, NF output is mapped to the stable prepared EPI grid and
 saved in `epi_ref/`. EPI decoders must match that grid. T1/MNI output uses the
 composed mapping directly. MC and nuisance sampling stay native; response
-smoothing, denoising and normalization run on the selected final grid.
+denoising, smoothing and normalization run on the selected final grid.
 
 See [QC metrics and threshold rules](registration_qc.md). Pearson correlation is
 for EPI/EPI or T1/template; EPI/T1 uses cross-contrast metrics and overlays.

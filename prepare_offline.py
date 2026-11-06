@@ -152,7 +152,98 @@ def import_fmriprep(args, run_command=run):
                                                      "n4_rerun": False},
                       "inputs": {key: file_identity(path) for key, path in sources.items()},
                       "alignment_validation": "not_performed_by_import"}
+        if getattr(args, "folder_preparation", None) is not None:
+            provenance["folder_preparation"] = args.folder_preparation
         return write_bundle(output, args.subject, images, transforms, args.mni_space, provenance)
+
+
+def _unique_file(paths, role):
+    paths = sorted({Path(path).resolve() for path in paths if Path(path).is_file()})
+    if len(paths) != 1:
+        found = ", ".join(str(path) for path in paths) or "none"
+        raise ValueError(f"Expected one {role}; found {len(paths)}: {found}")
+    return paths[0]
+
+
+def import_fmriprep_folder(args, run_command=run):
+    """Select one copied session, derive missing masks, then use the importer."""
+    folder = Path(args.input).expanduser().resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(folder)
+    output = _empty_destination(args.output or folder / "prepared")
+    subject = f"sub-{args.subject}"
+    anat, func = folder / "anat", folder / "func"
+    native = lambda path: (path.name.split("_")[0] == subject and "_space-" not in path.name
+                           and path.name.endswith((".nii", ".nii.gz")))
+    t1 = _unique_file((p for p in anat.glob(f"{subject}*_desc-preproc_T1w.nii*") if native(p)),
+                      "native preprocessed T1 (scope --input to one session)")
+    prefix = t1.name.split("_desc-preproc_T1w.nii")[0]
+    reference_run = str(args.reference_run)
+    if not re.fullmatch(r"[A-Za-z0-9]+", reference_run):
+        raise ValueError("--reference-run must be a BIDS run label, e.g. 01")
+    run_key = lambda value: int(value) if value.isdigit() else value
+    references = []
+    for path in func.glob(f"{subject}*_desc-coreg_boldref.nii*"):
+        match = re.search(r"_run-([^_]+)_", path.name)
+        task = re.search(r"_task-([^_]+)_", path.name)
+        if (native(path) and match and run_key(match[1]) == run_key(reference_run)
+                and (not args.reference_task or task and task[1] == args.reference_task)):
+            references.append(path)
+    reference = _unique_file(references, "native coreg boldref for the selected run; use --reference-task if needed")
+    ref_prefix = reference.name.split("_desc-coreg_boldref.nii")[0]
+    t1_session, ref_session = re.search(r"_ses-([^_]+)", prefix), re.search(r"_ses-([^_]+)", ref_prefix)
+    if t1_session and (not ref_session or t1_session[1] != ref_session[1]):
+        raise ValueError("Selected EPI reference and T1 belong to different sessions")
+    sources = {"epi_reference": reference,
+               "epi_to_t1": _file(func / (ref_prefix + "_from-boldref_to-T1w_mode-image_desc-coreg_xfm.txt")),
+               "t1": t1, "t1_mask": _nifti(anat, prefix + "_desc-brain_mask"),
+               "wm_probseg": _nifti(anat, prefix + "_label-WM_probseg")}
+    _affine_text(sources["epi_to_t1"])
+    transforms = list(anat.glob(prefix + "_from-T1w_to-MNI*_mode-image_xfm.h5"))
+    if args.mni_space:
+        transforms = [p for p in transforms if f"_to-{args.mni_space}_mode-image_" in p.name]
+    sources["t1_to_mni"] = _unique_file(transforms, "T1-to-MNI transform")
+    mni_space = sources["t1_to_mni"].name.split("_from-T1w_to-")[1].split("_mode-image_")[0]
+    sources["mni_template"] = (_file(args.mni_template) if args.mni_template else
+                               _unique_file((p for p in folder.joinpath("templates").glob("*.nii*")
+                                             if p.name.endswith((".nii", ".nii.gz"))), "canonical MNI template"))
+    aseg = _unique_file([folder / "FreeSurfer/mri/aseg.mgz",
+                         folder / f"FreeSurfer/{subject}/mri/aseg.mgz"], "FreeSurfer aseg.mgz")
+    fs_to_t1 = _file(anat / (prefix + "_from-fsnative_to-T1w_mode-image_xfm.txt"))
+    _affine_text(fs_to_t1)
+    epi_image, t1_image = _image(reference), _image(t1)
+    require_same_grid(t1_image, _image(sources["t1_mask"], binary=True))
+    fs_image = nib.load(str(aseg))
+    fs_labels = np.asanyarray(fs_image.dataobj)
+    if fs_labels.ndim != 3 or not np.isfinite(fs_labels).all() or not np.all(fs_labels == np.rint(fs_labels)):
+        raise ValueError("FreeSurfer aseg must be a finite integer 3D segmentation")
+    derived = folder / "derived" / ("run-" + reference_run)
+    derived.mkdir(parents=True, exist_ok=True)
+    epi_ref, t1_ref = reference, t1
+    for name, image in (("epi", epi_image), ("t1", t1_image)):
+        source = reference if name == "epi" else t1
+        if len(nib.load(str(source)).shape) == 4:
+            target = derived / source.name
+            nib.save(image, target)
+            if name == "epi": epi_ref = target
+            else: t1_ref = target
+    fs_nifti = derived / (prefix + "_space-fsnative_desc-aseg_dseg.nii.gz")
+    nib.save(nib.Nifti1Image(fs_labels.astype(np.int16), fs_image.affine), fs_nifti)
+    sources["aseg"] = derived / (prefix + "_space-T1w_desc-aseg_dseg.nii.gz")
+    sources["epi_mask"] = derived / (ref_prefix + "_desc-brain_mask.nii.gz")
+    derivations = [
+        ["antsApplyTransforms", "-d", "3", "-i", str(fs_nifti), "-r", str(t1_ref),
+         "-o", str(sources["aseg"]), "-n", "NearestNeighbor", "-t", str(fs_to_t1)],
+        ["antsApplyTransforms", "-d", "3", "-i", str(sources["t1_mask"]), "-r", str(epi_ref),
+         "-o", str(sources["epi_mask"]), "-n", "NearestNeighbor", "-t", f"[{sources['epi_to_t1']},1]"],
+    ]
+    for command in derivations:
+        run_command(command)
+    preparation = {"input_folder": str(folder), "reference_run": reference_run,
+                   "fs_aseg": file_identity(aseg), "fsnative_to_t1": file_identity(fs_to_t1),
+                   "derivation_commands": derivations}
+    return import_fmriprep(SimpleNamespace(subject=args.subject, mni_space=mni_space, output=output,
+                           t1_to_epi=None, folder_preparation=preparation, **sources), run_command)
 
 
 def _nifti(folder, name):
@@ -261,6 +352,15 @@ def build_parser():
     for option in ("epi-reference", "epi-mask", "epi-to-t1", "t1", "t1-mask", "wm-probseg", "aseg", "t1-to-mni"):
         importer.add_argument("--" + option, type=Path, required=True)
     importer.add_argument("--t1-to-epi", type=Path, help="Required inverse for a composite .h5 EPI-to-T1 transform.")
+    folder_importer = commands.add_parser("import-fmriprep-folder",
+        help="Prepare matching files copied under anat/, func/, FreeSurfer/ and templates/.")
+    folder_importer.add_argument("--subject", required=True, help="Subject ID without the sub- prefix.")
+    folder_importer.add_argument("--input", type=Path, required=True, help="One copied subject/session folder.")
+    folder_importer.add_argument("--reference-run", default="01", help="BIDS run label for the corrected native EPI anchor.")
+    folder_importer.add_argument("--reference-task", help="Task label if several tasks share the run number.")
+    folder_importer.add_argument("--mni-template", type=Path, help="Override the unique image under input/templates/.")
+    folder_importer.add_argument("--mni-space", help="Select a named space if several T1-to-MNI transforms exist.")
+    folder_importer.add_argument("--output", type=Path, help="New bundle directory; defaults to input/prepared/.")
     exporter = commands.add_parser("export-prepared", help="Copy an existing corrected DecNef reference and transforms.")
     exporter.add_argument("--prepared-day", type=Path, required=True)
     for subparser in (importer, exporter):
@@ -274,9 +374,11 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.subject.strip() or not args.mni_space.strip():
+    if not args.subject.strip() or args.mni_space is not None and not args.mni_space.strip():
         parser.error("--subject and --mni-space cannot be empty.")
-    manifest = import_fmriprep(args) if args.command == "import-fmriprep" else export_prepared(args)
+    handlers = {"import-fmriprep": import_fmriprep, "import-fmriprep-folder": import_fmriprep_folder,
+                "export-prepared": export_prepared}
+    manifest = handlers[args.command](args)
     print(f"Offline asset manifest: {manifest}")
     print("Import/export checks structure and grids; inspect anatomical alignment before use.")
     return manifest

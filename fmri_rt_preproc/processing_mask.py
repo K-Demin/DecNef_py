@@ -1,7 +1,7 @@
 """Processing-mask provenance and the historical source-grid margin helper.
 
-Current response processing uses the final analysis grid after spatial mapping
-and smoothing. Native unsmoothed nuisance sampling remains separate. The cubic
+Current response processing uses the final analysis grid after spatial mapping;
+denoising precedes optional smoothing. Native nuisance sampling stays unsmoothed. The cubic
 margin helper retains its original behavior for callers requiring native-grid
 support; it does not define the current response GLM/normalization mask.
 """
@@ -17,8 +17,48 @@ FINAL_PROCESSING_MASK_POLICY = "final_analysis_grid"
 FINAL_PROCESSING_MASK_POLICY_VERSION = 1
 FINAL_NUISANCE_SOURCE = "native_unsmoothed_mc"
 FINAL_PROCESSING_ORDER = (
+    "spatial_transform", "denoising", "smoothing", "normalization",
+)
+LEGACY_FINAL_PROCESSING_ORDER = (
     "spatial_transform", "smoothing", "denoising", "normalization",
 )
+
+
+def canonical_final_processing_mask(mask: dict, smoothing_fwhm_mm=None) -> dict:
+    """Validate final-grid provenance and retain equivalent unsmoothed runs.
+
+    The former smoothing-before-denoising order is equivalent only when the
+    run explicitly records zero Gaussian FWHM. Missing widths, booleans and
+    nonfinite values cannot establish that. Never modify the saved metadata.
+    Callers comparing runs must still compare their actual FWHM settings.
+    """
+    if not isinstance(mask, dict):
+        raise ValueError("Missing final-grid processing metadata.")
+    order = mask.get("processing_order")
+    if (mask.get("policy") != FINAL_PROCESSING_MASK_POLICY
+            or not isinstance(mask.get("version"), int)
+            or mask.get("version") != FINAL_PROCESSING_MASK_POLICY_VERSION
+            or isinstance(mask.get("version"), bool)
+            or mask.get("nuisance_source") != FINAL_NUISANCE_SOURCE
+            or not isinstance(order, (tuple, list))):
+        raise ValueError("Invalid final-grid order/nuisance-source policy.")
+    if tuple(order) == LEGACY_FINAL_PROCESSING_ORDER:
+        explicit_zero = (
+            isinstance(smoothing_fwhm_mm, (int, float, np.integer, np.floating))
+            and not isinstance(smoothing_fwhm_mm, (bool, np.bool_))
+            and np.isfinite(smoothing_fwhm_mm)
+            and smoothing_fwhm_mm == 0
+        )
+        if not explicit_zero:
+            raise ValueError(
+                "Smoothing-before-denoising references require explicit zero FWHM "
+                "for reuse; reprocess smoothed or unverifiable references."
+            )
+    elif tuple(order) != FINAL_PROCESSING_ORDER:
+        raise ValueError("Unsupported final-grid processing order.")
+    result = dict(mask)
+    result["processing_order"] = list(FINAL_PROCESSING_ORDER)
+    return result
 
 
 def canonical_upstream_processing(spec: dict) -> dict:
@@ -69,11 +109,14 @@ def upstream_processing_spec(metadata: dict, input_stage: str = "normalized") ->
         return None
     if not isinstance(metadata["normalization"], dict) or not metadata["normalization"]:
         raise ValueError("Run declares normalization but does not record its specification.")
+    mask = metadata.get("processing_mask")
+    if isinstance(mask, dict) and mask.get("policy") == FINAL_PROCESSING_MASK_POLICY:
+        mask = canonical_final_processing_mask(mask, metadata.get("smoothing_fwhm_mm"))
     return canonical_upstream_processing({
         "version": 1, "input_stage": input_stage,
         "normalization": metadata["normalization"] if input_stage == "normalized" else None,
         "coverage_policy": metadata.get("coverage_policy"),
-        "processing_mask": metadata.get("processing_mask"),
+        "processing_mask": mask,
     })
 
 
