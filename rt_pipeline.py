@@ -3103,6 +3103,15 @@ def run_rt_pipeline(cfg: RTSessionConfig, score_queue: Optional[object] = None):
             event_handler.speed.arrive(parse_dicom_name(path.name)[2], backlog=True)
 
     observer.start()
+    # Handler initialization can take several seconds. Files written after the
+    # initial snapshot but before the observer started have no queued event.
+    # Subscribe first, then rescan before submitting any work. Overlapping
+    # created/closed events use the handler's existing deduplication guards.
+    existing = []
+    for path in sorted(cfg.incoming_dir.glob("*.dcm")):
+        parsed = parse_dicom_name(path.name)
+        if parsed is not None and parsed[1] == int(cfg.run):
+            existing.append(path)
     if existing:
         print(f"[RT] Found {len(existing)} existing DICOMs — processing offline first…")
         for f in existing:
