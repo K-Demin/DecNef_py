@@ -42,6 +42,8 @@ def test_reference_roi_and_every_tr_export(tmp_path, monkeypatch, space, gpu, tr
     brain[0, :, :] = False
     mask = np.ones(values.shape, dtype=bool)
     mask[:, 0, :] = False
+    weights = np.arange(1., mask.sum() + 1.)
+    squared_weights = weights ** 2
 
     def map_values(data):
         return data.copy() if space == "epi" else np.flip(data, axis=1).copy()
@@ -57,7 +59,7 @@ def test_reference_roi_and_every_tr_export(tmp_path, monkeypatch, space, gpu, tr
         resample(command[command.index("-i") + 1], command[command.index("-o") + 1])
 
     monkeypatch.setattr(rt, "run", run)
-    handler = SimpleNamespace(scorer=SimpleNamespace(mask=mask), final_brain_mask=brain,
+    handler = SimpleNamespace(scorer=SimpleNamespace(mask=mask, w=weights), final_brain_mask=brain,
         gpu_resampler=SimpleNamespace(resample_support=map_values,
                                      resample_nifti_to_nifti=resample) if gpu else None)
     if training_reference:
@@ -88,16 +90,24 @@ def test_reference_roi_and_every_tr_export(tmp_path, monkeypatch, space, gpu, tr
     assert result["reference_correlation"] == pytest.approx(np.corrcoef(
         ref_data[expected_roi], current[expected_roi])[0, 1])
     assert result["reference_coverage_fraction"] == 1
-    # Later coverage loss is not hidden by reducing the fixed ROI.
+    assert result["decoder_weight_loss_fraction"] == pytest.approx(
+        squared_weights[~support[mask]].sum() / squared_weights.sum())
+    # Later loss lowers coverage and r still uses the valid overlap.
     lost = tuple(np.argwhere(expected_roi)[0])
     support[lost] = False
     result = rt.record_decoder_correlation(cfg, handler, 2, current_path, support)
-    assert result["correlation_status"] == "incomplete_coverage"
-    assert np.isnan(result["reference_correlation"])
+    overlap = expected_roi & support
+    assert result["correlation_status"] == "partial_coverage"
+    assert result["reference_correlation"] == pytest.approx(np.corrcoef(
+        ref_data[overlap], current[overlap])[0, 1])
+    assert result["reference_coverage_fraction"] == pytest.approx(overlap.sum() / expected_roi.sum())
+    assert result["decoder_weight_loss_fraction"] == pytest.approx(
+        squared_weights[~support[mask]].sum() / squared_weights.sum())
     np.testing.assert_array_equal(handler.decoder_qc.roi, expected_roi)
     with (tmp_path / "decoder_qc_rt.csv").open() as stream:
         rows = list(csv.DictReader(stream))
     assert [row["volume_idx"] for row in rows] == ["1", "2"]
+    assert float(rows[1]["decoder_weight_loss_fraction"]) == pytest.approx(result["decoder_weight_loss_fraction"])
     if space == "epi" or gpu:
         assert not commands
 

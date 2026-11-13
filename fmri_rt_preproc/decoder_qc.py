@@ -55,10 +55,13 @@ def _unit_centered(values):
     scale = float(np.max(np.abs(centered)))
     if scale == 0:
         return None
-    centered = centered / scale
+    centered /= scale
     centered -= centered.mean(dtype=np.float64)
     norm = float(np.sqrt(np.dot(centered, centered)))
-    return centered / norm if norm > 0 and np.isfinite(norm) else None
+    if norm <= 0 or not np.isfinite(norm):
+        return None
+    centered /= norm
+    return centered
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class DecoderCorrelationResult:
     reference_correlation: float
     reference_coverage_fraction: float
     correlation_status: str
+    decoder_weight_loss_fraction: float = float("nan")
 
     def as_dict(self):
         return asdict(self)
@@ -75,7 +79,8 @@ class DecoderSpatialCorrelation:
     """Cache one reference pattern and preserve one ROI for the entire run.
 
     ``decoder_mask`` is the effective decoder feature mask supplied by the
-    scorer; weights, their sign and nonzero thresholds are never inferred here.
+    scorer. Optional ``decoder_weights`` follow the same flattened mask order
+    and measure unavailable squared weight independently of the Pearson r.
     ``fixed_roi_mask`` may restrict that mask once using prepared session brain
     and acquisition coverage. Its exclusions are recorded relative to the full
     decoder. An optional explicit ``roi_image`` is intersected once as well.
@@ -88,7 +93,7 @@ class DecoderSpatialCorrelation:
     def __init__(self, reference_image, decoder_mask, *, analysis_image=None,
                  fixed_roi_mask=None, roi_image=None,
                  reference_kind="decoder_training_mean", reference_label=None,
-                 fixed_roi_policy=None):
+                 fixed_roi_policy=None, decoder_weights=None):
         if reference_kind not in {"decoder_training_mean", "prepared_session_reference"}:
             raise ValueError("Unknown decoder correlation reference kind.")
         reference = _image(reference_image)
@@ -117,7 +122,9 @@ class DecoderSpatialCorrelation:
         self.roi = roi
         self.roi.setflags(write=False)
         self._indices = np.flatnonzero(roi)
-        values = np.asarray(data, dtype=np.float64).ravel()[self._indices]
+        values = data.ravel()[self._indices].astype(np.float64, copy=False)
+        values.setflags(write=False)
+        self._reference_values = values
         self._reference_unit = None
         self._reference_status = None
         if not values.size:
@@ -137,17 +144,32 @@ class DecoderSpatialCorrelation:
             "Decoder-construction mean EPI" if reference_kind == "decoder_training_mean"
             else "Prepared session EPI reference (fallback)")
         full_count = int(decoder.sum())
+        self._decoder_indices = None
+        self._decoder_weight_energy = None
+        if decoder_weights is not None:
+            weights = np.asarray(decoder_weights, dtype=np.float64)
+            if weights.shape != (full_count,):
+                raise ValueError("Decoder QC weights must be a 1D array in decoder mask order.")
+            scale = np.max(np.abs(weights), initial=0.)
+            if np.isfinite(scale) and scale > 0:
+                # Scaling before squaring keeps the fraction defined for large weights.
+                energy = np.square(weights / scale)
+                self._decoder_weight_energy = energy / energy.sum()
+                self._decoder_indices = (
+                    self._indices if full_count == self._indices.size else np.flatnonzero(decoder)
+                )
         self.metadata = {
             "reference_kind": reference_kind, "reference_label": self.reference_label,
             "reference_path": str(Path(reference_image).resolve()) if isinstance(reference_image, (str, Path)) else None,
             "reference_shape": list(self.shape), "reference_affine": self.affine.tolist(),
-            "full_decoder_voxel_count": full_count, "fixed_qc_voxel_count": int(roi.sum()),
-            "excluded_decoder_fraction": 1 - int(roi.sum()) / full_count if full_count else 0.0,
+            "full_decoder_voxel_count": full_count, "fixed_qc_voxel_count": int(self._indices.size),
+            "excluded_decoder_fraction": 1 - self._indices.size / full_count if full_count else 0.0,
             "fixed_roi_policy": fixed_roi_policy or "Effective decoder mask intersected once with provided fixed session ROI and optional explicit QC ROI.",
             "explicit_roi_path": str(Path(roi_image).resolve()) if isinstance(roi_image, (str, Path)) else None,
             "comparison_stage": "Spatially transformed EPI before smoothing, denoising and voxel normalization.",
-            "correlation_definition": "Unweighted spatial Pearson correlation across the same fixed QC voxels at every TR; reference centered/unit-normalized once in float64.",
-            "incomplete_support_policy": "NaN correlation with status and coverage fraction; fixed QC voxels are never removed per volume.",
+            "correlation_definition": "Unweighted spatial Pearson correlation on the available subset of the fixed QC ROI at each TR.",
+            "incomplete_support_policy": "Use covered voxels with finite incoming values; defined correlations on a subset have partial_coverage status. Coverage is relative to the fixed QC ROI.",
+            "decoder_weight_loss_definition": "Fraction of full decoder squared weight on features without current spatial coverage or with nonfinite incoming EPI values.",
             "score_and_censor_effect": "None; diagnostic only.",
         }
 
@@ -156,7 +178,7 @@ class DecoderSpatialCorrelation:
 
         ``coverage`` describes the current spatially transformed EPI before
         temporal denoising. Do not substitute cumulative cGLM support here.
-        Omitting it assumes acquired support at every fixed QC voxel; it does
+        Omitting it assumes acquired support at every decoder voxel; it does
         not infer support from nonzero image intensity.
         """
         if hasattr(volume, "dataobj") and hasattr(volume, "affine"):
@@ -169,29 +191,48 @@ class DecoderSpatialCorrelation:
             raise ValueError("Incoming EPI and decoder correlation reference grids differ.")
         if data.shape != self.shape:
             raise ValueError("Incoming EPI and decoder correlation reference shapes differ.")
-        values = data.ravel()[self._indices].astype(np.float64, copy=False)
-        supported = np.ones(values.size, dtype=bool)
+        flat_data = data.ravel()
+        flat_coverage = None
         if coverage is not None:
-            valid = np.asarray(coverage)
+            valid = np.asarray(coverage, dtype=bool)
             if valid.shape != self.shape:
                 raise ValueError("Current coverage and decoder correlation reference shapes differ.")
-            supported = valid.ravel()[self._indices].astype(bool)
-        finite = np.isfinite(values)
-        fraction = float(np.count_nonzero(supported & finite) / values.size) if values.size else 0.0
+            flat_coverage = valid.ravel()
+        values = flat_data[self._indices].astype(np.float64, copy=False)
+        available = np.isfinite(values)
+        if flat_coverage is not None:
+            available &= flat_coverage[self._indices]
+        count = np.count_nonzero(available)
+        fraction = float(count / values.size) if values.size else 0.0
+        weight_loss = float("nan")
+        if self._decoder_weight_energy is not None:
+            decoder_available = available
+            if self._decoder_indices is not self._indices:
+                decoder_available = np.isfinite(flat_data[self._decoder_indices])
+                if flat_coverage is not None:
+                    decoder_available &= flat_coverage[self._decoder_indices]
+            weight_loss = float(np.clip(self._decoder_weight_energy.sum(where=~decoder_available), 0., 1.))
+
         status = self._reference_status
-        if status is None and not supported.all():
-            status = "incomplete_coverage"
-        if status is None and not finite.all():
-            status = "nonfinite_volume"
         if status is not None:
-            return DecoderCorrelationResult(float("nan"), fraction, status)
+            return DecoderCorrelationResult(float("nan"), fraction, status, weight_loss)
+        if count < 2:
+            return DecoderCorrelationResult(float("nan"), fraction, "insufficient_overlap", weight_loss)
+        reference_unit = self._reference_unit
+        status = "ok"
+        if count < values.size:
+            reference_unit = _unit_centered(self._reference_values[available])
+            if reference_unit is None:
+                return DecoderCorrelationResult(float("nan"), fraction, "constant_reference", weight_loss)
+            values = values[available]
+            status = "partial_coverage"
         unit = _unit_centered(values)
         if unit is None:
-            return DecoderCorrelationResult(float("nan"), fraction, "constant_volume")
-        correlation = float(np.dot(self._reference_unit, unit))
+            return DecoderCorrelationResult(float("nan"), fraction, "constant_volume", weight_loss)
+        correlation = float(np.dot(reference_unit, unit))
         if not np.isfinite(correlation):
-            return DecoderCorrelationResult(float("nan"), fraction, "nonfinite_correlation")
-        return DecoderCorrelationResult(float(np.clip(correlation, -1, 1)), fraction, "ok")
+            return DecoderCorrelationResult(float("nan"), fraction, "nonfinite_correlation", weight_loss)
+        return DecoderCorrelationResult(float(np.clip(correlation, -1, 1)), fraction, status, weight_loss)
 
 
 def has_decoder_qc(run_dir, *, csv_name=QC_CSV_NAME):
@@ -201,8 +242,8 @@ def has_decoder_qc(run_dir, *, csv_name=QC_CSV_NAME):
 def add_reference_correlation_panel(ax, run_dir, *, csv_name=QC_CSV_NAME):
     """Draw all logged TRs, including warmup, on a caller-owned QC axis.
 
-    Returns False when no QC CSV exists. Gaps remain gaps; an incomplete ROI is
-    not converted to a lower but apparently valid correlation.
+    Returns False when no QC CSV exists. Defined partial-coverage correlations
+    share the main trace. Unavailable correlations appear as gaps.
     """
     run_dir = Path(run_dir)
     path = run_dir / csv_name
@@ -221,10 +262,15 @@ def add_reference_correlation_panel(ax, run_dir, *, csv_name=QC_CSV_NAME):
     with path.open(newline="", encoding="utf-8-sig") as stream:
         for row in csv.DictReader(stream):
             try:
-                points.append((int(row["volume_idx"]), float(row["reference_correlation"]),
-                               float(row["reference_coverage_fraction"]), row.get("correlation_status", "")))
+                point = (int(row["volume_idx"]), float(row["reference_correlation"]),
+                         float(row["reference_coverage_fraction"]), row.get("correlation_status", ""))
             except (KeyError, TypeError, ValueError):
                 continue
+            try:
+                weight_loss = float(row.get("decoder_weight_loss_fraction") or "nan")
+            except (TypeError, ValueError):
+                weight_loss = float("nan")
+            points.append((*point, weight_loss))
     points.sort(key=lambda p: p[0])
     label = metadata.get("reference_label", "Fixed EPI reference")
     ax.set_title("Decoder ROI spatial stability · " + label)
@@ -232,15 +278,21 @@ def add_reference_correlation_panel(ax, run_dir, *, csv_name=QC_CSV_NAME):
         ax.set_title("Decoder ROI spatial stability · session-reference fallback")
     if not points:
         return False
-    x = np.array([p[0] for p in points]); y = np.array([p[1] if p[3] == "ok" else np.nan for p in points])
+    x = np.array([p[0] for p in points])
+    y = np.array([p[1] if p[3] in {"ok", "partial_coverage"} and np.isfinite(p[1]) else np.nan
+                  for p in points])
     ax.plot(x, y, color="#246a8c", linewidth=1.25, marker=".", markersize=3,
-            label="Fixed-ROI EPI correlation · all TRs")
+            label="EPI correlation on available QC voxels")
     coverage_axis = ax.twinx()
     coverage_axis.plot(x, [p[2] * 100 for p in points], color="#b88645", linestyle=":", linewidth=1., alpha=.85, label="Fixed QC ROI covered (%)")
+    weight_loss_percent = np.array([p[4] * 100 for p in points])
+    if np.isfinite(weight_loss_percent).any():
+        coverage_axis.plot(x, weight_loss_percent, color="#974368", linestyle="--", linewidth=1.,
+                           label="Full decoder squared weight missing (%)")
     coverage_axis.set_ylim(-2, 105)
-    coverage_axis.set_ylabel("QC ROI covered (%)", color="#8c6d43", fontsize=9)
-    coverage_axis.tick_params(axis="y", labelsize=8, colors="#8c6d43")
-    unavailable = np.array([p[3] != "ok" or not np.isfinite(p[1]) for p in points])
+    coverage_axis.set_ylabel("Percent", fontsize=9)
+    coverage_axis.tick_params(axis="y", labelsize=8)
+    unavailable = np.isnan(y)
     if unavailable.any():
         ax.scatter(x[unavailable], np.full(unavailable.sum(), -.99), marker="x", s=18, color="#b55b42", label="Correlation unavailable · see status/coverage")
     handles, labels = ax.get_legend_handles_labels()

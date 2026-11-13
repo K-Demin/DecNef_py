@@ -2,7 +2,9 @@
 
 The live pipeline compares each aligned BOLD image with one fixed EPI reference:
 
-`r_t = Pearson(reference[fixed_QC_ROI], BOLD_t[fixed_QC_ROI])`
+`available_t = fixed_QC_ROI & spatial_support_t & finite(BOLD_t)`
+
+`r_t = Pearson(reference[available_t], BOLD_t[available_t])`
 
 This is a correlation **across voxels** at each TR. It measures spatial pattern
 stability, independently of the decoder score. It is calculated after unwarping,
@@ -47,18 +49,22 @@ with the optional QC ROI. The saved metadata records the full decoder count,
 fixed QC count and excluded decoder fraction. These exclusions affect QC only;
 they do not remove or reweight decoder features.
 
-The same fixed voxels are compared at every TR. A later missing voxel produces
-`incomplete_coverage` and a NaN correlation, alongside the available fraction.
-The script does not replace missing samples with zeros or calculate a
-potentially misleading correlation on a different ROI at each TR. Current
-spatial support is used here, independently of cumulative cGLM eligibility.
-The existing `coverage_rt.csv` still reports support for the full decoder.
+Each TR uses the available voxels within that fixed region. Both patterns are
+centered over the same available subset. A valid correlation on a subset has
+status `partial_coverage` and appears on the correlation trace. Coverage is
+reported as the available fraction of the original fixed region. Interpret the
+two traces together because the compared voxels can vary from TR to TR. An
+empty or insufficient overlap, an invalid reference, or a constant pattern
+makes correlation undefined and produces NaN with an explicit status.
 
-Constant patterns, nonfinite values, empty ROIs and insufficient voxel counts
-also produce NaN plus an explicit status. An intensity of zero alone does not
-define missing acquisition coverage. Correlations cannot prove anatomical
-accuracy, and a high value within a small covered ROI does not validate the
-uncovered decoder features.
+**Squared decoder weight lost** uses the full effective decoder mask. The
+fraction is the sum of squared weights at unavailable voxels divided by the sum
+of all squared decoder weights. It includes both permanent and per-volume
+spatial exclusions and is independent of any optional QC ROI. A missing voxel
+with a large positive or negative weight contributes more loss than a missing
+voxel with a small weight. A finite zero intensity with spatial support counts
+as available. Both QC metrics use spatial support before temporal processing.
+The existing `coverage_rt.csv` reports support for the processed decoder inputs.
 
 ## Outputs
 
@@ -69,21 +75,22 @@ Within the usual `data/sub-ID/day/func/run/` directory:
 | `decoder_qc/fixed_roi.nii` | The exact fixed QC ROI for visual inspection. |
 | `decoder_qc/session_reference.nii` | Mapped reference when using the fallback. |
 | `decoder_qc_reference.json` | Reference identity, coordinates, ROI counts, stage and missing-coverage policy. Also copied into `session_metadata.json`. |
-| `decoder_qc_request.json` | Content identities for the input reference, fixed masks, grid, transforms and interpolation; prevents mixing different references when restarting a run. |
-| `decoder_qc_rt.csv` | `volume_idx`, `reference_correlation`, `reference_coverage_fraction`, `correlation_status`; every spatially processed TR, including warmup. |
-| `regression_status_rt.csv` | The same three QC columns beside FD, DVARS and readiness. |
-| `qc_scores_motion.png` | Existing score/motion plot plus correlation and coverage for all recorded TRs. Short runs can produce a QC-only panel before scores are ready. |
+| `decoder_qc_request.json` | QC version and identities of the inputs, grid, transforms and interpolation, used to check consistency when restarting a run. |
+| `decoder_qc_rt.csv` | `volume_idx`, `reference_correlation`, `reference_coverage_fraction`, `correlation_status`, and `decoder_weight_loss_fraction` for each spatially processed TR, including warmup. |
+| `regression_status_rt.csv` | Correlation, coverage and status beside FD, DVARS and readiness. |
+| `qc_scores_motion.png` | Score and motion panels plus correlation, QC ROI coverage and squared decoder weight lost. Short runs can produce a QC-only panel before scores are ready. |
 | `run_qc.xlsx` | Written at completion. `Volumes` joins available score/QC CSVs by explicit `volume_idx`; `Summary` records counts and QC reference metadata. |
 
 Workbook writing and plotting occur after processing, not once per TR. The
-reference is mapped and centered once; each TR requires only ROI extraction and
-a Pearson calculation. The behavioral launchers export after the processing
+reference is mapped once, with its centered pattern cached for full coverage.
+Partial coverage uses the same Pearson calculation on the supported subset.
+The behavioral launchers export after the processing
 child exits. The direct pipeline also attempts workbook export on orderly stop.
 An abrupt process or machine termination can leave only the CSVs; they remain
 the primary per-TR record. Existing CSVs without the new columns remain readable
-by the report helpers. Processing refuses to append to the older status-column
-schema; use fresh run folders for new acquisitions. A restart with different
-QC reference/ROI inputs is rejected before overwriting generated QC files.
+by the report helpers. Reprocess in a fresh output folder to calculate the
+updated metrics for an older run. The pipeline checks QC version and input
+identity before appending rows to an existing run.
 
 PCA workflows without a voxel decoder do not infer an ROI from their geometry
 template; status is `no_voxel_decoder`. Disabling QC records `disabled`. This

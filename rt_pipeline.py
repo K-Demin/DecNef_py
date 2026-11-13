@@ -789,6 +789,8 @@ def prepare_decoder_correlation_qc(cfg, handler):
     brain = getattr(handler, "final_brain_mask", None)
     explicit_reference = getattr(REGRESSOR_SETTINGS, "decoder_qc_reference", None)
     roi_path = getattr(REGRESSOR_SETTINGS, "decoder_qc_roi_mask", None)
+    decoder_identity = source_identity(resolve_decoder_template(cfg))
+    roi_txt = getattr(cfg, "decoder_roi_txt", None)
     # Bind inputs before overwriting any generated reference/support metadata.
     # Generated fallback mtimes are deliberately excluded: the same request may
     # be restarted, but existing rows must never change their reference or ROI.
@@ -803,10 +805,12 @@ def prepare_decoder_correlation_qc(cfg, handler):
                   [cfg.trans_dir / "epi2t1_Composite.h5"] if spatial else [])
     if space == "mni":
         transforms.insert(0, t1_to_mni_transform(cfg))
-    request = {"version": 1, "analysis_space": space,
+    request = {"version": 2, "analysis_space": space,
                "analysis_grid": {"shape": list(analysis_image.shape[:3]), "affine": analysis_image.affine.tolist()},
                "session_reference": file_identity(source),
                "explicit_reference": file_identity(Path(explicit_reference).expanduser()) if explicit_reference else None,
+               "decoder": decoder_identity,
+               "decoder_roi_txt": source_identity(roi_txt) if roi_txt is not None and roi_txt.is_file() else None,
                "decoder_mask": mask_identity(scorer.mask), "final_brain_mask": mask_identity(brain),
                "explicit_roi": file_identity(Path(roi_path).expanduser()) if roi_path else None,
                "transforms": [file_identity(transform) for transform in transforms],
@@ -821,7 +825,8 @@ def prepare_decoder_correlation_qc(cfg, handler):
         except (OSError, ValueError):
             previous = None
         if previous != request:
-            raise ValueError("Existing decoder QC rows use different or unrecorded reference/ROI inputs. Use a fresh run directory; existing files were not overwritten.")
+            raise ValueError("Existing decoder QC rows use a different QC version or incompatible inputs. "
+                             "Use a fresh run directory to preserve the existing files.")
     binding_temporary = binding_path.with_suffix(".json.tmp")
     binding_temporary.write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
     binding_temporary.replace(binding_path)
@@ -853,16 +858,18 @@ def prepare_decoder_correlation_qc(cfg, handler):
     qc = DecoderSpatialCorrelation(
         reference_path, scorer.mask, analysis_image=analysis_image,
         fixed_roi_mask=reference_support,
+        decoder_weights=getattr(scorer, "w", None),
         roi_image=Path(roi_path).expanduser().resolve() if roi_path else None,
         reference_kind="decoder_training_mean" if explicit_reference else "prepared_session_reference",
         reference_label="Decoder-training mean EPI" if explicit_reference else "Prepared session EPI reference (fallback)")
     metadata = dict(qc.metadata)
     metadata.update(stage="after_spatial_before_smoothing_glm_normalization",
                     analysis_space=space, reference=source_identity(reference_path),
-                    decoder=source_identity(resolve_decoder_template(cfg)),
+                    decoder=decoder_identity,
                     roi_file=source_identity(Path(roi_path).expanduser().resolve()) if roi_path else None,
                     session_reference=source_identity(source),
-                    reporting_only=True, missing_coverage_policy="nan_without_changing_fixed_roi")
+                    reporting_only=True, missing_coverage_policy="pearson_on_available_fixed_roi_voxels",
+                    weight_loss_basis="squared_weights_of_full_decoder_mask_before_temporal_processing")
     nib.save(nib.Nifti1Image(qc.roi.astype(np.uint8), analysis_image.affine),
              str(folder / "fixed_roi.nii"))
     metadata_path = cfg.rt_work_dir / "decoder_qc_reference.json"
@@ -884,7 +891,8 @@ def record_decoder_correlation(cfg, handler, volume_idx, image_path, support):
         return {"reference_correlation": float("nan"),
                 "reference_coverage_fraction": float("nan"),
                 "correlation_status": "disabled" if not getattr(
-                    REGRESSOR_SETTINGS, "enable_decoder_correlation_qc", True) else "no_voxel_decoder"}
+                    REGRESSOR_SETTINGS, "enable_decoder_correlation_qc", True) else "no_voxel_decoder",
+                "decoder_weight_loss_fraction": float("nan")}
     image = image_path if hasattr(image_path, "dataobj") else nib.load(str(image_path))
     result = qc.evaluate(image, coverage=support).as_dict()
     path = cfg.rt_work_dir / "decoder_qc_rt.csv"
