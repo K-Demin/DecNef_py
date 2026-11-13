@@ -383,10 +383,24 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
 
 
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
-    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+    try:
+        from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    REGRESSOR_SETTINGS.update(settings)
-    run_rt_pipeline(cfg, score_queue)
+        REGRESSOR_SETTINGS.update(settings)
+        run_rt_pipeline(cfg, score_queue)
+    except Exception as exc:
+        try:
+            score_queue.put_nowait({"pipeline_error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+        raise
+
+
+def _raise_if_pipeline_failed(message, win=None):
+    if message.get("pipeline_error"):
+        if win is not None:
+            win.close()
+        raise RuntimeError(f"Real-time processing failed: {message['pipeline_error']}")
 
 
 
@@ -518,8 +532,18 @@ def run_psychopy_presentation(
     acquisition_speed_path = condition_scores_path.parent / "acquisition_speed_rt.csv"
 
     first_trigger_timestamp: Optional[float] = None
+    pending_messages = deque()
     waiting = True
     while waiting:
+        # Detect worker failure while retaining ordinary scores for the
+        # existing post-trigger presentation path.
+        try:
+            while True:
+                message = score_queue.get_nowait()
+                _raise_if_pipeline_failed(message, win)
+                pending_messages.append(message)
+        except Empty:
+            pass
         win.fullscr = True
         _release_mouse_cursor(win)
         waiting_text.draw()
@@ -567,7 +591,8 @@ def run_psychopy_presentation(
         updated = False
         try:
             while True:
-                message = score_queue.get_nowait()
+                message = pending_messages.popleft() if pending_messages else score_queue.get_nowait()
+                _raise_if_pipeline_failed(message, win)
                 vol_idx = int(message.get("volume_idx", 0))
                 if vol_idx:
                     seen_vols.add(vol_idx)
@@ -989,8 +1014,8 @@ def main() -> None:
         pa_block=args.pa_block,
     )
 
-    from rt_pipeline import prepare_nf_run
-    prepare_nf_run(cfg)
+    from rt_pipeline import validate_nf_reference
+    validate_nf_reference(cfg)
 
     if use_pca and args.reference_score_run:
         log.info("PCA score source enabled: ignoring --rs=%s", args.reference_score_run)

@@ -221,12 +221,26 @@ def _run_biopac_listener(config: "BiopacReceiverConfig", stop_event: mp.Event) -
 
 
 def _run_pipeline_with_settings(cfg: "RTSessionConfig", score_queue: Queue, settings: dict) -> None:
-    from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
+    try:
+        from rt_pipeline import REGRESSOR_SETTINGS, run_rt_pipeline
 
-    for key, value in settings.items():
-        if hasattr(REGRESSOR_SETTINGS, key):
-            setattr(REGRESSOR_SETTINGS, key, value)
-    run_rt_pipeline(cfg, score_queue)
+        for key, value in settings.items():
+            if hasattr(REGRESSOR_SETTINGS, key):
+                setattr(REGRESSOR_SETTINGS, key, value)
+        run_rt_pipeline(cfg, score_queue)
+    except Exception as exc:
+        try:
+            score_queue.put_nowait({"pipeline_error": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+        raise
+
+
+def _raise_if_pipeline_failed(message, win=None):
+    if message.get("pipeline_error"):
+        if win is not None:
+            win.close()
+        raise RuntimeError(f"Real-time processing failed: {message['pipeline_error']}")
 
 
 def _release_mouse_cursor(win) -> None:
@@ -411,6 +425,7 @@ def run_nf_events_presentation(
         try:
             while True:
                 message = score_queue.get_nowait()
+                _raise_if_pipeline_failed(message, win)
                 vol_idx = int(message.get("volume_idx", 0) or 0)
                 if vol_idx > 0:
                     max_seen_vol = max(max_seen_vol, vol_idx)
@@ -763,8 +778,8 @@ def main() -> None:
         pa_block=args.pa_block
     )
 
-    from rt_pipeline import prepare_nf_run
-    prepare_nf_run(cfg)
+    from rt_pipeline import validate_nf_reference
+    validate_nf_reference(cfg)
 
     cfg.reference_score_stats = load_reference_score_stats(cfg, cfg.reference_score_run)
 

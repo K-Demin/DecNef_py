@@ -1,4 +1,4 @@
-"""First-NF reference cache and transform composition, without native ANTs."""
+"""Reference-run transform composition and prepared-resource consumers."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +13,6 @@ matplotlib.use("Agg")
 import test_rt_pipeline_parallel as headless  # Optional GUI/native RTPSpy dependencies.
 from fmri_rt_preproc import session_alignment as session
 from fmri_rt_preproc.offline_assets import copy_image
-from fmri_rt_preproc.registration_qc import approve_registration_qc, build_registration_qc
 
 
 def _image(path, shape, affine, mask=False):
@@ -130,161 +129,16 @@ def test_pipeline_bridge_cache_rejects_newly_selected_epi_path(bridge, monkeypat
     assert len(runner.calls) == count
 
 
-@pytest.fixture
-def frozen_session(tmp_path, monkeypatch):
-    assets = _assets(tmp_path / "offline")
-    day = tmp_path / "sub-001" / "day"
-    day.mkdir(parents=True)
-    cfg = SimpleNamespace(day_root=day, subject_root=day.parent, subject="001", day="day", run="4",
-                          incoming_dir=tmp_path / "incoming", fmap_dir=day / "fmap", preparation_only=False)
-    cfg.fmap_dir.mkdir()
-    for direction in ("AP", "PA"):
-        _image(cfg.fmap_dir / (direction + ".nii"), (7, 8, 4), np.eye(4))
-    settings = SimpleNamespace(offline_assets=None, registration_qc_policy=None,
-        registration_direction="epi_to_t1", registration_initialization="identity", registration_syn=True,
-        epi_phase_encoding="AP", epi_reference_n4=False)
-    runner, stages, preparations = FakeAnts(), [], []
-    monkeypatch.setattr(session, "prepared_assets", lambda current: assets)
-    monkeypatch.setattr("fmri_rt_preproc.offline_assets.load_offline_assets", lambda path, subject: assets)
-    monkeypatch.setattr("fmri_rt_preproc.utils.run", runner)
-    monkeypatch.setattr("run_preproc._wait_for_epi_dicoms", lambda *args, **kwargs: stages.append((args, kwargs)))
-
-    def stage(incoming, run, folder):
-        folder.mkdir()
-        path = folder / "staged.nii"
-        _image(path, (7, 8, 4, 20), np.eye(4))
-        return [path]
-    monkeypatch.setattr("run_preproc._stage_epi_block", stage)
-
-    class Preparation:
-        def __init__(self, prep_cfg):
-            self.cfg = prep_cfg
-            preparations.append(self)
-
-        def _prepare_anat(self):
-            self.anat_dir.mkdir()
-
-        def _unwarp_epi(self, source, output):
-            nib.save(nib.load(source), output)
-
-        def _motion_correct_and_mean(self, source, output, count):
-            assert count == 20
-            image = nib.load(source)
-            _image(output, image.shape[:3], image.affine)
-
-        def _skullstrip_epi(self, source, brain, mask):
-            image = nib.load(source)
-            nib.save(image, brain)
-            _image(mask, image.shape, image.affine, True)
-
-        def _register_to_offline_reference(self, epi, mask):
-            session.register_session_bridge(self.offline_assets, epi, mask, self.trans_dir, runner,
-                                             epi_reference_n4=self.cfg.epi_reference_n4)
-
-        def _make_rtp_nuisance_masks(self):
-            image = nib.load(self.rt_unwarped_analysis_ref_epi)
-            for name in ("rt_WM_mask.nii", "rt_Vent_mask.nii"):
-                _image(self.trans_dir / name, image.shape, image.affine, True)
-
-        def _write_registration_qc(self):
-            reports = []
-            for name in ("epi_t1", "epi_epi", "t1_mni"):
-                path = self.trans_dir / ("registration_qc_" + name + ".json")
-                build_registration_qc(assets["t1"], assets["t1"], assets["t1_mask"],
-                    comparison="epi_epi", output_json=path,
-                    transform_files=[self.trans_dir / "epi2t1_Composite.h5"])
-                reports.append(path)
-            return reports
-
-        def _registration_outputs(self):
-            return [self.trans_dir / ("epi2t1_" + suffix) for suffix in (
-                "Composite.h5", "InverseComposite.h5", "Warped.nii", "InverseWarped.nii")]
-
-    monkeypatch.setattr("fmri_rt_preproc.pipeline.FMRIRealtimePreprocessor", Preparation)
-    with pytest.raises(ValueError, match="needs visual approval"):
-        session.ensure_nf_session(cfg, settings)
-    folder = day / "func" / "session_trans"
-    marker = json.loads((folder / "session_alignment.json").read_text())
-    assert marker["reference_run"] == "4"
-    assert len(preparations) == 1
-    for path in marker["qc_reports"]:
-        approve_registration_qc(path, reviewer="Unit test reviewer")
-    return cfg, settings, assets, folder, runner, stages, preparations
-
-
-@pytest.mark.parametrize("offline", [False, True])
-def test_first_nf_is_frozen_and_reused_across_runs_after_bound_review(frozen_session, offline):
-    cfg, settings, assets, folder, runner, stages, preparations = frozen_session
-    assert stages[0][0] == (cfg.incoming_dir, 4)
-    assert stages[0][1] == {"expected": 20}
-    if offline:
-        settings.offline_assets = Path("assets.json")
-    count = len(runner.calls)
-    cfg.run = "7"
-    session.ensure_nf_session(cfg, settings)
-    assert len(preparations) == 1
-    assert len(runner.calls) == count
-
-
-def test_first_nf_uses_online_phase_encoding(frozen_session):
-    _, settings, _, _, _, _, preparations = frozen_session
-    assert preparations[0].cfg.epi_phase_encoding == settings.epi_phase_encoding
-
-
-def test_anatomical_policy_does_not_change_frozen_epi_bridge(frozen_session):
-    cfg, settings, _, _, runner, _, preparations = frozen_session
-    count = len(runner.calls)
-    settings.registration_initialization = 'center_of_mass'
-    settings.registration_threads = 1
-    session.ensure_nf_session(cfg, settings)
-    assert len(runner.calls) == count and len(preparations) == 1
-    assert preparations[0].cfg.registration_bridge_initialization == 'identity'
-
-
-@pytest.mark.parametrize("change", ["source", "output", "policy", "initialization", "version", "approval", "omitted_report"])
-def test_session_cache_rejects_changed_source_output_policy_or_review(frozen_session, change):
-    cfg, settings, assets, folder, runner, stages, preparations = frozen_session
-    if change == "source":
-        assets["epi_to_t1"].write_text("changed transform")
-    elif change == "output":
-        (folder / "rt_WM_mask.nii").write_bytes(b"changed output")
-    elif change == "policy":
-        settings.registration_qc_policy = folder / "changed_policy.json"
-        settings.registration_qc_policy.write_text("{}")
-    elif change == "initialization":
-        settings.registration_bridge_initialization = "center_of_mass"
-    elif change in {"version", "omitted_report"}:
-        path = folder / "session_alignment.json"
-        marker = json.loads(path.read_text())
-        if change == "version":
-            marker["version"] = 999
-        else:
-            marker["qc_reports"] = marker["qc_reports"][:1]
-        path.write_text(json.dumps(marker))
-    else:
-        approval = folder / "registration_qc_epi_epi.approval.json"
-        approval.unlink()
-    count = len(runner.calls)
-    with pytest.raises(ValueError):
-        session.ensure_nf_session(cfg, settings)
-    assert len(runner.calls) == count
-    assert len(preparations) == 1
-
-
-def test_incomplete_session_does_not_adopt_unvalidated_outputs(tmp_path, monkeypatch):
-    folder = tmp_path / "func" / "session_trans"
-    folder.mkdir(parents=True)
-    (folder / "epi2t1_Composite.h5").write_bytes(b"interrupted output")
-    monkeypatch.setattr(session, "prepared_assets", lambda cfg: {})
-    cfg = SimpleNamespace(preparation_only=False, day_root=tmp_path)
-    settings = SimpleNamespace(offline_assets=None, registration_qc_policy=None,
-                               registration_initialization="identity")
-    with pytest.raises(ValueError, match="Incomplete session"):
-        session.ensure_nf_session(cfg, settings)
-
-
 def test_preparation_run_does_not_build_nf_reference(tmp_path):
     session.ensure_nf_session(SimpleNamespace(preparation_only=True), SimpleNamespace())
+    assert not list(tmp_path.iterdir())
+
+
+def test_preparation_only_still_prepares_fieldmaps_without_building_session(tmp_path):
+    cfg = SimpleNamespace(preparation_only=True)
+    calls = []
+    session.ensure_nf_session(cfg, SimpleNamespace(), prepare_fieldmap=calls.append)
+    assert calls == [cfg]
     assert not list(tmp_path.iterdir())
 
 
@@ -309,16 +163,14 @@ def test_runtime_cpu_gpu_and_masks_resolve_the_selected_session_directory(tmp_pa
     (session_dir / "session_alignment.json").write_text("{}")
     (session_dir / "session_to_reference_Composite.h5").write_text("session to stable EPI")
     _image(session_dir / "reference_epi.nii", (7, 8, 4), np.eye(4))
-    selected = cfg.day_root / "func" / ("trans" if preparation_only else "session_trans")
+    selected = cfg.day_root / "func" / "trans"
     assert cfg.trans_dir == selected
     assert cfg.rt_motion_ref_epi == selected / "epi_unwarped_mean.nii"
     assert cfg.rt_motion_ref_mask == selected / "epi_mask_mean.nii"
     assert cfg.rt_wm_mask == selected / "rt_WM_mask.nii"
     assert cfg.rt_vent_mask == selected / "rt_Vent_mask.nii"
     assert mask_source(cfg, "cortical_gm")[0] == selected / "offline_anat" / "cortical_gm_mask.nii"
-    assert mask_transforms(cfg, "t1", "epi") == (
-        [] if preparation_only else [selected / "session_to_reference_Composite.h5"]
-    ) + [selected / "epi2t1_InverseComposite.h5"]
+    assert mask_transforms(cfg, "t1", "epi") == [selected / "epi2t1_InverseComposite.h5"]
     transforms = ([selected / "t1_to_mni.h5"] if space == "mni" else []) + [selected / "epi2t1_Composite.h5"]
     assert mask_transforms(cfg, "epi", space) == transforms
     cfg.decoder_template = _image(tmp_path / "decoder.nii", (9, 10, 11), np.eye(4))
@@ -398,20 +250,8 @@ def test_same_day_reference_rejects_old_estimator_without_changing_outputs(tmp_p
     assert (transform.read_bytes(), marker.read_bytes()) == before
 
 
-def test_frozen_session_rejects_old_estimator_before_reuse(frozen_session):
-    cfg, settings, assets, folder, runner, stages, preparations = frozen_session
-    marker = folder / "session_alignment.json"
-    saved = json.loads(marker.read_text())
-    saved["settings"].pop("fieldmap_estimator_recipe")
-    marker.write_text(json.dumps(saved))
-    before = len(runner.calls), len(stages), marker.read_bytes()
-    with pytest.raises(ValueError, match="inputs/QC policy changed"):
-        session.ensure_nf_session(cfg, settings)
-    assert (len(runner.calls), len(stages), marker.read_bytes()) == before
-
-
 @pytest.mark.parametrize("metadata", [True, False])
-def test_implicit_nf_import_keeps_offline_reference_used_for_rs(tmp_path, monkeypatch, metadata):
+def test_prepared_asset_export_preserves_original_offline_bundle(tmp_path, monkeypatch, metadata):
     cfg, pipe, assets = _prepared_day(tmp_path, monkeypatch, offline=True)
     if metadata:
         pipe._write_registration_qc()
